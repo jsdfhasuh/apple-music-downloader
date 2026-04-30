@@ -1,10 +1,10 @@
 media-user-token: "your-media-user-token" #If you need to obtain lyrics and aac-lc, need to change it
 authorization-token: "your-authorization-token" #You don't need to change it; it can automatically obtain token
-language: ""         #supportedLanguage by each storefront --> https://gist.github.com/itouakirai/c8ba9df9dc65bd300094103b058731d0
+language: "zh-Hant-HK"         #supportedLanguage by each storefront --> https://gist.github.com/itouakirai/c8ba9df9dc65bd300094103b058731d0
 lrc-type: "lyrics"   #lyrics or syllable-lyrics
 lrc-format: "lrc"   #lrc or ttml
 embed-lrc: true
-save-lrc-file: false
+save-lrc-file: true
 save-artist-cover: false
 save-animated-artwork: false    # If enabled, requires ffmpeg
 emby-animated-artwork: false    # If enabled, requires ffmpeg
@@ -13,17 +13,17 @@ cover-size: 5000x5000
 cover-format: jpg       #jpg png or original
 tag-sort-order: true
 tag-itunes-id: true
-alac-save-folder: AM-DL downloads
-atmos-save-folder: AM-DL-Atmos downloads
-aac-save-folder: AM-DL-AAC downloads
-mv-save-folder: AM-DL-MV downloads
+alac-save-folder: "/downloads/ALAC"
+atmos-save-folder: "/downloads/Atmos"
+aac-save-folder: "/downloads/AAC"
+mv-save-folder: "/downloads/MV"
 max-memory-limit: 256 # MB
-decrypt-m3u8-port: "127.0.0.1:10020"
-get-m3u8-port: "127.0.0.1:20020"
+decrypt-m3u8-port: "192.168.100.56:10020"
+get-m3u8-port: "192.168.100.56:20020"
 get-m3u8-from-device: true
 #set 'all' to retrieve all m3u8, and set 'hires' to only detect hires m3u8.
 get-m3u8-mode: hires # all hires
-aac-type: aac-lc # aac-lc aac aac-binaural aac-downmix
+aac-type: aac # aac-lc aac aac-binaural aac-downmix
 alac-max: 192000  #192000 96000 48000 44100
 atmos-max: 2768  #2768 2448
 limit-max: 200
@@ -31,13 +31,13 @@ limit-max: 200
 #example: {ReleaseYear} - {ArtistName} - {AlbumName}({AlbumId})({UPC})({Copyright}){Codec}
 album-folder-format: "{AlbumName}"
 #{PlaylistId} {PlaylistName} {ArtistName} {Quality} {Codec} {Tag}
-playlist-folder-format: "{PlaylistName}"
+playlist-folder-format: "playlists/{PlaylistName}"
 #{SongId} {SongNumer} {SongName} {DiscNumber} {TrackNumber} {Quality} {Codec} {Tag}
 #example: Disk {DiscNumber} - Track {TrackNumber} {SongName} [{Quality}]{{Tag}}"
-song-file-format: "{SongNumer}. {SongName}"
+song-file-format: "{DiscNumber}-{TrackNumber} {SongName}"
 #{ArtistId} {ArtistName}/{UrlArtistName}
 #if artist-folder-format set "",will not make artist folder
-artist-folder-format: "{UrlArtistName}"
+artist-folder-format: "{ArtistName}"
 #if set "" will not add tag
 explicit-choice : "[E]"
 clean-choice : "[C]"
@@ -48,11 +48,16 @@ use-songinfo-for-playlist: false
 dl-albumcover-for-playlist: false
 mv-audio-type: atmos  #atmos ac3 aac
 mv-max: 2160
+completed-root-folder: "/downloads/completed"
+telegram-bot-token: "your-telegram-bot-token"
+telegram-allowed-chat-id: "your-telegram-chat-id"
+telegram-webapp-base-url: "http://127.0.0.1:5000"
+telegram-store-path: "webapp/data/telegram_tasks.db"
 # storefront will be used only in searching. 
 # storefront is the 2-letter country code that are available in the urls (jp, ca, us etc.).
 # if your account is from Japan, you must use jp.
 # if the storefront is different from your account, you will see a "failed to get lyrics" error in most of the songs. By default the storefront is set to US if not set.
-storefront: "enter your account storefront"
+storefront: "hk"
 # Conversion settings
 convert-after-download: false     # Enable post-download conversion (requires ffmpeg)
 convert-format: "flac"            # flac | mp3 | opus | wav | copy (no re-encode)
@@ -64,5 +69,5 @@ convert-with-metadata: true      # If true, keep the same metadata in converted 
 # Conversion warnings and behavior
 convert-warn-lossy-to-lossless: true # If true, print a warning when converting a detected lossy source to a lossless container
 convert-skip-lossy-to-lossless: true # If true, skip converting detected lossy sources to lossless target formats (flac/wav)
-convert-check-bad-alac: false # If true, check and report if ALAC is damaged
-convert-delete-bad-alac: false # If true, delete if ALAC is damaged
+convert-check-bad-alac: true # If true, check and report if ALAC is damaged
+convert-delete-bad-alac: true # If true, delete if ALAC is damaged

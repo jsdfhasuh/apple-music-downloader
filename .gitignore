@@ -6,4 +6,13 @@
 !go.sum
 !main.go
 !README.md
+!README-CN.md
+!docs/
+!docs/**
+!webapp/
+!webapp/**
+webapp/**/__pycache__/
+webapp/**/*.pyc
+webapp/data/*.db
+webapp/config.yaml
 !utils/*

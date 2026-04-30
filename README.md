@@ -85,6 +85,78 @@ docker run --network host -v ./downloads:/downloads -v ./config.yaml:/app/config
 4. Paste the cookie value obtained in step 3 into the setting called "media-user-token" in config.yaml and save it
 5. Start the script as usual
 
+## Flask dashboard
+
+1. Make sure the downloader container is already running and is named `applemusic_download`
+2. Install the Flask dependencies:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r webapp/requirements.txt
+```
+
+3. Start the dashboard:
+
+```bash
+.venv/bin/python webapp/app.py
+```
+
+4. Open:
+
+```text
+http://127.0.0.1:5000
+```
+
+Notes:
+- The dashboard calls the existing downloader through `docker exec`
+- The web UI always uses the auto highest-quality path with Hi-Res/ALAC priority
+- Interactive modes such as `--search` and `--select` are intentionally not exposed
+- The page now shows a shared task list for both web-submitted and Telegram-submitted downloads
+- The task details panel streams live logs, status changes, and final output paths for the selected task
+
+Telegram private bot:
+
+```bash
+.venv/bin/python webapp/telegram_bot.py
+```
+
+- By default Telegram config is read from the repository root `config.yaml`.
+- You can also copy `webapp/config.example.yaml` to `webapp/config.yaml`, or set `WEBAPP_CONFIG_PATH` to a custom config file.
+- Required keys are `telegram-bot-token`, `telegram-allowed-chat-id`, `telegram-webapp-base-url`, and optional `telegram-store-path`
+- The bot only accepts private-chat messages from `telegram-allowed-chat-id`
+- The bot extracts the first Apple Music URL in a message and calls `/api/downloads`
+- Task state is persisted in the path from `telegram-store-path`, defaulting to `webapp/data/telegram_tasks.db`
+- Completion and failure messages are sent back to the same Telegram chat
+
+Webapp container runtime:
+
+- `webapp/Dockerfile` now starts both `webapp/app.py` and `webapp/telegram_bot.py`
+- Flask service logs and Telegram bot logs both go to the container stdout/stderr stream
+- Use `docker logs <container-name>` to inspect backend and bot logs together
+- The same logs are also written inside the container to `/app/logs/webapp.log` and `/app/logs/telegram-bot.log`
+- If `webapp/config.yaml` does not contain Telegram credentials, the container starts the webapp and skips the bot
+
+Additional API:
+
+```bash
+curl -X POST http://127.0.0.1:5000/api/downloads \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://music.apple.com/...","force":false}'
+```
+
+Response:
+
+```json
+{"taskId":"...","status":"running"}
+```
+
+Rules:
+- A URL is only marked as downloaded after the task actually finishes with `completed`
+- Submitting the same completed URL again will reuse the stored record instead of downloading again
+- `force=true` bypasses the dedup check and starts a fresh download
+- This endpoint always uses the auto highest-quality strategy with Hi-Res/ALAC priority
+- After NFO generation, the album folder is moved to `completed-root-folder/<artist>/<album>`, defaulting to `/downloads/completed`
+
 ## Get translation and pronunciation lyrics (Beta)
 
 1. Open [Apple Music](https://beta.music.apple.com) and log in.

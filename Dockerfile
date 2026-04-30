@@ -19,4 +19,4 @@ COPY config.yaml ./
 RUN echo 'alac-save-folder: "/downloads/ALAC"' >> config.yaml \
     && echo 'atmos-save-folder: "/downloads/Atmos"' >> config.yaml \
     && echo 'aac-save-folder: "/downloads/AAC"' >> config.yaml
-ENTRYPOINT ["/usr/local/bin/apple-music-dl"]
+CMD ["sleep", "infinity"]

@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Apple Music Downloader</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+  </head>
+  <body>
+    <div class="page">
+      <header class="topbar card">
+        <div>
+          <p class="eyebrow">Internal Tool</p>
+          <h1>Apple Music Downloader</h1>
+        </div>
+        <div class="badge online">Container Online</div>
+      </header>
+
+      <main class="layout">
+        <section class="main-column">
+          <section class="card form-card">
+            <h2>新建下载任务</h2>
+            <form id="download-form">
+              <label class="field">
+                <span>Apple Music 链接</span>
+                <input id="url-input" name="url" type="url" placeholder="https://music.apple.com/..." required>
+              </label>
+              <div class="form-row">
+                <div class="quality-hint">自动最高音质（Hi-Res/ALAC 优先）</div>
+                <label class="checkbox-field">
+                  <input id="force-checkbox" name="force" type="checkbox">
+                  <span>强制重新下载</span>
+                </label>
+                <button type="submit" class="primary-button">Start Download</button>
+              </div>
+            </form>
+            <p id="form-error" class="error-text"></p>
+            <p id="submission-note" class="info-text"></p>
+          </section>
+
+          <section class="card progress-card">
+            <div class="section-header">
+              <h2>当前任务</h2>
+              <span id="stage-badge" class="badge">idle</span>
+            </div>
+            <div class="progress-meta">
+              <div>
+                <p class="meta-label">任务状态</p>
+                <p id="status-text" class="meta-value">等待开始</p>
+              </div>
+              <div>
+                <p class="meta-label">当前链接</p>
+                <p id="current-url" class="meta-value dim">-</p>
+              </div>
+            </div>
+            <div class="progress-track">
+              <div id="progress-bar" class="progress-fill"></div>
+            </div>
+            <div class="progress-footer">
+              <span id="progress-text">0%</span>
+              <span id="current-message">尚未开始</span>
+            </div>
+          </section>
+
+          <section class="card logs-card">
+            <div class="section-header">
+              <h2>实时日志</h2>
+            </div>
+            <pre id="logs-output" class="logs-output"></pre>
+          </section>
+
+          <section class="card result-card">
+            <div class="section-header">
+              <h2>下载结果</h2>
+            </div>
+            <div id="result-list" class="result-list">
+              <p class="empty-text">暂无结果</p>
+            </div>
+          </section>
+        </section>
+
+        <aside class="side-column">
+          <section class="card task-list-card">
+            <div class="section-header">
+              <h2>任务列表</h2>
+            </div>
+            <div id="task-list" class="task-list">
+              <p class="empty-text">暂无任务</p>
+            </div>
+          </section>
+
+          <section class="summary-grid">
+            <article class="card stat-card">
+              <p class="meta-label">队列中</p>
+              <p id="queue-count" class="stat-value">0</p>
+            </article>
+            <article class="card stat-card">
+              <p class="meta-label">成功</p>
+              <p id="success-count" class="stat-value">0</p>
+            </article>
+            <article class="card stat-card">
+              <p class="meta-label">失败</p>
+              <p id="failure-count" class="stat-value">0</p>
+            </article>
+            <article class="card stat-card">
+              <p class="meta-label">运行中</p>
+              <p id="active-count" class="stat-value">0</p>
+            </article>
+          </section>
+        </aside>
+      </main>
+    </div>
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>
