@@ -1,15 +1,24 @@
+import io
 import json
+import os
+import sqlite3
 import tempfile
+import threading
+import time
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 
-from webapp.app import PipelineRunner, createApp
+from webapp.apple_music import AppleMusicAlbum, AppleMusicArtist
+from webapp.app import DownloadHistoryStore, DownloadTask, DownloaderRunner, PipelineRunner, createApp, updateTaskFromLine
 
 
 class FakeRunner:
-  def __init__(self):
+  def __init__(self, resultPath="/downloads/ALAC/example.flac"):
     self.calls = []
     self.autoComplete = True
+    self.resultPath = resultPath
 
   def __call__(self, task, url, codec):
     self.calls.append((task.id, url, codec))
@@ -22,7 +31,7 @@ class FakeRunner:
     task.setProgress(49)
     task.setResult([
       {
-        "path": "/downloads/ALAC/example.flac",
+        "path": self.resultPath,
         "artist": "Example Artist",
         "album": "Example Album",
         "song": "Example Song"
@@ -34,10 +43,41 @@ class FakeRunner:
     task.setProgress(100)
 
 
+class FakeAppleMusicClient:
+  def __init__(self):
+    self.searchResults = [
+      AppleMusicArtist(
+        artistId="12345",
+        storefront="cn",
+        name="Example Artist",
+        url="https://music.apple.com/cn/artist/example-artist/12345",
+      )
+    ]
+    self.artist = self.searchResults[0]
+    self.albums: list[AppleMusicAlbum] = []
+
+  def searchArtists(self, term):
+    return self.searchResults
+
+  def getArtist(self, storefront, artistId):
+    return AppleMusicArtist(
+      artistId=artistId,
+      storefront=storefront,
+      name=self.artist.name,
+      url=f"https://music.apple.com/{storefront}/artist/example-artist/{artistId}",
+    )
+
+  def listArtistAlbums(self, storefront, artistId):
+    return self.albums
+
+
 class FlaskDashboardTest(unittest.TestCase):
   def setUp(self):
-    self.runner = FakeRunner()
     self.tempDir = tempfile.TemporaryDirectory()
+    self.resultPath = Path(self.tempDir.name) / "downloads" / "ALAC" / "example.flac"
+    self.resultPath.parent.mkdir(parents=True)
+    self.resultPath.write_text("fake flac", encoding="utf-8")
+    self.runner = FakeRunner(str(self.resultPath))
     app = createApp(
       runnerFactory=lambda: self.runner,
       dbPath=f"{self.tempDir.name}/downloads.db"
@@ -53,6 +93,25 @@ class FlaskDashboardTest(unittest.TestCase):
 
     self.assertEqual(response.status_code, 200)
     self.assertIn(b"Apple Music Downloader", response.data)
+
+  def testCreateAppDoesNotStartSubscriptionSchedulerByDefault(self):
+    with patch("webapp.app.startSubscriptionScheduler") as startScheduler:
+      createApp(
+        dbPath=f"{self.tempDir.name}/no-scheduler-downloads.db",
+        recoverPending=False,
+      )
+
+    self.assertFalse(startScheduler.called)
+
+  def testCreateAppStartsSubscriptionSchedulerWhenRequested(self):
+    with patch("webapp.app.startSubscriptionScheduler") as startScheduler:
+      createApp(
+        dbPath=f"{self.tempDir.name}/scheduler-downloads.db",
+        recoverPending=False,
+        startScheduler=True,
+      )
+
+    self.assertEqual(startScheduler.call_count, 1)
 
   def testCreateTaskRejectsInvalidUrl(self):
     response = self.client.post(
@@ -83,7 +142,7 @@ class FlaskDashboardTest(unittest.TestCase):
     taskPayload = taskResponse.get_json()
     self.assertEqual(taskPayload["status"], "completed")
     self.assertEqual(taskPayload["progress"], 100)
-    self.assertEqual(taskPayload["result"][0]["path"], "/downloads/ALAC/example.flac")
+    self.assertEqual(taskPayload["result"][0]["path"], str(self.resultPath))
 
   def testCreateDownloadShortcutUsesDefaultCodec(self):
     response = self.client.post(
@@ -148,6 +207,28 @@ class FlaskDashboardTest(unittest.TestCase):
     self.assertEqual(payload[1]["taskId"], firstPayload["taskId"])
     self.assertEqual(payload[1]["source"], "telegram")
 
+  def testSummaryCountsQueuedAndRunningSeparately(self):
+    taskStore = self.client.application.config["TASK_STORE"]
+    queuedTask = taskStore.createTask(
+      "https://music.apple.com/cn/album/queued/111",
+      "alac",
+      "telegram",
+    )
+    queuedTask.setStatus("queued")
+    runningTask = taskStore.createTask(
+      "https://music.apple.com/cn/album/running/222",
+      "alac",
+      "web",
+    )
+    runningTask.setStatus("running")
+
+    response = self.client.get("/api/summary")
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(payload["queueCount"], 1)
+    self.assertEqual(payload["activeTaskCount"], 1)
+
   def testTaskStreamEmitsProgressAndResult(self):
     response = self.client.post(
       "/api/tasks",
@@ -164,7 +245,7 @@ class FlaskDashboardTest(unittest.TestCase):
     self.assertEqual(streamResponse.status_code, 200)
     self.assertIn(b'"type": "snapshot"', body)
     self.assertIn(b'"progress": 49', body)
-    self.assertIn(b'"path": "/downloads/ALAC/example.flac"', body)
+    self.assertIn(json.dumps(str(self.resultPath)).encode("utf-8"), body)
 
   def testDownloadShortcutReusesCompletedUrl(self):
     first = self.client.post(
@@ -194,6 +275,88 @@ class FlaskDashboardTest(unittest.TestCase):
     self.assertEqual(secondPayload["status"], "completed")
     self.assertEqual(secondPayload["message"], "already downloaded")
 
+  def testDownloadShortcutRedownloadsCompletedUrlWhenFilesAreMissing(self):
+    historyStore = self.client.application.config["HISTORY_STORE"]
+    historyStore.saveRunning(
+      "https://music.apple.com/cn/album/missing-completed/111",
+      "old-task",
+      "alac",
+    )
+    historyStore.saveCompleted(
+      "https://music.apple.com/cn/album/missing-completed/111",
+      "old-task",
+      "alac",
+      [{
+        "path": f"{self.tempDir.name}/ALAC/Artist/Album/missing.flac",
+        "artist": "Artist",
+        "album": "Album",
+        "song": "Missing",
+      }],
+    )
+
+    response = self.client.post(
+      "/api/downloads",
+      data=json.dumps({
+        "url": "https://music.apple.com/cn/album/missing-completed/111"
+      }),
+      content_type="application/json"
+    )
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 202)
+    self.assertEqual(payload["status"], "running")
+    self.assertNotEqual(payload["taskId"], "old-task")
+    self.assertEqual(len(self.runner.calls), 1)
+
+  def testDownloadShortcutReusesCompletedUrlMovedToCompletedRoot(self):
+    configPath = Path(self.tempDir.name) / "config.yaml"
+    completedFile = Path(self.tempDir.name) / "completed" / "Artist" / "Album" / "track.flac"
+    completedFile.parent.mkdir(parents=True)
+    completedFile.write_text("fake flac", encoding="utf-8")
+    configPath.write_text(
+      f'completed-root-folder: "{Path(self.tempDir.name) / "completed"}"\n',
+      encoding="utf-8",
+    )
+    historyStore = self.client.application.config["HISTORY_STORE"]
+    historyStore.saveRunning(
+      "https://music.apple.com/cn/album/moved-completed/222",
+      "old-task",
+      "alac",
+    )
+    historyStore.saveCompleted(
+      "https://music.apple.com/cn/album/moved-completed/222",
+      "old-task",
+      "alac",
+      [{
+        "path": f"{self.tempDir.name}/ALAC/Artist/Album/track.flac",
+        "artist": "Artist",
+        "album": "Album",
+        "song": "Track",
+      }],
+    )
+
+    originalConfigPath = os.environ.get("WEBAPP_CONFIG_PATH")
+    try:
+      os.environ["WEBAPP_CONFIG_PATH"] = str(configPath)
+      response = self.client.post(
+        "/api/downloads",
+        data=json.dumps({
+          "url": "https://music.apple.com/cn/album/moved-completed/222"
+        }),
+        content_type="application/json"
+      )
+    finally:
+      if originalConfigPath is None:
+        os.environ.pop("WEBAPP_CONFIG_PATH", None)
+      else:
+        os.environ["WEBAPP_CONFIG_PATH"] = originalConfigPath
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(payload["status"], "completed")
+    self.assertEqual(payload["taskId"], "old-task")
+    self.assertEqual(len(self.runner.calls), 0)
+
   def testDownloadShortcutForceCreatesNewTask(self):
     first = self.client.post(
       "/api/downloads",
@@ -218,6 +381,163 @@ class FlaskDashboardTest(unittest.TestCase):
     self.assertEqual(len(self.runner.calls), 2)
     self.assertNotEqual(secondPayload["taskId"], firstPayload["taskId"])
     self.assertEqual(secondPayload["status"], "running")
+
+  def testDownloadShortcutTreatsFalseStringAsNotForced(self):
+    first = self.client.post(
+      "/api/downloads",
+      data=json.dumps({
+        "url": "https://music.apple.com/cn/album/intro-hit-me-hard-and-soft-tour-single/1895089347"
+      }),
+      content_type="application/json"
+    )
+    firstPayload = first.get_json()
+
+    second = self.client.post(
+      "/api/downloads",
+      data=json.dumps({
+        "url": "https://music.apple.com/cn/album/intro-hit-me-hard-and-soft-tour-single/1895089347",
+        "force": "false"
+      }),
+      content_type="application/json"
+    )
+    secondPayload = second.get_json()
+
+    self.assertEqual(second.status_code, 200)
+    self.assertEqual(len(self.runner.calls), 1)
+    self.assertEqual(secondPayload["taskId"], firstPayload["taskId"])
+    self.assertEqual(secondPayload["status"], "completed")
+
+  def testDownloadShortcutNormalizesTrailingUrlPunctuation(self):
+    response = self.client.post(
+      "/api/downloads",
+      data=json.dumps({
+        "url": "https://music.apple.com/cn/album/intro-hit-me-hard-and-soft-tour-single/1895089347）。"
+      }),
+      content_type="application/json"
+    )
+
+    self.assertEqual(response.status_code, 202)
+    self.assertEqual(
+      self.runner.calls[0][1],
+      "https://music.apple.com/cn/album/intro-hit-me-hard-and-soft-tour-single/1895089347",
+    )
+
+  def testDownloadHistoryBackfillsAlbumIdFromExistingUrls(self):
+    dbPath = f"{self.tempDir.name}/backfill-downloads.db"
+    with sqlite3.connect(dbPath) as connection:
+      connection.execute(
+        """
+        CREATE TABLE downloads (
+          url TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL,
+          status TEXT NOT NULL,
+          codec TEXT NOT NULL,
+          source TEXT NOT NULL DEFAULT 'web',
+          result_json TEXT NOT NULL DEFAULT '[]',
+          error TEXT NOT NULL DEFAULT '',
+          ever_completed INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+      )
+      connection.execute(
+        """
+        INSERT INTO downloads (url, task_id, status, codec)
+        VALUES ('https://music.apple.com/cn/album/example/123456?l=en', 'task-old', 'failed', 'alac')
+        """
+      )
+      connection.commit()
+
+    store = DownloadHistoryStore(dbPath)
+    record = store.getByUrl("https://music.apple.com/cn/album/example/123456?l=en")
+
+    self.assertIsNotNone(record)
+    self.assertEqual(record["album_id"], "123456")
+
+  def testDownloadHistoryClearsAlbumIdForSongUrlsDuringMigration(self):
+    dbPath = f"{self.tempDir.name}/song-backfill-downloads.db"
+    songUrl = "https://music.apple.com/cn/album/example/123456?i=999999"
+    with sqlite3.connect(dbPath) as connection:
+      connection.execute(
+        """
+        CREATE TABLE downloads (
+          url TEXT PRIMARY KEY,
+          album_id TEXT NOT NULL DEFAULT '',
+          task_id TEXT NOT NULL,
+          status TEXT NOT NULL,
+          codec TEXT NOT NULL,
+          source TEXT NOT NULL DEFAULT 'web',
+          result_json TEXT NOT NULL DEFAULT '[]',
+          error TEXT NOT NULL DEFAULT '',
+          ever_completed INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+      )
+      connection.execute(
+        """
+        INSERT INTO downloads (url, album_id, task_id, status, codec)
+        VALUES (?, '123456', 'task-song', 'failed', 'alac')
+        """,
+        (songUrl,),
+      )
+      connection.commit()
+
+    store = DownloadHistoryStore(dbPath)
+    record = store.getByUrl(songUrl)
+
+    self.assertIsNotNone(record)
+    self.assertEqual(record["album_id"], "")
+
+  def testDownloadShortcutDeduplicatesDifferentUrlsForSameAlbumId(self):
+    first = self.client.post(
+      "/api/downloads",
+      data=json.dumps({
+        "url": "https://music.apple.com/cn/album/example-one/1895089347"
+      }),
+      content_type="application/json"
+    )
+    firstPayload = first.get_json()
+
+    second = self.client.post(
+      "/api/downloads",
+      data=json.dumps({
+        "url": "https://music.apple.com/cn/album/example-two/1895089347?l=en"
+      }),
+      content_type="application/json"
+    )
+    secondPayload = second.get_json()
+
+    self.assertEqual(second.status_code, 200)
+    self.assertEqual(len(self.runner.calls), 1)
+    self.assertEqual(secondPayload["taskId"], firstPayload["taskId"])
+    self.assertEqual(secondPayload["status"], "completed")
+
+  def testDownloadShortcutDoesNotReuseCompletedSongAsWholeAlbum(self):
+    songResponse = self.client.post(
+      "/api/downloads",
+      data=json.dumps({
+        "url": "https://music.apple.com/cn/album/example-song/1895089347?i=1895089348"
+      }),
+      content_type="application/json"
+    )
+    songPayload = songResponse.get_json()
+
+    albumResponse = self.client.post(
+      "/api/downloads",
+      data=json.dumps({
+        "url": "https://music.apple.com/cn/album/example-album/1895089347"
+      }),
+      content_type="application/json"
+    )
+    albumPayload = albumResponse.get_json()
+
+    self.assertEqual(songResponse.status_code, 202)
+    self.assertEqual(albumResponse.status_code, 202)
+    self.assertNotEqual(albumPayload["taskId"], songPayload["taskId"])
+    self.assertEqual(len(self.runner.calls), 2)
 
   def testDownloadShortcutReturnsExistingRunningTask(self):
     self.runner.autoComplete = False
@@ -245,6 +565,212 @@ class FlaskDashboardTest(unittest.TestCase):
     self.assertEqual(secondPayload["status"], "running")
     self.assertEqual(secondPayload["message"], "download already in progress")
 
+  def testSecondTaskStaysQueuedUntilFirstTaskFinishes(self):
+    startedUrls: list[str] = []
+    firstTaskStarted = threading.Event()
+    releaseFirstTask = threading.Event()
+
+    def waitForStatus(client, taskId, expectedStatus, timeout=2.0):
+      deadline = time.time() + timeout
+      while time.time() < deadline:
+        payload = client.get(f"/api/tasks/{taskId}").get_json()
+        if payload["status"] == expectedStatus:
+          return payload
+        time.sleep(0.01)
+      self.fail(f"task {taskId} did not reach status {expectedStatus}")
+
+    def waitForHistoryStatus(historyStore, url, expectedStatus, timeout=2.0):
+      deadline = time.time() + timeout
+      while time.time() < deadline:
+        record = historyStore.getByUrl(url)
+        if record is not None and record["status"] == expectedStatus:
+          return record
+        time.sleep(0.01)
+      self.fail(f"history {url} did not reach status {expectedStatus}")
+
+    def fakeRunner(task, url, codec):
+      startedUrls.append(url)
+      task.setStage("downloading")
+      task.setStatus("running")
+      if len(startedUrls) == 1:
+        firstTaskStarted.set()
+        releaseFirstTask.wait(timeout=2.0)
+      task.setResult([
+        {
+          "path": f"/downloads/{len(startedUrls)}.flac",
+          "artist": "Example Artist",
+          "album": "Example Album",
+          "song": "Example Song",
+        }
+      ])
+      task.setStage("completed")
+      task.setStatus("completed")
+      task.setProgress(100)
+
+    app = createApp(
+      runnerFactory=lambda: fakeRunner,
+      dbPath=f"{self.tempDir.name}/queue-downloads.db"
+    )
+    app.config["TESTING"] = False
+    client = app.test_client()
+    historyStore = app.config["HISTORY_STORE"]
+
+    first = client.post(
+      "/api/downloads",
+      data=json.dumps({
+        "url": "https://music.apple.com/cn/album/first/111"
+      }),
+      content_type="application/json"
+    )
+    firstPayload = first.get_json()
+
+    self.assertTrue(firstTaskStarted.wait(timeout=2.0))
+    self.assertEqual(firstPayload["status"], "running")
+
+    second = client.post(
+      "/api/downloads",
+      data=json.dumps({
+        "url": "https://music.apple.com/cn/album/second/222"
+      }),
+      content_type="application/json"
+    )
+    secondPayload = second.get_json()
+
+    self.assertEqual(second.status_code, 202)
+    self.assertEqual(secondPayload["status"], "queued")
+    self.assertEqual(len(startedUrls), 1)
+
+    queuedTask = waitForStatus(client, secondPayload["taskId"], "queued")
+    self.assertEqual(queuedTask["stage"], "queued")
+
+    releaseFirstTask.set()
+
+    waitForStatus(client, firstPayload["taskId"], "completed")
+    completedSecondTask = waitForStatus(client, secondPayload["taskId"], "completed")
+    waitForHistoryStatus(historyStore, "https://music.apple.com/cn/album/first/111", "completed")
+    waitForHistoryStatus(historyStore, "https://music.apple.com/cn/album/second/222", "completed")
+
+    self.assertEqual(len(startedUrls), 2)
+    self.assertEqual(completedSecondTask["result"][0]["path"], "/downloads/2.flac")
+
+  def testRecoverPendingHistoryRestoresRunningAndQueuedTasks(self):
+    dbPath = f"{self.tempDir.name}/recover-downloads.db"
+    historyStore = DownloadHistoryStore(dbPath)
+    historyStore.saveRunning(
+      "https://music.apple.com/cn/album/recover-running/111",
+      "recover-running-task",
+      "alac",
+      "telegram",
+    )
+    historyStore.saveQueued(
+      "https://music.apple.com/cn/album/recover-queued/222",
+      "recover-queued-task",
+      "alac",
+      "telegram",
+    )
+    startedUrls: list[str] = []
+    firstTaskStarted = threading.Event()
+    releaseFirstTask = threading.Event()
+
+    def waitForHistoryStatus(store, url, expectedStatus, timeout=2.0):
+      deadline = time.time() + timeout
+      while time.time() < deadline:
+        record = store.getByUrl(url)
+        if record is not None and record["status"] == expectedStatus:
+          return record
+        time.sleep(0.01)
+      self.fail(f"history {url} did not reach status {expectedStatus}")
+
+    def recoveredRunner(task, url, codec):
+      startedUrls.append(url)
+      task.setStage("downloading")
+      task.setStatus("running")
+      if url.endswith("/recover-running/111"):
+        firstTaskStarted.set()
+        releaseFirstTask.wait(timeout=2.0)
+      task.setResult([
+        {
+          "path": f"/downloads/{task.id}.flac",
+          "artist": "Recovered Artist",
+          "album": "Recovered Album",
+          "song": "Recovered Song",
+        }
+      ])
+      task.setStage("completed")
+      task.setStatus("completed")
+      task.setProgress(100)
+
+    recoveredApp = createApp(
+      runnerFactory=lambda: recoveredRunner,
+      dbPath=dbPath,
+    )
+    recoveredClient = recoveredApp.test_client()
+    recoveredHistoryStore = recoveredApp.config["HISTORY_STORE"]
+
+    self.assertTrue(firstTaskStarted.wait(timeout=2.0))
+    tasks = recoveredClient.get("/api/tasks").get_json()
+    tasksById = {task["taskId"]: task for task in tasks}
+
+    self.assertEqual(tasksById["recover-running-task"]["status"], "running")
+    self.assertEqual(tasksById["recover-queued-task"]["status"], "queued")
+    self.assertEqual(tasksById["recover-running-task"]["source"], "telegram")
+    self.assertEqual(tasksById["recover-queued-task"]["source"], "telegram")
+
+    releaseFirstTask.set()
+    waitForHistoryStatus(
+      recoveredHistoryStore,
+      "https://music.apple.com/cn/album/recover-running/111",
+      "completed",
+    )
+    waitForHistoryStatus(
+      recoveredHistoryStore,
+      "https://music.apple.com/cn/album/recover-queued/222",
+      "completed",
+    )
+
+    self.assertEqual(startedUrls, [
+      "https://music.apple.com/cn/album/recover-running/111",
+      "https://music.apple.com/cn/album/recover-queued/222",
+    ])
+
+  def testRecoverPendingHistoryExpiresOldRunningTasks(self):
+    dbPath = f"{self.tempDir.name}/recover-expired-downloads.db"
+    configPath = Path(self.tempDir.name) / "recover-config.yaml"
+    configPath.write_text("recover-pending-max-age-hours: 1\n", encoding="utf-8")
+    historyStore = DownloadHistoryStore(dbPath)
+    historyStore.saveRunning(
+      "https://music.apple.com/cn/album/recover-expired/333",
+      "recover-expired-task",
+      "alac",
+      "telegram",
+    )
+    with sqlite3.connect(dbPath) as connection:
+      connection.execute(
+        "UPDATE downloads SET updated_at = '2000-01-01 00:00:00' WHERE url = ?",
+        ("https://music.apple.com/cn/album/recover-expired/333",),
+      )
+      connection.commit()
+    calls = []
+    originalConfigPath = os.environ.get("WEBAPP_CONFIG_PATH")
+    try:
+      os.environ["WEBAPP_CONFIG_PATH"] = str(configPath)
+      recoveredApp = createApp(
+        runnerFactory=lambda: lambda task, url, codec: calls.append(url),
+        dbPath=dbPath,
+      )
+    finally:
+      if originalConfigPath is None:
+        os.environ.pop("WEBAPP_CONFIG_PATH", None)
+      else:
+        os.environ["WEBAPP_CONFIG_PATH"] = originalConfigPath
+
+    record = recoveredApp.config["HISTORY_STORE"].getByUrl("https://music.apple.com/cn/album/recover-expired/333")
+
+    self.assertEqual(calls, [])
+    self.assertIsNotNone(record)
+    self.assertEqual(record["status"], "failed")
+    self.assertIn("expired", record["error"])
+
   def testDownloadShortcutReplacesStaleRunningTask(self):
     self.runner.autoComplete = False
     first = self.client.post(
@@ -256,10 +782,14 @@ class FlaskDashboardTest(unittest.TestCase):
     )
     firstPayload = first.get_json()
 
-    restartedRunner = FakeRunner()
+    restartedResultPath = Path(self.tempDir.name) / "downloads" / "ALAC" / "restarted-example.flac"
+    restartedResultPath.parent.mkdir(parents=True, exist_ok=True)
+    restartedResultPath.write_text("fake flac", encoding="utf-8")
+    restartedRunner = FakeRunner(str(restartedResultPath))
     restartedApp = createApp(
       runnerFactory=lambda: restartedRunner,
-      dbPath=f"{self.tempDir.name}/downloads.db"
+      dbPath=f"{self.tempDir.name}/downloads.db",
+      recoverPending=False,
     )
     restartedApp.config["TESTING"] = True
     restartedClient = restartedApp.test_client()
@@ -276,6 +806,195 @@ class FlaskDashboardTest(unittest.TestCase):
     self.assertEqual(second.status_code, 202)
     self.assertEqual(len(restartedRunner.calls), 1)
     self.assertNotEqual(secondPayload["taskId"], firstPayload["taskId"])
+
+  def testRetryFailedTasksReturnsZeroWhenNoFailures(self):
+    response = self.client.post("/api/tasks/retry-failed")
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(payload["retriedCount"], 0)
+    self.assertEqual(payload["skippedCompletedCount"], 0)
+    self.assertEqual(payload["skippedRunningCount"], 0)
+
+  def testRetryFailedTasksSkipsCompletedUrls(self):
+    completed = self.client.post(
+      "/api/downloads",
+      data=json.dumps({
+        "url": "https://music.apple.com/cn/album/intro-hit-me-hard-and-soft-tour-single/1895089347"
+      }),
+      content_type="application/json"
+    )
+    completedPayload = completed.get_json()
+    taskStore = self.client.application.config["TASK_STORE"]
+    failedTask = taskStore.createTask(
+      "https://music.apple.com/cn/album/intro-hit-me-hard-and-soft-tour-single/1895089347",
+      "alac",
+      "telegram"
+    )
+    failedTask.setStage("failed")
+    failedTask.setStatus("failed")
+    failedTask.setError("download failed")
+
+    response = self.client.post("/api/tasks/retry-failed")
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(len(self.runner.calls), 1)
+    self.assertEqual(payload["retriedCount"], 0)
+    self.assertEqual(payload["skippedCompletedCount"], 1)
+    self.assertEqual(payload["skippedCompletedUrls"], [failedTask.url])
+    self.assertEqual(payload["retriedTaskIds"], [])
+    self.assertEqual(completedPayload["taskId"], self.client.get(f"/api/tasks/{completedPayload['taskId']}").get_json()["taskId"])
+
+  def testRetryFailedTasksSkipsUrlsThatAreAlreadyRunning(self):
+    taskStore = self.client.application.config["TASK_STORE"]
+    failedTask = taskStore.createTask(
+      "https://music.apple.com/cn/album/happier-than-ever/1564530719",
+      "alac",
+      "web"
+    )
+    failedTask.setStage("failed")
+    failedTask.setStatus("failed")
+    failedTask.setError("download failed")
+
+    runningTask = taskStore.createTask(
+      "https://music.apple.com/cn/album/happier-than-ever/1564530719",
+      "alac",
+      "telegram"
+    )
+    runningTask.setStage("queued")
+    runningTask.setStatus("running")
+
+    response = self.client.post("/api/tasks/retry-failed")
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(payload["retriedCount"], 0)
+    self.assertEqual(payload["skippedRunningCount"], 1)
+    self.assertEqual(payload["skippedRunningUrls"], [failedTask.url])
+    self.assertEqual(len(self.runner.calls), 0)
+
+  def testRetryFailedTasksDeduplicatesFailedUrlsAndPreservesSource(self):
+    taskStore = self.client.application.config["TASK_STORE"]
+    firstFailedTask = taskStore.createTask(
+      "https://music.apple.com/cn/album/hit-me-hard-and-soft/1739659134",
+      "alac",
+      "telegram"
+    )
+    firstFailedTask.setStage("failed")
+    firstFailedTask.setStatus("failed")
+    firstFailedTask.setError("download failed")
+
+    secondFailedTask = taskStore.createTask(
+      "https://music.apple.com/cn/album/hit-me-hard-and-soft/1739659134",
+      "alac",
+      "web"
+    )
+    secondFailedTask.setStage("failed")
+    secondFailedTask.setStatus("failed")
+    secondFailedTask.setError("download failed")
+
+    response = self.client.post("/api/tasks/retry-failed")
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(payload["retriedCount"], 1)
+    self.assertEqual(payload["skippedCompletedCount"], 0)
+    self.assertEqual(payload["skippedRunningCount"], 0)
+    self.assertEqual(len(self.runner.calls), 1)
+
+    taskResponse = self.client.get(f"/api/tasks/{payload['retriedTaskIds'][0]}")
+    taskPayload = taskResponse.get_json()
+    self.assertEqual(taskPayload["source"], "telegram")
+
+  def testRetryFailedTasksSkipsUrlThatIsAlreadyQueued(self):
+    taskStore = self.client.application.config["TASK_STORE"]
+    failedTask = taskStore.createTask(
+      "https://music.apple.com/cn/album/queued-retry/777",
+      "alac",
+      "telegram"
+    )
+    failedTask.setStage("failed")
+    failedTask.setStatus("failed")
+    failedTask.setError("download failed")
+
+    queuedTask = taskStore.createTask(
+      "https://music.apple.com/cn/album/queued-retry/777",
+      "alac",
+      "telegram"
+    )
+    queuedTask.setStage("queued")
+    queuedTask.setStatus("queued")
+
+    response = self.client.post("/api/tasks/retry-failed")
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(payload["retriedCount"], 0)
+    self.assertEqual(payload["skippedRunningCount"], 1)
+    self.assertEqual(payload["skippedRunningUrls"], [failedTask.url])
+    self.assertEqual(len(self.runner.calls), 0)
+
+  def testRetryFailedTasksPreservesOriginalCodec(self):
+    taskStore = self.client.application.config["TASK_STORE"]
+    failedTask = taskStore.createTask(
+      "https://music.apple.com/cn/album/aac-retry/888",
+      "aac",
+      "telegram"
+    )
+    failedTask.setStage("failed")
+    failedTask.setStatus("failed")
+    failedTask.setError("download failed")
+
+    response = self.client.post("/api/tasks/retry-failed")
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(payload["retriedCount"], 1)
+    self.assertEqual(len(self.runner.calls), 1)
+    self.assertEqual(self.runner.calls[0][2], "aac")
+
+  def testHistoryRetryFailedSkipsUrlThatIsAlreadyQueued(self):
+    taskStore = self.client.application.config["TASK_STORE"]
+    historyStore = self.client.application.config["HISTORY_STORE"]
+    historyStore.saveFailed(
+      "https://music.apple.com/cn/album/history-queued/555",
+      "old-task",
+      "alac",
+      "error"
+    )
+    queuedTask = taskStore.createTask(
+      "https://music.apple.com/cn/album/history-queued/555",
+      "alac",
+      "web"
+    )
+    queuedTask.setStage("queued")
+    queuedTask.setStatus("queued")
+
+    response = self.client.post("/api/history/retry-failed")
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(payload["retriedCount"], 0)
+    self.assertEqual(payload["skippedRunningCount"], 1)
+    self.assertIn("https://music.apple.com/cn/album/history-queued/555", payload["skippedRunningUrls"])
+
+  def testHistoryRetryFailedPreservesStoredCodec(self):
+    historyStore = self.client.application.config["HISTORY_STORE"]
+    historyStore.saveFailed(
+      "https://music.apple.com/cn/album/history-aac/556",
+      "old-task",
+      "aac",
+      "error"
+    )
+
+    response = self.client.post("/api/history/retry-failed")
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(payload["retriedCount"], 1)
+    self.assertEqual(len(self.runner.calls), 1)
+    self.assertEqual(self.runner.calls[0][2], "aac")
 
   def testPipelineCallsPostProcessing(self):
     scriptCalls: list[list[str]] = []
@@ -327,12 +1046,71 @@ class FlaskDashboardTest(unittest.TestCase):
 
     self.assertEqual(response.status_code, 202)
     self.assertEqual(len(scriptCalls), 2)
-    self.assertTrue(scriptCalls[0][1].endswith("convert_to_flac.py"))
-    self.assertTrue(scriptCalls[0][2].endswith("example.m4a"))
-    self.assertTrue(scriptCalls[1][1].endswith("build_nfo.py"))
-    self.assertEqual(scriptCalls[1][2], self.tempDir.name)
+    self.assertEqual(scriptCalls[0][:3], ["python", "-m", "tools.convert_to_flac"])
+    self.assertTrue(scriptCalls[0][3].endswith("example.m4a"))
+    self.assertEqual(scriptCalls[1][:3], ["python", "-m", "tools.build_nfo"])
+    self.assertEqual(scriptCalls[1][3], self.tempDir.name)
     self.assertEqual(len(self.runner.calls), 1)
     self.assertEqual(self.runner.calls[0][2], "alac")
+
+  def testPipelineRemovesOriginalWhenConfigDisablesKeepingIt(self):
+    scriptCalls: list[list[str]] = []
+    sourcePath = f"{self.tempDir.name}/example.m4a"
+    outputPath = f"{self.tempDir.name}/example.flac"
+    configPath = f"{self.tempDir.name}/config.yaml"
+    with open(sourcePath, "wb") as handle:
+      handle.write(b"fake m4a")
+    with open(outputPath, "wb") as handle:
+      handle.write(b"fake flac")
+    with open(configPath, "w", encoding="utf-8") as handle:
+      handle.write('convert-keep-original: false\n')
+
+    def fakeDownloadRunner(task, url, codec):
+      task.setResult([
+        {
+          "path": sourcePath,
+          "artist": "Example Artist",
+          "album": "Example Album",
+          "song": "Example Song"
+        }
+      ])
+      task.setStatus("completed")
+
+    class RecordingPipelineRunner(PipelineRunner):
+      def __init__(self, downloadRunner):
+        super().__init__(downloadRunner)
+
+      def _runScript(self, task, command):
+        scriptCalls.append(command)
+        if command[1].endswith("convert_to_flac.py"):
+          return outputPath
+        return ""
+
+    originalConfigPath = os.environ.get("WEBAPP_CONFIG_PATH")
+    try:
+      os.environ["WEBAPP_CONFIG_PATH"] = configPath
+      app = createApp(
+        runnerFactory=lambda: RecordingPipelineRunner(fakeDownloadRunner),
+        dbPath=f"{self.tempDir.name}/downloads.db"
+      )
+      app.config["TESTING"] = True
+      client = app.test_client()
+
+      response = client.post(
+        "/api/downloads",
+        data=json.dumps({
+          "url": "https://music.apple.com/cn/album/intro-hit-me-hard-and-soft-tour-single/1895089347"
+        }),
+        content_type="application/json"
+      )
+
+      self.assertEqual(response.status_code, 202)
+      self.assertIn("--remove-original", scriptCalls[0])
+    finally:
+      if originalConfigPath is None:
+        os.environ.pop("WEBAPP_CONFIG_PATH", None)
+      else:
+        os.environ["WEBAPP_CONFIG_PATH"] = originalConfigPath
 
   def testPipelineUsesDerivedFlacPathForNfo(self):
     sourcePath = f"{self.tempDir.name}/example.m4a"
@@ -361,7 +1139,7 @@ class FlaskDashboardTest(unittest.TestCase):
 
       def _runScript(self, task, command):
         scriptCalls.append(command)
-        if command[1].endswith("convert_to_flac.py"):
+        if command[:3] == ["python", "-m", "tools.convert_to_flac"]:
           return "2026-04-29 20:45:31 | INFO | 所有文件转换成功!"
         return ""
 
@@ -386,7 +1164,7 @@ class FlaskDashboardTest(unittest.TestCase):
 
     self.assertEqual(taskPayload["status"], "completed")
     self.assertEqual(taskPayload["result"][0]["path"], derivedFlacPath)
-    self.assertEqual(scriptCalls[1][2], self.tempDir.name)
+    self.assertEqual(scriptCalls[1][3], self.tempDir.name)
 
   def testPipelineFailsWhenSourceFileMissing(self):
     def fakeDownloadRunner(task, url, codec):
@@ -421,6 +1199,368 @@ class FlaskDashboardTest(unittest.TestCase):
 
     self.assertEqual(taskPayload["status"], "failed")
     self.assertIn("Source file not accessible", taskPayload["error"])
+
+  def testHistoryReturnsDownloadRecords(self):
+    self.client.post(
+      "/api/downloads",
+      data=json.dumps({
+        "url": "https://music.apple.com/cn/album/intro-hit-me-hard-and-soft-tour-single/1895089347"
+      }),
+      content_type="application/json"
+    )
+
+    response = self.client.get("/api/history")
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 200)
+    self.assertIsInstance(payload, list)
+    self.assertEqual(len(payload), 1)
+    self.assertEqual(payload[0]["url"], "https://music.apple.com/cn/album/intro-hit-me-hard-and-soft-tour-single/1895089347")
+    self.assertEqual(payload[0]["status"], "completed")
+    self.assertIn("created_at", payload[0])
+    self.assertIn("updated_at", payload[0])
+
+  def testHistoryRetryFailedRetriesFailedNeverCompletedUrl(self):
+    historyStore = self.client.application.config["HISTORY_STORE"]
+    historyStore.saveFailed(
+      "https://music.apple.com/cn/album/never-completed/111",
+      "old-task-id",
+      "alac",
+      "download error"
+    )
+
+    response = self.client.post("/api/history/retry-failed")
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(payload["retriedCount"], 1)
+    self.assertEqual(len(payload["retriedTaskIds"]), 1)
+    self.assertEqual(payload["skippedCompletedCount"], 0)
+    self.assertEqual(len(self.runner.calls), 1)
+
+  def testHistoryRetryFailedSkipsUrlThatHasCompleted(self):
+    historyStore = self.client.application.config["HISTORY_STORE"]
+    completedPath = Path(self.tempDir.name) / "completed-example.flac"
+    completedPath.write_text("fake flac", encoding="utf-8")
+    historyStore.saveRunning(
+      "https://music.apple.com/cn/album/has-success/222",
+      "running-task",
+      "alac"
+    )
+    historyStore.saveCompleted(
+      "https://music.apple.com/cn/album/has-success/222",
+      "completed-task",
+      "alac",
+      [{"path": str(completedPath)}]
+    )
+    historyStore.saveFailed(
+      "https://music.apple.com/cn/album/has-success/222",
+      "failed-task",
+      "alac",
+      "later error"
+    )
+
+    response = self.client.post("/api/history/retry-failed")
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(payload["retriedCount"], 0)
+    self.assertEqual(payload["skippedCompletedCount"], 1)
+    self.assertIn("https://music.apple.com/cn/album/has-success/222", payload["skippedCompletedUrls"])
+
+  def testHistoryRetryFailedDeduplicatesUrls(self):
+    historyStore = self.client.application.config["HISTORY_STORE"]
+    historyStore.saveFailed(
+      "https://music.apple.com/cn/album/dup-url/333",
+      "task-a",
+      "alac",
+      "first error"
+    )
+    historyStore.saveFailed(
+      "https://music.apple.com/cn/album/dup-url/333",
+      "task-b",
+      "alac",
+      "second error"
+    )
+
+    response = self.client.post("/api/history/retry-failed")
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(payload["retriedCount"], 1)
+    self.assertEqual(len(self.runner.calls), 1)
+
+  def testHistoryRetryFailedSkipsUrlWithRunningTask(self):
+    taskStore = self.client.application.config["TASK_STORE"]
+    historyStore = self.client.application.config["HISTORY_STORE"]
+    historyStore.saveFailed(
+      "https://music.apple.com/cn/album/running-url/444",
+      "old-task",
+      "alac",
+      "error"
+    )
+    runningTask = taskStore.createTask(
+      "https://music.apple.com/cn/album/running-url/444",
+      "alac",
+      "web"
+    )
+    runningTask.setStatus("running")
+
+    response = self.client.post("/api/history/retry-failed")
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(payload["retriedCount"], 0)
+    self.assertEqual(payload["skippedRunningCount"], 1)
+    self.assertIn("https://music.apple.com/cn/album/running-url/444", payload["skippedRunningUrls"])
+
+  def testHistorySingleRetryAllowsFailedNeverCompletedUrl(self):
+    historyStore = self.client.application.config["HISTORY_STORE"]
+    historyStore.saveFailed(
+      "https://music.apple.com/cn/album/single-retry/111",
+      "task-single",
+      "alac",
+      "download failed"
+    )
+
+    response = self.client.post(
+      "/api/history/retry",
+      data=json.dumps({"url": "https://music.apple.com/cn/album/single-retry/111"}),
+      content_type="application/json"
+    )
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 202)
+    self.assertEqual(payload["status"], "running")
+    self.assertEqual(len(self.runner.calls), 1)
+
+  def testHistorySingleRetryRejectsUrlThatIsAlreadyQueued(self):
+    taskStore = self.client.application.config["TASK_STORE"]
+    historyStore = self.client.application.config["HISTORY_STORE"]
+    historyStore.saveFailed(
+      "https://music.apple.com/cn/album/single-queued/333",
+      "task-single",
+      "alac",
+      "download failed"
+    )
+    queuedTask = taskStore.createTask(
+      "https://music.apple.com/cn/album/single-queued/333",
+      "alac",
+      "web"
+    )
+    queuedTask.setStage("queued")
+    queuedTask.setStatus("queued")
+
+    response = self.client.post(
+      "/api/history/retry",
+      data=json.dumps({"url": "https://music.apple.com/cn/album/single-queued/333"}),
+      content_type="application/json"
+    )
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 409)
+    self.assertEqual(payload["error"], "a task for this URL is already queued")
+    self.assertEqual(len(self.runner.calls), 0)
+
+  def testHistorySingleRetryRejectsUrlThatHasCompletedBefore(self):
+    historyStore = self.client.application.config["HISTORY_STORE"]
+    completedPath = Path(self.tempDir.name) / "single-completed-example.flac"
+    completedPath.write_text("fake flac", encoding="utf-8")
+    historyStore.saveRunning(
+      "https://music.apple.com/cn/album/single-retry-completed/222",
+      "running-task",
+      "alac"
+    )
+    historyStore.saveCompleted(
+      "https://music.apple.com/cn/album/single-retry-completed/222",
+      "completed-task",
+      "alac",
+      [{"path": str(completedPath)}]
+    )
+    historyStore.saveFailed(
+      "https://music.apple.com/cn/album/single-retry-completed/222",
+      "failed-task",
+      "alac",
+      "later failure"
+    )
+
+    response = self.client.post(
+      "/api/history/retry",
+      data=json.dumps({"url": "https://music.apple.com/cn/album/single-retry-completed/222"}),
+      content_type="application/json"
+    )
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 400)
+    self.assertEqual(len(self.runner.calls), 0)
+
+
+  def testSubscriptionSearchReturnsArtistResults(self):
+    fakeAppleMusic = FakeAppleMusicClient()
+    self.client.application.config["APPLE_MUSIC_CLIENT_FACTORY"] = lambda: fakeAppleMusic
+
+    response = self.client.post(
+      "/api/subscriptions/search",
+      data=json.dumps({"term": "Example"}),
+      content_type="application/json",
+    )
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(payload["results"][0]["artistId"], "12345")
+    self.assertEqual(payload["results"][0]["artistName"], "Example Artist")
+
+  def testCreateSubscriptionScansAndQueuesMissingAlbums(self):
+    fakeAppleMusic = FakeAppleMusicClient()
+    fakeAppleMusic.albums = [
+      AppleMusicAlbum(
+        albumId="111",
+        name="Already Done",
+        url="https://music.apple.com/cn/album/already-done/111",
+        releaseDate="2024-01-01",
+      ),
+      AppleMusicAlbum(
+        albumId="222",
+        name="Failed Before",
+        url="https://music.apple.com/cn/album/failed-before/222",
+        releaseDate="2024-02-01",
+      ),
+      AppleMusicAlbum(
+        albumId="333",
+        name="New Album",
+        url="https://music.apple.com/cn/album/new-album/333",
+        releaseDate="2024-03-01",
+      ),
+    ]
+    self.client.application.config["APPLE_MUSIC_CLIENT_FACTORY"] = lambda: fakeAppleMusic
+    historyStore = self.client.application.config["HISTORY_STORE"]
+    completedPath = Path(self.tempDir.name) / "completed-subscription.flac"
+    completedPath.write_text("fake flac", encoding="utf-8")
+    historyStore.saveRunning(
+      "https://music.apple.com/cn/album/old-slug/111?l=en",
+      "completed-task",
+      "alac",
+      "web",
+    )
+    historyStore.saveCompleted(
+      "https://music.apple.com/cn/album/old-slug/111?l=en",
+      "completed-task",
+      "alac",
+      [{"path": str(completedPath)}],
+    )
+    historyStore.saveFailed(
+      "https://music.apple.com/cn/album/failed-before/222",
+      "failed-task",
+      "alac",
+      "error",
+    )
+
+    response = self.client.post(
+      "/api/subscriptions",
+      data=json.dumps({"artistUrl": "https://music.apple.com/cn/artist/example-artist/12345"}),
+      content_type="application/json",
+    )
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 201)
+    self.assertEqual(payload["scan"]["foundCount"], 3)
+    self.assertEqual(payload["scan"]["queuedCount"], 2)
+    self.assertEqual(payload["scan"]["skippedCompletedCount"], 1)
+    self.assertEqual(len(self.runner.calls), 2)
+
+    tasks = self.client.get("/api/tasks").get_json()
+    self.assertEqual({task["source"] for task in tasks}, {"subscription"})
+
+  def testSubscriptionScanSkipsActiveAlbumByAlbumId(self):
+    fakeAppleMusic = FakeAppleMusicClient()
+    fakeAppleMusic.albums = [
+      AppleMusicAlbum(
+        albumId="555",
+        name="Active Album",
+        url="https://music.apple.com/cn/album/new-active-slug/555",
+      )
+    ]
+    self.client.application.config["APPLE_MUSIC_CLIENT_FACTORY"] = lambda: fakeAppleMusic
+    taskStore = self.client.application.config["TASK_STORE"]
+    activeTask = taskStore.createTask(
+      "https://music.apple.com/cn/album/old-active-slug/555?l=en",
+      "alac",
+      "telegram",
+    )
+    activeTask.setStage("downloading")
+    activeTask.setStatus("running")
+
+    response = self.client.post(
+      "/api/subscriptions",
+      data=json.dumps({"artistUrl": "https://music.apple.com/cn/artist/example-artist/12345"}),
+      content_type="application/json",
+    )
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 201)
+    self.assertEqual(payload["scan"]["queuedCount"], 0)
+    self.assertEqual(payload["scan"]["skippedActiveCount"], 1)
+    self.assertEqual(len(self.runner.calls), 0)
+
+  def testSubscriptionListAndDeleteByArtistId(self):
+    fakeAppleMusic = FakeAppleMusicClient()
+    fakeAppleMusic.albums = []
+    self.client.application.config["APPLE_MUSIC_CLIENT_FACTORY"] = lambda: fakeAppleMusic
+
+    self.client.post(
+      "/api/subscriptions",
+      data=json.dumps({"artistUrl": "https://music.apple.com/cn/artist/example-artist/12345"}),
+      content_type="application/json",
+    )
+
+    listResponse = self.client.get("/api/subscriptions")
+    listPayload = listResponse.get_json()
+    deleteResponse = self.client.delete("/api/subscriptions/by-artist/12345")
+    afterDelete = self.client.get("/api/subscriptions").get_json()
+
+    self.assertEqual(listResponse.status_code, 200)
+    self.assertEqual(len(listPayload), 1)
+    self.assertEqual(deleteResponse.status_code, 200)
+    self.assertEqual(afterDelete, [])
+
+
+class DownloaderRunnerTest(unittest.TestCase):
+  def testIgnoresRetryPromptAfterCompletedSummary(self):
+    task = DownloadTask(
+      id="task-id",
+      url="https://music.apple.com/cn/album/example/123",
+      codec="alac"
+    )
+
+    updateTaskFromLine(task, "=======  [✔ ] Completed: 1/1  |  [⚠ ] Warnings: 0  |  [✖ ] Errors: 1  =======")
+    updateTaskFromLine(task, "Error detected, press Enter to try again...")
+
+    self.assertEqual(task.status, "completed")
+    self.assertEqual(task.stage, "completed")
+    self.assertEqual(task.progress, 100)
+
+  def testMarksTaskFailedWhenProcessExitsNonZeroAfterNetworkError(self):
+    task = DownloadTask(
+      id="task-id",
+      url="https://music.apple.com/cn/album/example/123",
+      codec="alac"
+    )
+
+    class FakeProcess:
+      def __init__(self):
+        self.stdout = io.StringIO(
+          "dial tcp 192.168.100.56:10020: connect: no route to host\n"
+        )
+
+      def wait(self):
+        return 1
+
+    with patch("webapp.app.subprocess.Popen", return_value=FakeProcess()):
+      DownloaderRunner()(task, task.url, task.codec)
+
+    self.assertEqual(task.status, "failed")
+    self.assertEqual(task.stage, "failed")
+    self.assertIn("no route to host", task.error)
 
 
 if __name__ == "__main__":

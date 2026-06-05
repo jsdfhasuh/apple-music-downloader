@@ -1,10 +1,18 @@
-# Copy this file to webapp/config.yaml and fill in real values before running the bot.
+# Copy this file to data/config.yaml for container use, or point WEBAPP_CONFIG_PATH to it.
 
 # Used by tools/build_nfo.py when the webapp post-processing step moves albums.
 completed-root-folder: "/downloads/completed"
+
+# Apple Music lookup settings used by artist subscriptions.
+storefront: "us"
+language: "en-US"
+authorization-token: "your-authorization-token"
 
 # Telegram bot settings.
 telegram-bot-token: ""
 telegram-allowed-chat-id: ""
 telegram-webapp-base-url: "http://127.0.0.1:5000"
-telegram-store-path: "webapp/data/telegram_tasks.db"
+telegram-store-path: "data/telegram_tasks.db"
+
+# Recover queued/running tasks on webapp startup. Set to 0 to disable the age limit.
+recover-pending-max-age-hours: 12

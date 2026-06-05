@@ -9,6 +9,8 @@
 !README-CN.md
 !docs/
 !docs/**
+!scripts/
+!scripts/**
 !webapp/
 !webapp/**
 webapp/**/__pycache__/

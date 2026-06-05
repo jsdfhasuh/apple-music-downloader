@@ -27,6 +27,7 @@ def resolveConfigPath(explicitPath: Path | None = None) -> Path:
 
   webappDir = Path(__file__).resolve().parent
   for candidate in (
+    webappDir.parent / "data" / "config.yaml",
     webappDir.parent / "config.yaml",
     webappDir / "config.yaml",
     webappDir / "config.example.yaml",

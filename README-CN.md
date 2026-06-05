@@ -79,11 +79,12 @@ Telegram 私聊机器人：
 .venv/bin/python webapp/telegram_bot.py
 ```
 
-- Telegram 配置从 `config.yaml` 读取
+- 容器内优先从 `/app/data/config.yaml` 读取 Telegram 配置；本地开发回退到仓库根目录 `config.yaml`
 - 必填配置项是 `telegram-bot-token`、`telegram-allowed-chat-id`、`telegram-webapp-base-url`，可选 `telegram-store-path`
 - 机器人只接受 `telegram-allowed-chat-id` 指定私聊里的消息
-- 每条消息只提取第一个 Apple Music URL，并调用 `/api/downloads`
-- 任务映射会保存在 `telegram-store-path` 指定路径，默认是 `webapp/data/telegram_tasks.db`
+- 每条消息会按顺序提取全部 Apple Music URL，对同一条消息内重复链接去重后，逐条调用 `/api/downloads`
+- `/force` 也支持在同一条消息里发送多个 Apple Music URL，并会对提取到的全部链接启用强制下载
+- 任务映射会保存在 `telegram-store-path` 指定路径，默认是 `data/telegram_tasks.db`
 - 下载完成或失败后，会回发到同一个 Telegram 私聊
 
 额外接口：

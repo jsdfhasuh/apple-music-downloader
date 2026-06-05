@@ -942,8 +942,13 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	}
 	if existsOriginal {
 		fmt.Println("Track already exists locally.")
-		counter.Success++
-		okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
+		track.SavePath = trackPath
+		err = writeMP4Tags(track, lrc)
+		if err != nil {
+			fmt.Println("\u26A0 Failed to write tags in existing media:", err)
+			counter.Error++
+			return
+		}
 
 		tArtistId := ""
 		if len(track.Resp.Relationships.Artists.Data) > 0 {
@@ -956,6 +961,8 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 			Album:    track.Resp.Attributes.AlbumName,
 			Song:     track.Resp.Attributes.Name,
 		})
+		counter.Success++
+		okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
 		return
 	}
 	if considerConverted {
@@ -1043,7 +1050,10 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	err = writeMP4Tags(track, lrc)
 	if err != nil {
 		fmt.Println("\u26A0 Failed to write tags in media:", err)
-		counter.Unavailable++
+		if removeErr := os.Remove(trackPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			fmt.Println("Failed to remove incomplete media:", removeErr)
+		}
+		counter.Error++
 		return
 	}
 
@@ -1778,6 +1788,16 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 	return nil
 }
 
+const maxMP4TagID = int64(2147483647)
+
+func parseMP4TagID(raw string) (int32, bool) {
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value < 0 || value > maxMP4TagID {
+		return 0, false
+	}
+	return int32(value), true
+}
+
 func writeMP4Tags(track *task.Track, lrc string) error {
 	t := &mp4tag.MP4Tags{
 		Title:      track.Resp.Attributes.Name,
@@ -1806,19 +1826,15 @@ func writeMP4Tags(track *task.Track, lrc string) error {
 
 	if Config.TagItunesID {
 		if track.PreType == "albums" {
-			albumID, err := strconv.ParseUint(track.PreID, 10, 32)
-			if err != nil {
-				return err
+			if albumID, ok := parseMP4TagID(track.PreID); ok {
+				t.ItunesAlbumID = albumID
 			}
-			t.ItunesAlbumID = int32(albumID)
 		}
 
 		if len(track.Resp.Relationships.Artists.Data) > 0 {
-			artistID, err := strconv.ParseUint(track.Resp.Relationships.Artists.Data[0].ID, 10, 32)
-			if err != nil {
-				return err
+			if artistID, ok := parseMP4TagID(track.Resp.Relationships.Artists.Data[0].ID); ok {
+				t.ItunesArtistID = artistID
 			}
-			t.ItunesArtistID = int32(artistID)
 		}
 	}
 

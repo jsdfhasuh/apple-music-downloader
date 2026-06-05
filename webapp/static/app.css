@@ -123,6 +123,19 @@ select {
   align-items: end;
 }
 
+.stacked-form {
+  display: grid;
+  gap: 12px;
+}
+
+.url-subscribe-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  margin-top: 14px;
+  align-items: end;
+}
+
 .compact {
   min-width: 180px;
 }
@@ -165,6 +178,21 @@ select {
 
 .primary-button:hover {
   background: #1d4ed8;
+}
+
+.secondary-button {
+  border: 1px solid #cbd5e1;
+  border-radius: 12px;
+  background: #ffffff;
+  color: #1f2937;
+  padding: 10px 14px;
+  font-size: 13px;
+  font-weight: bold;
+  cursor: pointer;
+}
+
+.secondary-button:hover {
+  background: #f8fafc;
 }
 
 .error-text {
@@ -290,6 +318,11 @@ select {
   color: #166534;
 }
 
+.task-source.subscription {
+  background: #fef3c7;
+  color: #92400e;
+}
+
 .task-progress {
   color: #374151;
   font-size: 13px;
@@ -302,6 +335,124 @@ select {
   font-size: 13px;
   line-height: 1.5;
   word-break: break-all;
+}
+
+.history-list {
+  display: grid;
+  gap: 12px;
+}
+
+.history-item {
+  border: 1px solid #dbe2ea;
+  border-radius: 14px;
+  background: #f8fafc;
+  padding: 14px;
+}
+
+.history-item.history-failed {
+  border-color: #fca5a5;
+  background: #fef2f2;
+}
+
+.history-item-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.history-status.failed {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.history-status.completed {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.history-status.running {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.history-url {
+  margin-top: 10px;
+  color: #111827;
+  font-size: 13px;
+  line-height: 1.5;
+  word-break: break-all;
+}
+
+.history-updated {
+  margin-top: 6px;
+  color: #6b7280;
+  font-size: 12px;
+}
+
+.history-retry-btn {
+  padding: 6px 12px;
+  font-size: 12px;
+}
+
+.artist-search-results,
+.subscription-list {
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.artist-result,
+.subscription-item {
+  border: 1px solid #dbe2ea;
+  border-radius: 14px;
+  background: #f8fafc;
+  padding: 14px;
+}
+
+.artist-result {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.artist-result p,
+.subscription-item p {
+  margin-top: 4px;
+  color: #6b7280;
+  font-size: 12px;
+}
+
+.subscription-item-top,
+.subscription-actions,
+.subscription-stats {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.subscription-stats {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  color: #4b5563;
+  font-size: 12px;
+}
+
+.subscription-actions {
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+
+.subscription-status {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.subscription-error-line {
+  color: #dc2626;
 }
 
 .stat-value {
@@ -339,9 +490,15 @@ select {
   }
 
   .form-row,
+  .url-subscribe-row,
   .progress-meta,
   .summary-grid {
     grid-template-columns: 1fr;
     display: grid;
+  }
+
+  .section-header {
+    align-items: start;
+    gap: 12px;
   }
 }

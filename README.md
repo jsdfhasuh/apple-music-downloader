@@ -120,12 +120,14 @@ Telegram private bot:
 .venv/bin/python webapp/telegram_bot.py
 ```
 
-- By default Telegram config is read from the repository root `config.yaml`.
-- You can also copy `webapp/config.example.yaml` to `webapp/config.yaml`, or set `WEBAPP_CONFIG_PATH` to a custom config file.
+- In containers, Telegram config is read from `/app/data/config.yaml` when present.
+- For local development, it falls back to the repository root `config.yaml`.
+- You can also set `WEBAPP_CONFIG_PATH` to a custom config file.
 - Required keys are `telegram-bot-token`, `telegram-allowed-chat-id`, `telegram-webapp-base-url`, and optional `telegram-store-path`
 - The bot only accepts private-chat messages from `telegram-allowed-chat-id`
-- The bot extracts the first Apple Music URL in a message and calls `/api/downloads`
-- Task state is persisted in the path from `telegram-store-path`, defaulting to `webapp/data/telegram_tasks.db`
+- The bot extracts all Apple Music URLs in a message, deduplicates repeated URLs within that message, and calls `/api/downloads` for each link in order
+- `/force` also supports multiple Apple Music URLs in a single message and applies force mode to every extracted link
+- Task state is persisted in the path from `telegram-store-path`, defaulting to `data/telegram_tasks.db`
 - Completion and failure messages are sent back to the same Telegram chat
 
 Webapp container runtime:
@@ -133,7 +135,7 @@ Webapp container runtime:
 - `webapp/Dockerfile` now starts both `webapp/app.py` and `webapp/telegram_bot.py`
 - Flask service logs and Telegram bot logs both go to the container stdout/stderr stream
 - Use `docker logs <container-name>` to inspect backend and bot logs together
-- The same logs are also written inside the container to `/app/logs/webapp.log` and `/app/logs/telegram-bot.log`
+- The same logs are also written inside the container to `/app/data/logs/webapp.log` and `/app/data/logs/telegram-bot.log`
 - If `webapp/config.yaml` does not contain Telegram credentials, the container starts the webapp and skips the bot
 
 Additional API:

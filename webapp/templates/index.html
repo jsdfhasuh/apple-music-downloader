@@ -80,12 +80,50 @@
         </section>
 
         <aside class="side-column">
+          <section class="card subscription-card">
+            <div class="section-header">
+              <h2>歌手订阅</h2>
+              <button id="scan-subscriptions-button" type="button" class="secondary-button">扫描全部</button>
+            </div>
+            <form id="subscription-search-form" class="stacked-form">
+              <label class="field">
+                <span>搜索歌手</span>
+                <input id="artist-search-input" name="artist-search" type="search" placeholder="Artist name">
+              </label>
+              <button type="submit" class="secondary-button">搜索</button>
+            </form>
+            <div id="artist-search-results" class="artist-search-results"></div>
+            <div class="url-subscribe-row">
+              <label class="field">
+                <span>歌手链接</span>
+                <input id="artist-url-input" name="artist-url" type="url" placeholder="https://music.apple.com/.../artist/...">
+              </label>
+              <button id="subscribe-url-button" type="button" class="primary-button">订阅</button>
+            </div>
+            <p id="subscription-error" class="error-text"></p>
+            <p id="subscription-note" class="info-text"></p>
+            <div id="subscription-list" class="subscription-list">
+              <p class="empty-text">暂无订阅</p>
+            </div>
+          </section>
+
           <section class="card task-list-card">
             <div class="section-header">
               <h2>任务列表</h2>
+              <button id="retry-failed-button" type="button" class="secondary-button">重试失败任务</button>
             </div>
             <div id="task-list" class="task-list">
               <p class="empty-text">暂无任务</p>
+            </div>
+          </section>
+
+          <section class="card history-card">
+            <div class="section-header">
+              <h2>历史记录</h2>
+              <button id="retry-history-failed-button" type="button" class="secondary-button">一键重试历史失败</button>
+            </div>
+            <div id="history-list" class="history-list">
+              <p class="empty-text">暂无历史</p>
             </div>
           </section>
 

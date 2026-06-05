@@ -1,0 +1,133 @@
+diff --git a/main.go b/main.go
+--- a/main.go
++++ b/main.go
+@@ -913,6 +913,31 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
+ 		convertedPath = strings.TrimSuffix(trackPath, filepath.Ext(trackPath)) + "." + strings.ToLower(Config.ConvertFormat)
+ 		considerConverted = true
+ 	}
++	// Fetch metadata used by tag writing before the existence check, so existing
++	// local media can be retagged instead of being reported as successful with
++	// stale or missing tags.
++	if track.PreType == "playlists" && Config.UseSongInfoForPlaylist {
++		track.GetAlbumData(token)
++	}
++
++	//get lrc
++	var lrc string = ""
++	if Config.EmbedLrc || Config.SaveLrcFile {
++		lrcStr, err := lyrics.Get(track.Storefront, track.ID, Config.LrcType, Config.Language, Config.LrcFormat, token, mediaUserToken)
++		if err != nil {
++			fmt.Println(err)
++		} else {
++			if Config.SaveLrcFile {
++				err := writeLyrics(track.SaveDir, lrcFilename, lrcStr)
++				if err != nil {
++					fmt.Printf("Failed to write lyrics")
++				}
++			}
++			if Config.EmbedLrc {
++				lrc = lrcStr
++			}
++		}
++	}
+ 	// Existence check now considers converted output (if original was deleted)
+ 	existsOriginal, err := fileExists(trackPath)
+ 	if err != nil {
+@@ -920,6 +940,14 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
+ 	}
+ 	if existsOriginal {
+ 		fmt.Println("Track already exists locally.")
++		track.SavePath = trackPath
++		err = writeMP4Tags(track, lrc)
++		if err != nil {
++			fmt.Println("\u26A0 Failed to write tags in existing media:", err)
++			counter.Error++
++			return
++		}
++
+ 		counter.Success++
+ 		okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
+ 
+@@ -958,30 +986,6 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
+ 			return
+ 		}
+ 	}
+-
+-	//提前获取到的播放列表下track所在的专辑信息
+-	if track.PreType == "playlists" && Config.UseSongInfoForPlaylist {
+-		track.GetAlbumData(token)
+-	}
+-
+-	//get lrc
+-	var lrc string = ""
+-	if Config.EmbedLrc || Config.SaveLrcFile {
+-		lrcStr, err := lyrics.Get(track.Storefront, track.ID, Config.LrcType, Config.Language, Config.LrcFormat, token, mediaUserToken)
+-		if err != nil {
+-			fmt.Println(err)
+-		} else {
+-			if Config.SaveLrcFile {
+-				err := writeLyrics(track.SaveDir, lrcFilename, lrcStr)
+-				if err != nil {
+-					fmt.Printf("Failed to write lyrics")
+-				}
+-			}
+-			if Config.EmbedLrc {
+-				lrc = lrcStr
+-			}
+-		}
+-	}
+ 
+ 	if needDlAacLc {
+ 		if len(mediaUserToken) <= 50 {
+@@ -1055,7 +1064,10 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
+ 	err = writeMP4Tags(track, lrc)
+ 	if err != nil {
+ 		fmt.Println("\u26A0 Failed to write tags in media:", err)
+-		counter.Unavailable++
++		if removeErr := os.Remove(trackPath); removeErr != nil && !os.IsNotExist(removeErr) {
++			fmt.Println("Failed to remove incomplete media:", removeErr)
++		}
++		counter.Error++
+ 		return
+ 	}
+ 
+@@ -1826,4 +1838,14 @@ func writeM3UPlaylist(folderPath string, name string, tracks []AddedTrack) error
+ 	return nil
+ }
+ 
++const maxMP4TagID = int64(2147483647)
++
++func parseMP4TagID(raw string) (int32, bool) {
++	value, err := strconv.ParseInt(raw, 10, 64)
++	if err != nil || value < 0 || value > maxMP4TagID {
++		return 0, false
++	}
++	return int32(value), true
++}
++
+ func writeMP4Tags(track *task.Track, lrc string) error {
+@@ -1854,20 +1872,16 @@ func writeMP4Tags(track *task.Track, lrc string) error {
+ 
+ 	if Config.TagItunesID {
+ 		if track.PreType == "albums" {
+-			albumID, err := strconv.ParseUint(track.PreID, 10, 64)
+-			if err != nil {
+-				return err
++			if albumID, ok := parseMP4TagID(track.PreID); ok {
++				t.ItunesAlbumID = albumID
+ 			}
+-			t.ItunesAlbumID = int32(albumID)
+ 		}
+ 
+ 		if len(track.Resp.Relationships.Artists.Data) > 0 {
+-			artistID, err := strconv.ParseUint(track.Resp.Relationships.Artists.Data[0].ID, 10, 64)
+-			if err != nil {
+-				return err
++			if artistID, ok := parseMP4TagID(track.Resp.Relationships.Artists.Data[0].ID); ok {
++				t.ItunesArtistID = artistID
+ 			}
+-			t.ItunesArtistID = int32(artistID)
+ 		}
+ 	}
+ 
+ 	if (track.PreType == "playlists" || track.PreType == "stations") && !Config.UseSongInfoForPlaylist {

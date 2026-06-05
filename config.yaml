@@ -48,20 +48,27 @@ use-songinfo-for-playlist: false
 dl-albumcover-for-playlist: false
 mv-audio-type: atmos  #atmos ac3 aac
 mv-max: 2160
-completed-root-folder: "/downloads/completed"
-telegram-bot-token: "your-telegram-bot-token"
-telegram-allowed-chat-id: "your-telegram-chat-id"
-telegram-webapp-base-url: "http://127.0.0.1:5000"
-telegram-store-path: "webapp/data/telegram_tasks.db"
 # storefront will be used only in searching. 
 # storefront is the 2-letter country code that are available in the urls (jp, ca, us etc.).
 # if your account is from Japan, you must use jp.
 # if the storefront is different from your account, you will see a "failed to get lyrics" error in most of the songs. By default the storefront is set to US if not set.
 storefront: "hk"
+
+# ============================================================================
+# Web / Telegram / Post-processing settings
+# ============================================================================
+
+completed-root-folder: "/downloads/completed"
+telegram-bot-token: "your-telegram-bot-token"
+telegram-allowed-chat-id: "your-telegram-chat-id"
+telegram-webapp-base-url: "http://127.0.0.1:5000"
+telegram-store-path: "data/telegram_tasks.db"
+recover-pending-max-age-hours: 12  # Recover queued/running tasks on webapp startup; 0 means no age limit
+
 # Conversion settings
 convert-after-download: false     # Enable post-download conversion (requires ffmpeg)
 convert-format: "flac"            # flac | mp3 | opus | wav | copy (no re-encode)
-convert-keep-original: false       # Keep original file after successful conversion
+convert-keep-original: false      # Keep original M4A file after successful conversion
 convert-skip-if-source-matches: true  # If already in target format, skip
 ffmpeg-path: "ffmpeg"             # Override if ffmpeg is not in PATH
 convert-extra-args: ""            # Additional raw args appended (advanced)
