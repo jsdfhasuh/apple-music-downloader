@@ -1268,6 +1268,37 @@ class FlaskDashboardTest(unittest.TestCase):
     self.assertEqual(payload["skippedCompletedCount"], 1)
     self.assertIn("https://music.apple.com/cn/album/has-success/222", payload["skippedCompletedUrls"])
 
+  def testHistoryRetryFailedSkipsDifferentUrlForCompletedAlbumId(self):
+    historyStore = self.client.application.config["HISTORY_STORE"]
+    completedPath = Path(self.tempDir.name) / "completed-album-id-example.flac"
+    completedPath.write_text("fake flac", encoding="utf-8")
+    historyStore.saveRunning(
+      "https://music.apple.com/cn/album/new-slug/999",
+      "completed-task",
+      "alac",
+    )
+    historyStore.saveCompleted(
+      "https://music.apple.com/cn/album/new-slug/999",
+      "completed-task",
+      "alac",
+      [{"path": str(completedPath)}],
+    )
+    historyStore.saveFailed(
+      "https://music.apple.com/cn/album/old-slug/999?l=en",
+      "failed-task",
+      "alac",
+      "old failure",
+    )
+
+    response = self.client.post("/api/history/retry-failed")
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(payload["retriedCount"], 0)
+    self.assertEqual(payload["skippedCompletedCount"], 1)
+    self.assertIn("https://music.apple.com/cn/album/old-slug/999?l=en", payload["skippedCompletedUrls"])
+    self.assertEqual(len(self.runner.calls), 0)
+
   def testHistoryRetryFailedDeduplicatesUrls(self):
     historyStore = self.client.application.config["HISTORY_STORE"]
     historyStore.saveFailed(
@@ -1394,6 +1425,38 @@ class FlaskDashboardTest(unittest.TestCase):
     self.assertEqual(response.status_code, 400)
     self.assertEqual(len(self.runner.calls), 0)
 
+  def testHistorySingleRetryRejectsDifferentUrlForCompletedAlbumId(self):
+    historyStore = self.client.application.config["HISTORY_STORE"]
+    completedPath = Path(self.tempDir.name) / "single-completed-album-id.flac"
+    completedPath.write_text("fake flac", encoding="utf-8")
+    historyStore.saveRunning(
+      "https://music.apple.com/cn/album/new-single-slug/999",
+      "completed-task",
+      "alac",
+    )
+    historyStore.saveCompleted(
+      "https://music.apple.com/cn/album/new-single-slug/999",
+      "completed-task",
+      "alac",
+      [{"path": str(completedPath)}],
+    )
+    failedUrl = "https://music.apple.com/cn/album/old-single-slug/999?l=en"
+    historyStore.saveFailed(
+      failedUrl,
+      "failed-task",
+      "alac",
+      "old failure",
+    )
+
+    response = self.client.post(
+      "/api/history/retry",
+      data=json.dumps({"url": failedUrl}),
+      content_type="application/json"
+    )
+
+    self.assertEqual(response.status_code, 400)
+    self.assertEqual(len(self.runner.calls), 0)
+
 
   def testSubscriptionSearchReturnsArtistResults(self):
     fakeAppleMusic = FakeAppleMusicClient()
@@ -1471,6 +1534,15 @@ class FlaskDashboardTest(unittest.TestCase):
     tasks = self.client.get("/api/tasks").get_json()
     self.assertEqual({task["source"] for task in tasks}, {"subscription"})
 
+    with sqlite3.connect(historyStore.dbPath) as connection:
+      rows = connection.execute(
+        "SELECT album_id, status FROM subscription_seen_albums ORDER BY album_id"
+      ).fetchall()
+    self.assertEqual(
+      {albumId: status for albumId, status in rows},
+      {"111": "completed", "222": "completed", "333": "completed"},
+    )
+
   def testSubscriptionScanSkipsActiveAlbumByAlbumId(self):
     fakeAppleMusic = FakeAppleMusicClient()
     fakeAppleMusic.albums = [
@@ -1501,6 +1573,49 @@ class FlaskDashboardTest(unittest.TestCase):
     self.assertEqual(payload["scan"]["queuedCount"], 0)
     self.assertEqual(payload["scan"]["skippedActiveCount"], 1)
     self.assertEqual(len(self.runner.calls), 0)
+
+  def testSubscriptionSeenAlbumStatusUpdatesWhenTaskFails(self):
+    class FailingRunner:
+      def __init__(self):
+        self.calls = []
+
+      def __call__(self, task, url, codec):
+        self.calls.append((task.id, url, codec))
+        task.setStage("failed")
+        task.setStatus("failed")
+        task.setError("subscription failure")
+
+    failingRunner = FailingRunner()
+    fakeAppleMusic = FakeAppleMusicClient()
+    fakeAppleMusic.albums = [
+      AppleMusicAlbum(
+        albumId="666",
+        name="Failing Album",
+        url="https://music.apple.com/cn/album/failing-album/666",
+      )
+    ]
+    app = createApp(
+      runnerFactory=lambda: failingRunner,
+      dbPath=f"{self.tempDir.name}/failing-subscription-downloads.db",
+    )
+    app.config["TESTING"] = True
+    app.config["APPLE_MUSIC_CLIENT_FACTORY"] = lambda: fakeAppleMusic
+    client = app.test_client()
+
+    response = client.post(
+      "/api/subscriptions",
+      data=json.dumps({"artistUrl": "https://music.apple.com/cn/artist/example-artist/12345"}),
+      content_type="application/json",
+    )
+
+    self.assertEqual(response.status_code, 201)
+    with sqlite3.connect(app.config["SUBSCRIPTION_STORE"].dbPath) as connection:
+      row = connection.execute(
+        "SELECT status, task_id FROM subscription_seen_albums WHERE album_id = '666'"
+      ).fetchone()
+    self.assertIsNotNone(row)
+    self.assertEqual(row[0], "failed")
+    self.assertTrue(row[1])
 
   def testSubscriptionListAndDeleteByArtistId(self):
     fakeAppleMusic = FakeAppleMusicClient()

@@ -382,6 +382,9 @@ class ArtistSubscriptionStore:
       connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_seen_albums_subscription ON subscription_seen_albums(subscription_id)"
       )
+      connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_seen_albums_album_id ON subscription_seen_albums(album_id) WHERE album_id != ''"
+      )
       connection.commit()
 
   def createOrEnable(self, artist: AppleMusicArtist) -> tuple[dict[str, object], bool]:
@@ -505,6 +508,21 @@ class ArtistSubscriptionStore:
         (status, taskId, subscriptionId, albumId),
       )
       connection.commit()
+
+  def updateSeenAlbumStatusByAlbumId(self, albumId: str, status: str, taskId: str = "") -> int:
+    if not albumId:
+      return 0
+    with closing(self._connect()) as connection:
+      cursor = connection.execute(
+        """
+        UPDATE subscription_seen_albums
+        SET status = ?, task_id = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE album_id = ?
+        """,
+        (status, taskId, albumId),
+      )
+      connection.commit()
+      return cursor.rowcount
 
   def markChecked(self, subscriptionId: int, error: str = "") -> None:
     with closing(self._connect()) as connection:
@@ -978,13 +996,16 @@ def startTask(
       runner(task, url, codec)
       if task.status == "completed" and task.result:
         historyStore.saveCompleted(url, task.id, codec, task.result, albumId)
+        syncSubscriptionAlbumStatus(app, albumId, "completed", task.id)
       elif task.status == "failed":
         historyStore.saveFailed(url, task.id, codec, task.error or "download failed", source, albumId)
+        syncSubscriptionAlbumStatus(app, albumId, "failed", task.id)
     except Exception as exc:  # noqa: BLE001
       task.setStage("failed")
       task.setStatus("failed")
       task.setError(str(exc))
       historyStore.saveFailed(url, task.id, codec, str(exc), source, albumId)
+      syncSubscriptionAlbumStatus(app, albumId, "failed", task.id)
     finally:
       taskQueue.complete(task.id)
 
@@ -1078,23 +1099,34 @@ def findDownloadRecord(historyStore: DownloadHistoryStore, url: str, albumId: st
   return exactRecord or (albumRecords[0] if albumRecords else None)
 
 
+def syncSubscriptionAlbumStatus(app: Flask, albumId: str, status: str, taskId: str) -> None:
+  if not albumId:
+    return
+  subscriptionStore = app.config.get("SUBSCRIPTION_STORE")
+  if not isinstance(subscriptionStore, ArtistSubscriptionStore):
+    return
+  subscriptionStore.updateSeenAlbumStatusByAlbumId(albumId, status, taskId)
+
+
 def retryFailedTasks(app: Flask, taskStore: TaskStore, historyStore: DownloadHistoryStore) -> dict[str, object]:
   retriedTaskIds: list[str] = []
   skippedCompletedUrls: list[str] = []
   skippedRunningUrls: list[str] = []
-  seenUrls: set[str] = set()
+  seenKeys: set[str] = set()
 
   for task in taskStore.listTasks():
-    if task.status != "failed" or task.url in seenUrls:
+    albumId = extractAlbumIdFromUrl(task.url)
+    seenKey = f"album:{albumId}" if albumId else f"url:{task.url}"
+    if task.status != "failed" or seenKey in seenKeys:
       continue
-    seenUrls.add(task.url)
+    seenKeys.add(seenKey)
 
-    existing = historyStore.getByUrl(task.url)
-    if existing is not None and existing["status"] == "completed" and hasUsableCompletedRecord(existing):
+    existing = findDownloadRecord(historyStore, task.url, albumId)
+    if hasUsableCompletedRecord(existing):
       skippedCompletedUrls.append(task.url)
       continue
 
-    if hasActiveTaskForUrl(taskStore, task.url):
+    if getActiveTaskForUrlOrAlbumId(taskStore, task.url, albumId) is not None:
       skippedRunningUrls.append(task.url)
       continue
 
@@ -1127,19 +1159,22 @@ def retryHistoryFailed(
   retriedTaskIds: list[str] = []
   skippedCompletedUrls: list[str] = []
   skippedRunningUrls: list[str] = []
-  seenUrls: set[str] = set()
+  seenKeys: set[str] = set()
 
   for record in historyStore.listAll():
     url = record["url"]
-    if record["status"] != "failed" or url in seenUrls:
+    albumId = record.get("album_id", "") or extractAlbumIdFromUrl(url)
+    seenKey = f"album:{albumId}" if albumId else f"url:{url}"
+    if record["status"] != "failed" or seenKey in seenKeys:
       continue
-    seenUrls.add(url)
+    seenKeys.add(seenKey)
 
-    if hasUsableCompletedRecord(record):
+    existing = findDownloadRecord(historyStore, url, albumId)
+    if hasUsableCompletedRecord(existing):
       skippedCompletedUrls.append(url)
       continue
 
-    if hasActiveTaskForUrl(taskStore, url):
+    if getActiveTaskForUrlOrAlbumId(taskStore, url, albumId) is not None:
       skippedRunningUrls.append(url)
       continue
 
@@ -1281,7 +1316,8 @@ def scanSubscriptionUnlocked(
         continue
 
       taskId = str(responsePayload.get("taskId", ""))
-      status = str(responsePayload.get("status", "queued")) or "queued"
+      task = taskStore.getTask(taskId)
+      status = task.status if task is not None else str(responsePayload.get("status", "queued")) or "queued"
       summary.queuedCount += 1
       if taskId:
         summary.queuedTaskIds.append(taskId)
@@ -1669,10 +1705,12 @@ def createApp(
     if existing["status"] != "failed":
       return jsonify({"error": "only failed records can be retried"}), 400
 
-    if hasUsableCompletedRecord(existing):
+    albumId = existing.get("album_id", "") or extractAlbumIdFromUrl(url)
+    matchedRecord = findDownloadRecord(historyStore, url, albumId)
+    if hasUsableCompletedRecord(matchedRecord):
       return jsonify({"error": "this URL has already been completed before"}), 400
 
-    activeTask = getActiveTaskForUrl(taskStore, url)
+    activeTask = getActiveTaskForUrlOrAlbumId(taskStore, url, albumId)
     if activeTask is not None:
       errorMessage = "a task for this URL is already running" if activeTask.status == "running" else "a task for this URL is already queued"
       return jsonify({"error": errorMessage}), 409
