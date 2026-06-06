@@ -11,8 +11,12 @@
 !docs/**
 !scripts/
 !scripts/**
+!tools/
+!tools/**
 !webapp/
 !webapp/**
+tools/**/__pycache__/
+tools/**/*.pyc
 webapp/**/__pycache__/
 webapp/**/*.pyc
 webapp/data/*.db
