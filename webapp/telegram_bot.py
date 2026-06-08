@@ -790,7 +790,7 @@ def parseSubscriptionAlbumCallbackData(data: str) -> tuple[str, str, str, int | 
   if not subscriptionId or not albumId or not action:
     return None
   page: int | None = None
-  if len(parts) == 5:
+  if len(parts) >= 5:
     try:
       page = int(parts[4])
     except ValueError:

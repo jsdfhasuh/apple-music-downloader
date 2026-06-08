@@ -1290,6 +1290,88 @@ class TelegramBotTest(unittest.TestCase):
     self.assertIn("6. Album 2", messages[1][1])
     self.assertNotIn("Album 1", messages[1][1])
 
+  def testHandleUpdateKeepsReviewAndSelectionPagesAfterAlbumAction(self):
+    calls = []
+    fetchCalls = []
+    edits = []
+    messages = []
+    answers = []
+    initialSubscription = {
+      "id": 7,
+      "artistName": "Example Artist",
+      "recentAlbums": [
+        {
+          "albumId": str(index),
+          "albumName": f"Album {index}",
+          "releaseDate": f"2026-06-{index:02d}",
+          "userState": "pending",
+          "detectedStatus": "missing",
+          "canDownload": True,
+        }
+        for index in range(1, 8)
+      ],
+    }
+    refreshedSubscription = {
+      "id": 7,
+      "artistName": "Example Artist",
+      "recentAlbums": [
+        {
+          "albumId": str(index),
+          "albumName": f"Album {index}",
+          "releaseDate": f"2026-06-{index:02d}",
+          "userState": "ignored" if index == 1 else "pending",
+          "detectedStatus": "missing",
+          "canDownload": True,
+        }
+        for index in range(1, 8)
+      ],
+    }
+
+    def fakeFetchSubscriptions():
+      fetchCalls.append("fetch")
+      if len(fetchCalls) == 1:
+        return [initialSubscription]
+      return [refreshedSubscription]
+
+    with tempfile.TemporaryDirectory() as tempDir:
+      store = TelegramTaskStore(f"{tempDir}/telegram_tasks.db")
+      handleUpdate(
+        update={
+          "update_id": 1,
+          "callback_query": {
+            "id": "callback-1",
+            "from": {"id": 12345, "is_bot": False},
+            "message": {
+              "message_id": 99,
+              "chat": {"id": 12345, "type": "private"},
+            },
+            "data": "sa:7:1:i:1:0",
+          },
+        },
+        allowedChatId=12345,
+        store=store,
+        createTask=lambda url: {"taskId": "task-1", "status": "running"},
+        fetchSubscriptions=fakeFetchSubscriptions,
+        updateSubscriptionAlbumBySubscriptionId=lambda subscriptionId, albumId, action: calls.append((subscriptionId, albumId, action)) or {
+          "action": action,
+          "updatedCount": 1,
+        },
+        answerCallback=lambda callbackQueryId, text="": answers.append((callbackQueryId, text)),
+        editMessageReplyMarkup=lambda chatId, messageId, replyMarkup=None: edits.append((chatId, messageId, replyMarkup)),
+        sendMessage=lambda chatId, text, replyToMessageId=None, replyMarkup=None: messages.append((chatId, text, replyToMessageId, replyMarkup)),
+      )
+
+    self.assertEqual(calls, [("7", "1", "ignore")])
+    self.assertEqual(answers, [("callback-1", "已处理")])
+    self.assertEqual(edits, [(12345, 99, None)])
+    self.assertEqual(len(messages), 2)
+    self.assertIn("已忽略：Album 1", messages[0][1])
+    self.assertIn("第 2/2 页", messages[1][1])
+    self.assertIn("6. Album 2", messages[1][1])
+    callbackData = [button["callback_data"] for row in messages[1][3]["inline_keyboard"] for button in row]
+    self.assertIn("ssp:0", callbackData)
+    self.assertTrue(any(item.endswith(":1:0") for item in callbackData if item.startswith("sa:7:")))
+
   def testHandleUpdateSendsNoPendingSubscriptionReviewWithoutKeyboard(self):
     messages = []
 
