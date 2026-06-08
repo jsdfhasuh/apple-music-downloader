@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 
 from webapp.apple_music import AppleMusicAlbum, AppleMusicArtist
-from webapp.app import DownloadHistoryStore, DownloadTask, DownloaderRunner, PipelineRunner, createApp, updateTaskFromLine
+from webapp.app import ArtistSubscriptionStore, DownloadHistoryStore, DownloadTask, DownloaderRunner, PipelineRunner, createApp, updateTaskFromLine
 
 
 class FakeRunner:
@@ -424,7 +424,8 @@ class FlaskDashboardTest(unittest.TestCase):
 
   def testDownloadHistoryBackfillsAlbumIdFromExistingUrls(self):
     dbPath = f"{self.tempDir.name}/backfill-downloads.db"
-    with sqlite3.connect(dbPath) as connection:
+    connection = sqlite3.connect(dbPath)
+    try:
       connection.execute(
         """
         CREATE TABLE downloads (
@@ -448,6 +449,8 @@ class FlaskDashboardTest(unittest.TestCase):
         """
       )
       connection.commit()
+    finally:
+      connection.close()
 
     store = DownloadHistoryStore(dbPath)
     record = store.getByUrl("https://music.apple.com/cn/album/example/123456?l=en")
@@ -458,7 +461,8 @@ class FlaskDashboardTest(unittest.TestCase):
   def testDownloadHistoryClearsAlbumIdForSongUrlsDuringMigration(self):
     dbPath = f"{self.tempDir.name}/song-backfill-downloads.db"
     songUrl = "https://music.apple.com/cn/album/example/123456?i=999999"
-    with sqlite3.connect(dbPath) as connection:
+    connection = sqlite3.connect(dbPath)
+    try:
       connection.execute(
         """
         CREATE TABLE downloads (
@@ -484,6 +488,8 @@ class FlaskDashboardTest(unittest.TestCase):
         (songUrl,),
       )
       connection.commit()
+    finally:
+      connection.close()
 
     store = DownloadHistoryStore(dbPath)
     record = store.getByUrl(songUrl)
@@ -744,12 +750,15 @@ class FlaskDashboardTest(unittest.TestCase):
       "alac",
       "telegram",
     )
-    with sqlite3.connect(dbPath) as connection:
+    connection = sqlite3.connect(dbPath)
+    try:
       connection.execute(
         "UPDATE downloads SET updated_at = '2000-01-01 00:00:00' WHERE url = ?",
         ("https://music.apple.com/cn/album/recover-expired/333",),
       )
       connection.commit()
+    finally:
+      connection.close()
     calls = []
     originalConfigPath = os.environ.get("WEBAPP_CONFIG_PATH")
     try:
@@ -1163,7 +1172,7 @@ class FlaskDashboardTest(unittest.TestCase):
     taskPayload = taskResponse.get_json()
 
     self.assertEqual(taskPayload["status"], "completed")
-    self.assertEqual(taskPayload["result"][0]["path"], derivedFlacPath)
+    self.assertEqual(Path(taskPayload["result"][0]["path"]), Path(derivedFlacPath))
     self.assertEqual(scriptCalls[1][3], self.tempDir.name)
 
   def testPipelineFailsWhenSourceFileMissing(self):
@@ -1473,7 +1482,43 @@ class FlaskDashboardTest(unittest.TestCase):
     self.assertEqual(payload["results"][0]["artistId"], "12345")
     self.assertEqual(payload["results"][0]["artistName"], "Example Artist")
 
-  def testCreateSubscriptionScansAndQueuesMissingAlbums(self):
+  def testLegacySubscriptionMigrationDefaultsPolicyToConfirm(self):
+    dbPath = Path(self.tempDir.name) / "legacy-subscriptions.db"
+    connection = sqlite3.connect(dbPath)
+    try:
+      connection.execute(
+        """
+        CREATE TABLE artist_subscriptions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          artist_id TEXT NOT NULL,
+          storefront TEXT NOT NULL,
+          artist_name TEXT NOT NULL,
+          artist_url TEXT NOT NULL,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          last_checked_at TEXT,
+          last_error TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(artist_id, storefront)
+        )
+        """
+      )
+      connection.execute(
+        """
+        INSERT INTO artist_subscriptions (artist_id, storefront, artist_name, artist_url)
+        VALUES ('12345', 'cn', 'Example Artist', 'https://music.apple.com/cn/artist/example/12345')
+        """
+      )
+      connection.commit()
+    finally:
+      connection.close()
+
+    store = ArtistSubscriptionStore(str(dbPath))
+    subscriptions = store.listAll()
+
+    self.assertEqual(subscriptions[0]["newAlbumPolicy"], "confirm")
+
+  def testCreateSubscriptionScansAndPendsMissingAlbums(self):
     fakeAppleMusic = FakeAppleMusicClient()
     fakeAppleMusic.albums = [
       AppleMusicAlbum(
@@ -1527,21 +1572,116 @@ class FlaskDashboardTest(unittest.TestCase):
 
     self.assertEqual(response.status_code, 201)
     self.assertEqual(payload["scan"]["foundCount"], 3)
-    self.assertEqual(payload["scan"]["queuedCount"], 2)
+    self.assertEqual(payload["scan"]["queuedCount"], 0)
+    self.assertEqual(payload["scan"]["pendingCount"], 2)
     self.assertEqual(payload["scan"]["skippedCompletedCount"], 1)
-    self.assertEqual(len(self.runner.calls), 2)
+    self.assertEqual(len(self.runner.calls), 0)
 
     tasks = self.client.get("/api/tasks").get_json()
-    self.assertEqual({task["source"] for task in tasks}, {"subscription"})
+    self.assertEqual(tasks, [])
 
-    with sqlite3.connect(historyStore.dbPath) as connection:
+    connection = sqlite3.connect(historyStore.dbPath)
+    try:
       rows = connection.execute(
-        "SELECT album_id, status FROM subscription_seen_albums ORDER BY album_id"
+        "SELECT album_id, status, user_state, detected_status FROM subscription_seen_albums ORDER BY album_id"
       ).fetchall()
+    finally:
+      connection.close()
     self.assertEqual(
-      {albumId: status for albumId, status in rows},
-      {"111": "completed", "222": "completed", "333": "completed"},
+      {albumId: (status, userState, detectedStatus) for albumId, status, userState, detectedStatus in rows},
+      {
+        "111": ("completed", "subscribed", "completed"),
+        "222": ("failed", "pending", "failed_history"),
+        "333": ("seen", "pending", "missing"),
+      },
     )
+
+    subscriptions = self.client.get("/api/subscriptions").get_json()
+    recentAlbums = {
+      album["albumId"]: album
+      for album in subscriptions[0]["recentAlbums"]
+    }
+    self.assertEqual(recentAlbums["111"]["albumName"], "Already Done")
+    self.assertEqual(recentAlbums["111"]["status"], "completed")
+    self.assertEqual(recentAlbums["222"]["userState"], "pending")
+    self.assertEqual(recentAlbums["222"]["detectedStatus"], "failed_history")
+    self.assertEqual(recentAlbums["333"]["albumName"], "New Album")
+    self.assertEqual(recentAlbums["333"]["releaseDate"], "2024-03-01")
+
+  def testSubscriptionAutoPolicyQueuesAlbumsAfterDetection(self):
+    fakeAppleMusic = FakeAppleMusicClient()
+    fakeAppleMusic.albums = [
+      AppleMusicAlbum(
+        albumId="444",
+        name="Auto Album",
+        url="https://music.apple.com/cn/album/auto-album/444",
+      )
+    ]
+    self.client.application.config["APPLE_MUSIC_CLIENT_FACTORY"] = lambda: fakeAppleMusic
+
+    createResponse = self.client.post(
+      "/api/subscriptions",
+      data=json.dumps({"artistUrl": "https://music.apple.com/cn/artist/example-artist/12345"}),
+      content_type="application/json",
+    )
+    subscriptionId = createResponse.get_json()["subscription"]["id"]
+    policyResponse = self.client.patch(
+      f"/api/subscriptions/{subscriptionId}",
+      data=json.dumps({"newAlbumPolicy": "auto"}),
+      content_type="application/json",
+    )
+    scanResponse = self.client.post(f"/api/subscriptions/{subscriptionId}/scan")
+    scanPayload = scanResponse.get_json()
+
+    self.assertEqual(policyResponse.status_code, 200)
+    self.assertEqual(scanResponse.status_code, 200)
+    self.assertEqual(scanPayload["queuedCount"], 1)
+    self.assertEqual(len(self.runner.calls), 1)
+
+  def testSubscriptionIgnoredAndImportedAlbumsPersistAcrossScans(self):
+    fakeAppleMusic = FakeAppleMusicClient()
+    fakeAppleMusic.albums = [
+      AppleMusicAlbum(
+        albumId="777",
+        name="Ignored Album",
+        url="https://music.apple.com/cn/album/ignored-album/777",
+      ),
+      AppleMusicAlbum(
+        albumId="888",
+        name="Imported Album",
+        url="https://music.apple.com/cn/album/imported-album/888",
+      ),
+    ]
+    self.client.application.config["APPLE_MUSIC_CLIENT_FACTORY"] = lambda: fakeAppleMusic
+
+    createResponse = self.client.post(
+      "/api/subscriptions",
+      data=json.dumps({"artistUrl": "https://music.apple.com/cn/artist/example-artist/12345"}),
+      content_type="application/json",
+    )
+    subscriptionId = createResponse.get_json()["subscription"]["id"]
+    ignoreResponse = self.client.post(
+      f"/api/subscriptions/{subscriptionId}/albums/actions",
+      data=json.dumps({"albumIds": ["777"], "action": "ignore"}),
+      content_type="application/json",
+    )
+    importedResponse = self.client.post(
+      f"/api/subscriptions/{subscriptionId}/albums/actions",
+      data=json.dumps({"albumIds": ["888"], "action": "mark_imported"}),
+      content_type="application/json",
+    )
+    scanResponse = self.client.post(f"/api/subscriptions/{subscriptionId}/scan")
+    scanPayload = scanResponse.get_json()
+
+    self.assertEqual(ignoreResponse.status_code, 200)
+    self.assertEqual(importedResponse.status_code, 200)
+    self.assertEqual(scanPayload["queuedCount"], 0)
+    self.assertEqual(scanPayload["skippedIgnoredCount"], 1)
+    self.assertEqual(scanPayload["skippedImportedCount"], 1)
+    subscriptions = self.client.get("/api/subscriptions").get_json()
+    recentAlbums = {album["albumId"]: album for album in subscriptions[0]["recentAlbums"]}
+    self.assertEqual(recentAlbums["777"]["userState"], "ignored")
+    self.assertEqual(recentAlbums["888"]["userState"], "imported")
 
   def testSubscriptionScanSkipsActiveAlbumByAlbumId(self):
     fakeAppleMusic = FakeAppleMusicClient()
@@ -1594,28 +1734,67 @@ class FlaskDashboardTest(unittest.TestCase):
         url="https://music.apple.com/cn/album/failing-album/666",
       )
     ]
-    app = createApp(
-      runnerFactory=lambda: failingRunner,
-      dbPath=f"{self.tempDir.name}/failing-subscription-downloads.db",
-    )
-    app.config["TESTING"] = True
+    app = self.client.application
+    app.config["RUNNER_FACTORY"] = lambda: failingRunner
     app.config["APPLE_MUSIC_CLIENT_FACTORY"] = lambda: fakeAppleMusic
-    client = app.test_client()
 
-    response = client.post(
+    response = self.client.post(
       "/api/subscriptions",
       data=json.dumps({"artistUrl": "https://music.apple.com/cn/artist/example-artist/12345"}),
       content_type="application/json",
     )
+    subscriptionId = response.get_json()["subscription"]["id"]
+    actionResponse = self.client.post(
+      f"/api/subscriptions/{subscriptionId}/albums/actions",
+      data=json.dumps({"albumIds": ["666"], "action": "download"}),
+      content_type="application/json",
+    )
 
     self.assertEqual(response.status_code, 201)
-    with sqlite3.connect(app.config["SUBSCRIPTION_STORE"].dbPath) as connection:
+    self.assertEqual(actionResponse.status_code, 200)
+    self.assertEqual(actionResponse.get_json()["queuedCount"], 1)
+    connection = sqlite3.connect(app.config["SUBSCRIPTION_STORE"].dbPath)
+    try:
       row = connection.execute(
-        "SELECT status, task_id FROM subscription_seen_albums WHERE album_id = '666'"
+        "SELECT status, task_id, user_state, detected_status FROM subscription_seen_albums WHERE album_id = '666'"
       ).fetchone()
+    finally:
+      connection.close()
     self.assertIsNotNone(row)
     self.assertEqual(row[0], "failed")
     self.assertTrue(row[1])
+    self.assertEqual(row[2], "subscribed")
+    self.assertEqual(row[3], "failed_history")
+
+  def testSubscriptionListReturnsAllAlbumsSortedByReleaseDate(self):
+    subscriptionStore = self.client.application.config["SUBSCRIPTION_STORE"]
+    artist = AppleMusicArtist(
+      artistId="release-sort",
+      storefront="cn",
+      name="Release Sort Artist",
+      url="https://music.apple.com/cn/artist/release-sort/123",
+    )
+    subscription, _created = subscriptionStore.createOrEnable(artist)
+    albums = [
+      AppleMusicAlbum(albumId="001", name="Oldest", url="https://music.apple.com/cn/album/oldest/001", releaseDate="2019-01-01"),
+      AppleMusicAlbum(albumId="002", name="No Date", url="https://music.apple.com/cn/album/no-date/002", releaseDate=""),
+      AppleMusicAlbum(albumId="003", name="Newest", url="https://music.apple.com/cn/album/newest/003", releaseDate="2026-06-05"),
+      AppleMusicAlbum(albumId="004", name="Middle", url="https://music.apple.com/cn/album/middle/004", releaseDate="2024-08-10"),
+      AppleMusicAlbum(albumId="005", name="Another Old", url="https://music.apple.com/cn/album/another-old/005", releaseDate="2020-05-20"),
+      AppleMusicAlbum(albumId="006", name="Recent", url="https://music.apple.com/cn/album/recent/006", releaseDate="2025-12-31"),
+      AppleMusicAlbum(albumId="007", name="Older", url="https://music.apple.com/cn/album/older/007", releaseDate="2021-03-15"),
+    ]
+    for album in albums:
+      subscriptionStore.upsertSeenAlbum(int(subscription["id"]), album, status="seen")
+
+    response = self.client.get("/api/subscriptions")
+    payload = response.get_json()
+    releaseSortSubscription = next(item for item in payload if item["artistId"] == "release-sort")
+    albumIds = [album["albumId"] for album in releaseSortSubscription["recentAlbums"]]
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(len(albumIds), 7)
+    self.assertEqual(albumIds, ["003", "006", "004", "007", "005", "001", "002"])
 
   def testSubscriptionListAndDeleteByArtistId(self):
     fakeAppleMusic = FakeAppleMusicClient()

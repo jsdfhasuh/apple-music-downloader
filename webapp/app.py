@@ -28,6 +28,22 @@ RETRY_PROMPT_LINES = {
   "Error detected, press Enter to try again...",
   "Start trying again...",
 }
+SUBSCRIPTION_POLICY_CONFIRM = "confirm"
+SUBSCRIPTION_POLICY_AUTO = "auto"
+SUBSCRIPTION_POLICIES = {SUBSCRIPTION_POLICY_CONFIRM, SUBSCRIPTION_POLICY_AUTO}
+ALBUM_USER_STATE_PENDING = "pending"
+ALBUM_USER_STATE_SUBSCRIBED = "subscribed"
+ALBUM_USER_STATE_IGNORED = "ignored"
+ALBUM_USER_STATE_IMPORTED = "imported"
+ALBUM_USER_STATES = {
+  ALBUM_USER_STATE_PENDING,
+  ALBUM_USER_STATE_SUBSCRIBED,
+  ALBUM_USER_STATE_IGNORED,
+  ALBUM_USER_STATE_IMPORTED,
+}
+ALBUM_DETECTED_ACTIVE = {"queued", "running"}
+ALBUM_DETECTED_NEEDS_CONFIRM = {"missing", "failed_history", "stale_history"}
+ALBUM_DETECTED_STATUSES = ALBUM_DETECTED_ACTIVE | ALBUM_DETECTED_NEEDS_CONFIRM | {"completed", "seen"}
 
 
 @dataclass
@@ -109,8 +125,11 @@ class SubscriptionScanSummary:
   artistName: str
   foundCount: int = 0
   queuedCount: int = 0
+  pendingCount: int = 0
   skippedCompletedCount: int = 0
   skippedActiveCount: int = 0
+  skippedIgnoredCount: int = 0
+  skippedImportedCount: int = 0
   errorCount: int = 0
   queuedTaskIds: list[str] = field(default_factory=list)
   errors: list[str] = field(default_factory=list)
@@ -122,12 +141,69 @@ class SubscriptionScanSummary:
       "artistName": self.artistName,
       "foundCount": self.foundCount,
       "queuedCount": self.queuedCount,
+      "pendingCount": self.pendingCount,
       "skippedCompletedCount": self.skippedCompletedCount,
       "skippedActiveCount": self.skippedActiveCount,
+      "skippedIgnoredCount": self.skippedIgnoredCount,
+      "skippedImportedCount": self.skippedImportedCount,
       "errorCount": self.errorCount,
       "queuedTaskIds": list(self.queuedTaskIds),
       "errors": list(self.errors),
     }
+
+
+def normalizeSubscriptionPolicy(value: object, default: str = SUBSCRIPTION_POLICY_CONFIRM) -> str:
+  normalized = str(value or "").strip().lower()
+  return normalized if normalized in SUBSCRIPTION_POLICIES else default
+
+
+def normalizeAlbumUserState(value: object, default: str = ALBUM_USER_STATE_PENDING) -> str:
+  normalized = str(value or "").strip().lower()
+  return normalized if normalized in ALBUM_USER_STATES else default
+
+
+def normalizeDetectedStatus(value: object, default: str = "seen") -> str:
+  normalized = str(value or "").strip().lower()
+  return normalized if normalized in ALBUM_DETECTED_STATUSES else default
+
+
+def detectedStatusFromHistoryRecord(record: dict[str, str] | None) -> str:
+  if record is None:
+    return "missing"
+  if hasUsableCompletedRecord(record):
+    return "completed"
+  status = str(record.get("status", "")).strip().lower()
+  if status == "failed":
+    return "failed_history"
+  if status in {"queued", "running", "completed"}:
+    return "stale_history"
+  return "missing"
+
+
+def rowStatusFromDetectedStatus(detectedStatus: str) -> str:
+  normalized = normalizeDetectedStatus(detectedStatus, "seen")
+  if normalized in {"queued", "running", "completed"}:
+    return normalized
+  if normalized in {"failed_history", "stale_history"}:
+    return "failed"
+  return "seen"
+
+
+def detectedStatusFromRowStatus(status: str) -> str:
+  normalized = str(status or "").strip().lower()
+  if normalized in {"queued", "running", "completed"}:
+    return normalized
+  if normalized == "failed":
+    return "failed_history"
+  if normalized == "seen":
+    return "seen"
+  return normalizeDetectedStatus(normalized, "seen")
+
+
+def canDownloadSubscriptionAlbum(userState: str, detectedStatus: str) -> bool:
+  return normalizeAlbumUserState(userState) not in {ALBUM_USER_STATE_IGNORED, ALBUM_USER_STATE_IMPORTED} and (
+    normalizeDetectedStatus(detectedStatus, "missing") in ALBUM_DETECTED_NEEDS_CONFIRM
+  )
 
 
 class DownloadHistoryStore:
@@ -351,6 +427,7 @@ class ArtistSubscriptionStore:
           artist_name TEXT NOT NULL,
           artist_url TEXT NOT NULL,
           enabled INTEGER NOT NULL DEFAULT 1,
+          new_album_policy TEXT NOT NULL DEFAULT 'confirm',
           last_checked_at TEXT,
           last_error TEXT NOT NULL DEFAULT '',
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -370,12 +447,32 @@ class ArtistSubscriptionStore:
           release_date TEXT NOT NULL DEFAULT '',
           status TEXT NOT NULL DEFAULT 'seen',
           task_id TEXT NOT NULL DEFAULT '',
+          user_state TEXT NOT NULL DEFAULT 'subscribed',
+          detected_status TEXT NOT NULL DEFAULT 'seen',
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
           updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
           UNIQUE(subscription_id, album_id)
         )
         """
       )
+      try:
+        connection.execute(
+          "ALTER TABLE artist_subscriptions ADD COLUMN new_album_policy TEXT NOT NULL DEFAULT 'confirm'"
+        )
+      except sqlite3.OperationalError:
+        pass
+      try:
+        connection.execute(
+          "ALTER TABLE subscription_seen_albums ADD COLUMN user_state TEXT NOT NULL DEFAULT 'subscribed'"
+        )
+      except sqlite3.OperationalError:
+        pass
+      try:
+        connection.execute(
+          "ALTER TABLE subscription_seen_albums ADD COLUMN detected_status TEXT NOT NULL DEFAULT 'seen'"
+        )
+      except sqlite3.OperationalError:
+        pass
       connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_artist_subscriptions_due ON artist_subscriptions(enabled, last_checked_at)"
       )
@@ -384,6 +481,9 @@ class ArtistSubscriptionStore:
       )
       connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_seen_albums_album_id ON subscription_seen_albums(album_id) WHERE album_id != ''"
+      )
+      connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_seen_albums_user_state ON subscription_seen_albums(user_state)"
       )
       connection.commit()
 
@@ -396,8 +496,8 @@ class ArtistSubscriptionStore:
       created = existing is None
       connection.execute(
         """
-        INSERT INTO artist_subscriptions (artist_id, storefront, artist_name, artist_url, enabled, last_error, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 1, '', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        INSERT INTO artist_subscriptions (artist_id, storefront, artist_name, artist_url, enabled, new_album_policy, last_error, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 1, 'confirm', '', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         ON CONFLICT(artist_id, storefront) DO UPDATE SET
           artist_name = excluded.artist_name,
           artist_url = excluded.artist_url,
@@ -442,16 +542,74 @@ class ArtistSubscriptionStore:
         SELECT
           s.*,
           COUNT(a.id) AS album_count,
-          SUM(CASE WHEN a.status IN ('queued', 'running') THEN 1 ELSE 0 END) AS active_album_count,
-          SUM(CASE WHEN a.status = 'completed' THEN 1 ELSE 0 END) AS completed_album_count,
-          SUM(CASE WHEN a.status = 'failed' THEN 1 ELSE 0 END) AS failed_album_count
+          SUM(CASE WHEN a.user_state = 'pending' THEN 1 ELSE 0 END) AS pending_album_count,
+          SUM(CASE WHEN a.detected_status IN ('queued', 'running') OR a.status IN ('queued', 'running') THEN 1 ELSE 0 END) AS active_album_count,
+          SUM(CASE WHEN a.detected_status = 'completed' OR a.status = 'completed' THEN 1 ELSE 0 END) AS completed_album_count,
+          SUM(CASE WHEN a.detected_status IN ('failed_history', 'stale_history') OR a.status = 'failed' THEN 1 ELSE 0 END) AS failed_album_count,
+          SUM(CASE WHEN a.user_state = 'ignored' THEN 1 ELSE 0 END) AS ignored_album_count,
+          SUM(CASE WHEN a.user_state = 'imported' THEN 1 ELSE 0 END) AS imported_album_count
         FROM artist_subscriptions s
         LEFT JOIN subscription_seen_albums a ON a.subscription_id = s.id
         GROUP BY s.id
         ORDER BY s.updated_at DESC, s.id DESC
         """
       ).fetchall()
-    return [self._rowToSubscription(row) for row in rows]
+    subscriptions = [self._rowToSubscription(row) for row in rows]
+    for subscription in subscriptions:
+      subscription["recentAlbums"] = self.listSeenAlbums(int(subscription["id"]))
+    return subscriptions
+
+  def listSeenAlbums(self, subscriptionId: int) -> list[dict[str, str]]:
+    with closing(self._connect()) as connection:
+      rows = connection.execute(
+        """
+        SELECT album_id, album_url, album_name, release_date, status, task_id, user_state, detected_status, updated_at
+        FROM subscription_seen_albums
+        WHERE subscription_id = ?
+        ORDER BY
+          CASE WHEN release_date = '' THEN 1 ELSE 0 END,
+          release_date DESC,
+          updated_at DESC,
+          id DESC
+        """,
+        (subscriptionId,),
+      ).fetchall()
+    return [self._rowToSeenAlbum(row) for row in rows]
+
+  def getSeenAlbum(self, subscriptionId: int, albumId: str) -> dict[str, str] | None:
+    if not albumId:
+      return None
+    with closing(self._connect()) as connection:
+      row = connection.execute(
+        """
+        SELECT album_id, album_url, album_name, release_date, status, task_id, user_state, detected_status, updated_at
+        FROM subscription_seen_albums
+        WHERE subscription_id = ? AND album_id = ?
+        LIMIT 1
+        """,
+        (subscriptionId, albumId),
+      ).fetchone()
+    if row is None:
+      return None
+    return self._rowToSeenAlbum(row)
+
+  def getSeenAlbumByAlbumId(self, albumId: str) -> dict[str, str] | None:
+    if not albumId:
+      return None
+    with closing(self._connect()) as connection:
+      row = connection.execute(
+        """
+        SELECT album_id, album_url, album_name, release_date, status, task_id, user_state, detected_status, updated_at
+        FROM subscription_seen_albums
+        WHERE album_id = ?
+        ORDER BY updated_at DESC, id DESC
+        LIMIT 1
+        """,
+        (albumId,),
+      ).fetchone()
+    if row is None:
+      return None
+    return self._rowToSeenAlbum(row)
 
   def listEnabled(self) -> list[dict[str, object]]:
     with closing(self._connect()) as connection:
@@ -479,47 +637,163 @@ class ArtistSubscriptionStore:
       connection.commit()
     return True
 
-  def upsertSeenAlbum(self, subscriptionId: int, album: AppleMusicAlbum, status: str = "seen", taskId: str = "") -> None:
+  def upsertSeenAlbum(
+    self,
+    subscriptionId: int,
+    album: AppleMusicAlbum,
+    status: str = "seen",
+    taskId: str = "",
+    userState: str | None = None,
+    detectedStatus: str | None = None,
+  ) -> None:
+    existing = self.getSeenAlbum(subscriptionId, album.albumId)
+    resolvedUserState = normalizeAlbumUserState(
+      userState,
+      normalizeAlbumUserState(existing["userState"], ALBUM_USER_STATE_SUBSCRIBED) if existing is not None else ALBUM_USER_STATE_SUBSCRIBED,
+    )
+    resolvedDetectedStatus = normalizeDetectedStatus(detectedStatus or status, detectedStatusFromRowStatus(status))
     with closing(self._connect()) as connection:
       connection.execute(
         """
-        INSERT INTO subscription_seen_albums (subscription_id, album_id, album_url, album_name, release_date, status, task_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        INSERT INTO subscription_seen_albums (subscription_id, album_id, album_url, album_name, release_date, status, task_id, user_state, detected_status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         ON CONFLICT(subscription_id, album_id) DO UPDATE SET
           album_url = excluded.album_url,
           album_name = excluded.album_name,
           release_date = excluded.release_date,
           status = excluded.status,
           task_id = excluded.task_id,
+          user_state = excluded.user_state,
+          detected_status = excluded.detected_status,
           updated_at = CURRENT_TIMESTAMP
         """,
-        (subscriptionId, album.albumId, album.url, album.name, album.releaseDate, status, taskId),
+        (
+          subscriptionId,
+          album.albumId,
+          album.url,
+          album.name,
+          album.releaseDate,
+          rowStatusFromDetectedStatus(resolvedDetectedStatus),
+          taskId,
+          resolvedUserState,
+          resolvedDetectedStatus,
+        ),
       )
       connection.commit()
 
-  def updateSeenAlbumStatus(self, subscriptionId: int, albumId: str, status: str, taskId: str = "") -> None:
+  def upsertSeenAlbumMetadata(self, subscriptionId: int, album: AppleMusicAlbum) -> tuple[dict[str, str], bool]:
+    existing = self.getSeenAlbum(subscriptionId, album.albumId)
+    created = existing is None
+    if created:
+      self.upsertSeenAlbum(
+        subscriptionId,
+        album,
+        status="seen",
+        taskId="",
+        userState=ALBUM_USER_STATE_PENDING,
+        detectedStatus="missing",
+      )
+    else:
+      with closing(self._connect()) as connection:
+        connection.execute(
+          """
+          UPDATE subscription_seen_albums
+          SET album_url = ?, album_name = ?, release_date = ?, updated_at = CURRENT_TIMESTAMP
+          WHERE subscription_id = ? AND album_id = ?
+          """,
+          (album.url, album.name, album.releaseDate, subscriptionId, album.albumId),
+        )
+        connection.commit()
+    row = self.getSeenAlbum(subscriptionId, album.albumId)
+    assert row is not None
+    return row, created
+
+  def updateSubscriptionPolicy(self, subscriptionId: int, newAlbumPolicy: str) -> bool:
+    normalizedPolicy = normalizeSubscriptionPolicy(newAlbumPolicy)
     with closing(self._connect()) as connection:
-      connection.execute(
+      cursor = connection.execute(
         """
-        UPDATE subscription_seen_albums
-        SET status = ?, task_id = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE subscription_id = ? AND album_id = ?
+        UPDATE artist_subscriptions
+        SET new_album_policy = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
         """,
-        (status, taskId, subscriptionId, albumId),
+        (normalizedPolicy, subscriptionId),
       )
       connection.commit()
+      return cursor.rowcount > 0
 
-  def updateSeenAlbumStatusByAlbumId(self, albumId: str, status: str, taskId: str = "") -> int:
-    if not albumId:
-      return 0
+  def updateSeenAlbumUserState(self, subscriptionId: int, albumId: str, userState: str) -> bool:
+    normalizedUserState = normalizeAlbumUserState(userState)
     with closing(self._connect()) as connection:
       cursor = connection.execute(
         """
         UPDATE subscription_seen_albums
-        SET status = ?, task_id = ?, updated_at = CURRENT_TIMESTAMP
+        SET user_state = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE subscription_id = ? AND album_id = ?
+        """,
+        (normalizedUserState, subscriptionId, albumId),
+      )
+      connection.commit()
+      return cursor.rowcount > 0
+
+  def updateSeenAlbumDetection(
+    self,
+    subscriptionId: int,
+    albumId: str,
+    detectedStatus: str,
+    taskId: str = "",
+    userState: str | None = None,
+  ) -> None:
+    normalizedDetectedStatus = normalizeDetectedStatus(detectedStatus, detectedStatusFromRowStatus(detectedStatus))
+    status = rowStatusFromDetectedStatus(normalizedDetectedStatus)
+    if userState is None:
+      with closing(self._connect()) as connection:
+        connection.execute(
+          """
+          UPDATE subscription_seen_albums
+          SET status = ?, task_id = ?, detected_status = ?, updated_at = CURRENT_TIMESTAMP
+          WHERE subscription_id = ? AND album_id = ?
+          """,
+          (status, taskId, normalizedDetectedStatus, subscriptionId, albumId),
+        )
+        connection.commit()
+      return
+    normalizedUserState = normalizeAlbumUserState(userState)
+    with closing(self._connect()) as connection:
+      connection.execute(
+        """
+        UPDATE subscription_seen_albums
+        SET status = ?, task_id = ?, user_state = ?, detected_status = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE subscription_id = ? AND album_id = ?
+        """,
+        (status, taskId, normalizedUserState, normalizedDetectedStatus, subscriptionId, albumId),
+      )
+      connection.commit()
+
+  def updateSeenAlbumStatus(self, subscriptionId: int, albumId: str, status: str, taskId: str = "") -> None:
+    self.updateSeenAlbumDetection(subscriptionId, albumId, detectedStatusFromRowStatus(status), taskId)
+
+  def updateSeenAlbumStatusByAlbumId(self, albumId: str, status: str, taskId: str = "") -> int:
+    if not albumId:
+      return 0
+    normalizedDetectedStatus = normalizeDetectedStatus(status, detectedStatusFromRowStatus(status))
+    rowStatus = rowStatusFromDetectedStatus(normalizedDetectedStatus)
+    with closing(self._connect()) as connection:
+      cursor = connection.execute(
+        """
+        UPDATE subscription_seen_albums
+        SET
+          status = ?,
+          task_id = ?,
+          detected_status = ?,
+          user_state = CASE
+            WHEN ? IN ('queued', 'running', 'completed') AND user_state = 'pending' THEN 'subscribed'
+            ELSE user_state
+          END,
+          updated_at = CURRENT_TIMESTAMP
         WHERE album_id = ?
         """,
-        (status, taskId, albumId),
+        (rowStatus, taskId, normalizedDetectedStatus, normalizedDetectedStatus, albumId),
       )
       connection.commit()
       return cursor.rowcount
@@ -545,14 +819,40 @@ class ArtistSubscriptionStore:
       "artistName": str(row["artist_name"]),
       "artistUrl": str(row["artist_url"]),
       "enabled": bool(row["enabled"]),
+      "newAlbumPolicy": normalizeSubscriptionPolicy(row["new_album_policy"] if "new_album_policy" in keys else "", SUBSCRIPTION_POLICY_CONFIRM),
       "lastCheckedAt": row["last_checked_at"],
       "lastError": str(row["last_error"]),
       "createdAt": str(row["created_at"]),
       "updatedAt": str(row["updated_at"]),
       "albumCount": int(row["album_count"]) if "album_count" in keys and row["album_count"] is not None else 0,
+      "pendingAlbumCount": int(row["pending_album_count"]) if "pending_album_count" in keys and row["pending_album_count"] is not None else 0,
       "activeAlbumCount": int(row["active_album_count"]) if "active_album_count" in keys and row["active_album_count"] is not None else 0,
       "completedAlbumCount": int(row["completed_album_count"]) if "completed_album_count" in keys and row["completed_album_count"] is not None else 0,
       "failedAlbumCount": int(row["failed_album_count"]) if "failed_album_count" in keys and row["failed_album_count"] is not None else 0,
+      "ignoredAlbumCount": int(row["ignored_album_count"]) if "ignored_album_count" in keys and row["ignored_album_count"] is not None else 0,
+      "importedAlbumCount": int(row["imported_album_count"]) if "imported_album_count" in keys and row["imported_album_count"] is not None else 0,
+    }
+
+  def _rowToSeenAlbum(self, row: sqlite3.Row) -> dict[str, str]:
+    keys = set(row.keys())
+    userState = normalizeAlbumUserState(row["user_state"] if "user_state" in keys else "", ALBUM_USER_STATE_SUBSCRIBED)
+    detectedStatus = normalizeDetectedStatus(
+      row["detected_status"] if "detected_status" in keys else "",
+      detectedStatusFromRowStatus(str(row["status"])),
+    )
+    return {
+      "albumId": str(row["album_id"]),
+      "albumUrl": str(row["album_url"]),
+      "albumName": str(row["album_name"]),
+      "releaseDate": str(row["release_date"]),
+      "status": str(row["status"]),
+      "taskId": str(row["task_id"]),
+      "userState": userState,
+      "detectedStatus": detectedStatus,
+      "canDownload": canDownloadSubscriptionAlbum(userState, detectedStatus),
+      "canIgnore": userState != ALBUM_USER_STATE_IGNORED,
+      "canMarkImported": userState != ALBUM_USER_STATE_IMPORTED,
+      "updatedAt": str(row["updated_at"]),
     }
 
 
@@ -667,7 +967,7 @@ class PipelineRunner:
         updatedResult.append(item)
         task.appendLog(f"Skipped conversion (not M4A): {sourcePath}")
         continue
-      if not Path(sourcePath).exists():
+      if not safePathExists(Path(sourcePath)):
         task.setStage("failed")
         task.setStatus("failed")
         task.setError(
@@ -683,9 +983,9 @@ class PipelineRunner:
         return
       finalPath = flacPath
       outputPath = Path(output.strip()) if output.strip() else None
-      if outputPath is not None and outputPath.exists():
+      if outputPath is not None and safePathExists(outputPath):
         finalPath = outputPath
-      if not finalPath.exists():
+      if not safePathExists(finalPath):
         task.setStage("failed")
         task.setStatus("failed")
         task.setError(f"Converted file not found: {finalPath}")
@@ -861,6 +1161,27 @@ def sanitizePathComponent(value: str) -> str:
   return cleaned or "Unknown"
 
 
+def safePathExists(path: Path) -> bool:
+  try:
+    return path.exists()
+  except OSError:
+    return False
+
+
+def safePathIsFile(path: Path) -> bool:
+  try:
+    return path.is_file()
+  except OSError:
+    return False
+
+
+def safePathIsDir(path: Path) -> bool:
+  try:
+    return path.is_dir()
+  except OSError:
+    return False
+
+
 def getCompletedRoot() -> Path:
   configuredPath = getConfigValue(resolveConfigPath(), "completed-root-folder")
   if not configuredPath:
@@ -896,18 +1217,22 @@ def resultItemFileExists(item: dict[str, str], completedRoot: Path) -> bool:
   if not rawPath:
     return False
   originalPath = Path(rawPath)
-  if originalPath.is_file():
+  if safePathIsFile(originalPath):
     return True
-  if originalPath.is_absolute() and len(originalPath.parts) > 1 and originalPath.parts[1] == "downloads" and not Path("/downloads").exists():
+  if originalPath.is_absolute() and len(originalPath.parts) > 1 and originalPath.parts[1] == "downloads" and not safePathExists(Path("/downloads")):
     return True
   if not originalPath.name:
     return False
   for albumDir in getCompletedAlbumCandidateDirs(item, originalPath, completedRoot):
     directCandidate = albumDir / originalPath.name
-    if directCandidate.is_file():
+    if safePathIsFile(directCandidate):
       return True
-    if albumDir.is_dir() and any(candidate.is_file() for candidate in albumDir.rglob(originalPath.name)):
-      return True
+    if safePathIsDir(albumDir):
+      try:
+        if any(safePathIsFile(candidate) for candidate in albumDir.rglob(originalPath.name)):
+          return True
+      except OSError:
+        continue
   return False
 
 
@@ -1247,6 +1572,78 @@ def createAppleMusicClient(app: Flask) -> AppleMusicClient:
   return app.config["APPLE_MUSIC_CLIENT_FACTORY"]()
 
 
+def getStaticVersion(app: Flask) -> str:
+  staticPath = Path(app.static_folder or "")
+  mtimes: list[int] = []
+  for filename in ("app.css", "app.js"):
+    filePath = staticPath / filename
+    if filePath.exists():
+      mtimes.append(int(filePath.stat().st_mtime))
+  return str(max(mtimes)) if mtimes else "1"
+
+
+def detectSubscriptionAlbumStatus(
+  historyStore: DownloadHistoryStore,
+  taskStore: TaskStore,
+  album: AppleMusicAlbum,
+) -> tuple[str, str]:
+  activeTask = getActiveTaskForUrlOrAlbumId(taskStore, album.url, album.albumId)
+  if activeTask is not None:
+    return activeTask.status, activeTask.id
+
+  existing = findDownloadRecord(historyStore, album.url, album.albumId)
+  detectedStatus = detectedStatusFromHistoryRecord(existing)
+  taskId = str(existing.get("task_id", "")) if existing is not None else ""
+  return detectedStatus, taskId
+
+
+def queueSubscriptionAlbumDownload(
+  app: Flask,
+  subscriptionStore: ArtistSubscriptionStore,
+  historyStore: DownloadHistoryStore,
+  taskStore: TaskStore,
+  taskQueue: SerialTaskQueue,
+  subscriptionId: int,
+  album: AppleMusicAlbum,
+  summary: SubscriptionScanSummary,
+) -> None:
+  try:
+    responsePayload = startTask(
+      app,
+      taskStore,
+      taskQueue,
+      historyStore,
+      album.url,
+      "alac",
+      "subscription",
+    )
+  except Exception as exc:  # noqa: BLE001
+    summary.errorCount += 1
+    summary.errors.append(f"{album.name}: {exc}")
+    subscriptionStore.updateSeenAlbumDetection(
+      subscriptionId,
+      album.albumId,
+      "failed_history",
+      "",
+      ALBUM_USER_STATE_PENDING,
+    )
+    return
+
+  taskId = str(responsePayload.get("taskId", ""))
+  task = taskStore.getTask(taskId)
+  status = task.status if task is not None else str(responsePayload.get("status", "queued")) or "queued"
+  summary.queuedCount += 1
+  if taskId:
+    summary.queuedTaskIds.append(taskId)
+  subscriptionStore.updateSeenAlbumDetection(
+    subscriptionId,
+    album.albumId,
+    status,
+    taskId,
+    ALBUM_USER_STATE_SUBSCRIBED,
+  )
+
+
 def scanSubscriptionUnlocked(
   app: Flask,
   subscriptionStore: ArtistSubscriptionStore,
@@ -1259,6 +1656,7 @@ def scanSubscriptionUnlocked(
   artistId = str(subscription["artistId"])
   artistName = str(subscription["artistName"])
   storefront = str(subscription["storefront"])
+  newAlbumPolicy = normalizeSubscriptionPolicy(subscription.get("newAlbumPolicy"), SUBSCRIPTION_POLICY_CONFIRM)
   summary = SubscriptionScanSummary(
     subscriptionId=subscriptionId,
     artistId=artistId,
@@ -1280,48 +1678,52 @@ def scanSubscriptionUnlocked(
         url=normalizeUrl(album.url),
         releaseDate=album.releaseDate,
       )
-      subscriptionStore.upsertSeenAlbum(subscriptionId, normalizedAlbum)
+      seenAlbum, _created = subscriptionStore.upsertSeenAlbumMetadata(subscriptionId, normalizedAlbum)
+      currentUserState = normalizeAlbumUserState(seenAlbum.get("userState"), ALBUM_USER_STATE_PENDING)
+      detectedStatus, taskId = detectSubscriptionAlbumStatus(historyStore, taskStore, normalizedAlbum)
 
-      activeTask = getActiveTaskForUrlOrAlbumId(taskStore, normalizedAlbum.url, albumId)
-      if activeTask is not None:
+      if detectedStatus in ALBUM_DETECTED_ACTIVE:
         summary.skippedActiveCount += 1
-        subscriptionStore.updateSeenAlbumStatus(subscriptionId, albumId, activeTask.status, activeTask.id)
+        userState = currentUserState if currentUserState in {ALBUM_USER_STATE_IGNORED, ALBUM_USER_STATE_IMPORTED} else ALBUM_USER_STATE_SUBSCRIBED
+        subscriptionStore.updateSeenAlbumDetection(subscriptionId, albumId, detectedStatus, taskId, userState)
         continue
 
-      existing = findDownloadRecord(historyStore, normalizedAlbum.url, albumId)
-      if hasUsableCompletedRecord(existing):
+      if detectedStatus == "completed":
         summary.skippedCompletedCount += 1
-        subscriptionStore.updateSeenAlbumStatus(
-          subscriptionId,
-          albumId,
-          "completed",
-          str(existing.get("task_id", "")) if existing is not None else "",
-        )
+        userState = currentUserState if currentUserState in {ALBUM_USER_STATE_IGNORED, ALBUM_USER_STATE_IMPORTED} else ALBUM_USER_STATE_SUBSCRIBED
+        subscriptionStore.updateSeenAlbumDetection(subscriptionId, albumId, detectedStatus, taskId, userState)
         continue
 
-      try:
-        responsePayload = startTask(
+      if currentUserState == ALBUM_USER_STATE_IGNORED:
+        summary.skippedIgnoredCount += 1
+        subscriptionStore.updateSeenAlbumDetection(subscriptionId, albumId, detectedStatus, taskId, currentUserState)
+        continue
+
+      if currentUserState == ALBUM_USER_STATE_IMPORTED:
+        summary.skippedImportedCount += 1
+        subscriptionStore.updateSeenAlbumDetection(subscriptionId, albumId, detectedStatus, taskId, currentUserState)
+        continue
+
+      if detectedStatus in ALBUM_DETECTED_NEEDS_CONFIRM and newAlbumPolicy == SUBSCRIPTION_POLICY_AUTO:
+        subscriptionStore.updateSeenAlbumDetection(subscriptionId, albumId, detectedStatus, taskId, ALBUM_USER_STATE_SUBSCRIBED)
+        queueSubscriptionAlbumDownload(
           app,
+          subscriptionStore,
+          historyStore,
           taskStore,
           taskQueue,
-          historyStore,
-          normalizedAlbum.url,
-          "alac",
-          "subscription",
+          subscriptionId,
+          normalizedAlbum,
+          summary,
         )
-      except Exception as exc:  # noqa: BLE001
-        summary.errorCount += 1
-        summary.errors.append(f"{normalizedAlbum.name}: {exc}")
-        subscriptionStore.updateSeenAlbumStatus(subscriptionId, albumId, "failed")
         continue
 
-      taskId = str(responsePayload.get("taskId", ""))
-      task = taskStore.getTask(taskId)
-      status = task.status if task is not None else str(responsePayload.get("status", "queued")) or "queued"
-      summary.queuedCount += 1
-      if taskId:
-        summary.queuedTaskIds.append(taskId)
-      subscriptionStore.updateSeenAlbumStatus(subscriptionId, albumId, status, taskId)
+      if detectedStatus in ALBUM_DETECTED_NEEDS_CONFIRM:
+        summary.pendingCount += 1
+        subscriptionStore.updateSeenAlbumDetection(subscriptionId, albumId, detectedStatus, taskId, ALBUM_USER_STATE_PENDING)
+        continue
+
+      subscriptionStore.updateSeenAlbumDetection(subscriptionId, albumId, detectedStatus, taskId)
 
     subscriptionStore.markChecked(subscriptionId)
   except Exception as exc:  # noqa: BLE001
@@ -1385,11 +1787,117 @@ def aggregateSubscriptionSummaries(summaries: list[SubscriptionScanSummary]) -> 
     "scannedCount": len(summaries),
     "foundCount": sum(summary.foundCount for summary in summaries),
     "queuedCount": sum(summary.queuedCount for summary in summaries),
+    "pendingCount": sum(summary.pendingCount for summary in summaries),
     "skippedCompletedCount": sum(summary.skippedCompletedCount for summary in summaries),
     "skippedActiveCount": sum(summary.skippedActiveCount for summary in summaries),
+    "skippedIgnoredCount": sum(summary.skippedIgnoredCount for summary in summaries),
+    "skippedImportedCount": sum(summary.skippedImportedCount for summary in summaries),
     "errorCount": sum(summary.errorCount for summary in summaries),
     "summaries": summaryPayloads,
   }
+
+
+def normalizeAlbumAction(value: object) -> str:
+  normalized = str(value or "").strip().lower().replace("-", "_")
+  aliases = {
+    "imported": "mark_imported",
+    "import": "mark_imported",
+    "restore": "pending",
+  }
+  return aliases.get(normalized, normalized)
+
+
+def applySubscriptionAlbumAction(
+  app: Flask,
+  subscriptionStore: ArtistSubscriptionStore,
+  historyStore: DownloadHistoryStore,
+  taskStore: TaskStore,
+  taskQueue: SerialTaskQueue,
+  subscription: dict[str, object],
+  albumIds: list[str],
+  action: str,
+) -> dict[str, object]:
+  subscriptionId = int(subscription["id"])
+  normalizedAction = normalizeAlbumAction(action)
+  summary = SubscriptionScanSummary(
+    subscriptionId=subscriptionId,
+    artistId=str(subscription["artistId"]),
+    artistName=str(subscription["artistName"]),
+  )
+  updatedAlbumIds: list[str] = []
+
+  if normalizedAction not in {"download", "ignore", "mark_imported", "pending"}:
+    return {"error": "unsupported album action"}
+
+  for albumId in albumIds:
+    normalizedAlbumId = str(albumId or "").strip()
+    if not normalizedAlbumId:
+      continue
+    seenAlbum = subscriptionStore.getSeenAlbum(subscriptionId, normalizedAlbumId)
+    if seenAlbum is None:
+      summary.errorCount += 1
+      summary.errors.append(f"专辑不存在: {normalizedAlbumId}")
+      continue
+
+    if normalizedAction != "download":
+      targetState = {
+        "ignore": ALBUM_USER_STATE_IGNORED,
+        "mark_imported": ALBUM_USER_STATE_IMPORTED,
+        "pending": ALBUM_USER_STATE_PENDING,
+      }[normalizedAction]
+      if subscriptionStore.updateSeenAlbumUserState(subscriptionId, normalizedAlbumId, targetState):
+        updatedAlbumIds.append(normalizedAlbumId)
+      continue
+
+    album = AppleMusicAlbum(
+      albumId=normalizedAlbumId,
+      name=str(seenAlbum.get("albumName", "")),
+      url=normalizeUrl(str(seenAlbum.get("albumUrl", ""))),
+      releaseDate=str(seenAlbum.get("releaseDate", "")),
+    )
+    if not album.url:
+      summary.errorCount += 1
+      summary.errors.append(f"专辑缺少链接: {normalizedAlbumId}")
+      continue
+
+    detectedStatus, taskId = detectSubscriptionAlbumStatus(historyStore, taskStore, album)
+    if detectedStatus in ALBUM_DETECTED_ACTIVE:
+      summary.skippedActiveCount += 1
+      subscriptionStore.updateSeenAlbumDetection(subscriptionId, normalizedAlbumId, detectedStatus, taskId, ALBUM_USER_STATE_SUBSCRIBED)
+      updatedAlbumIds.append(normalizedAlbumId)
+      continue
+    if detectedStatus == "completed":
+      summary.skippedCompletedCount += 1
+      subscriptionStore.updateSeenAlbumDetection(subscriptionId, normalizedAlbumId, detectedStatus, taskId, ALBUM_USER_STATE_SUBSCRIBED)
+      updatedAlbumIds.append(normalizedAlbumId)
+      continue
+    if detectedStatus not in ALBUM_DETECTED_NEEDS_CONFIRM:
+      subscriptionStore.updateSeenAlbumDetection(subscriptionId, normalizedAlbumId, detectedStatus, taskId, ALBUM_USER_STATE_SUBSCRIBED)
+      updatedAlbumIds.append(normalizedAlbumId)
+      continue
+
+    subscriptionStore.updateSeenAlbumDetection(subscriptionId, normalizedAlbumId, detectedStatus, taskId, ALBUM_USER_STATE_SUBSCRIBED)
+    beforeQueuedCount = summary.queuedCount
+    queueSubscriptionAlbumDownload(
+      app,
+      subscriptionStore,
+      historyStore,
+      taskStore,
+      taskQueue,
+      subscriptionId,
+      album,
+      summary,
+    )
+    if summary.queuedCount > beforeQueuedCount:
+      updatedAlbumIds.append(normalizedAlbumId)
+
+  payload = summary.toDict()
+  payload.update({
+    "action": normalizedAction,
+    "updatedCount": len(updatedAlbumIds),
+    "updatedAlbumIds": updatedAlbumIds,
+  })
+  return payload
 
 
 def startSubscriptionScheduler(app: Flask) -> None:
@@ -1454,7 +1962,7 @@ def createApp(
 
   @app.get("/")
   def index() -> str:
-    return render_template("index.html")
+    return render_template("index.html", static_version=getStaticVersion(app))
 
   @app.post("/api/tasks")
   def createTaskRoute():
@@ -1594,6 +2102,48 @@ def createApp(
       return jsonify({"error": errorMessage}), statusCode
     return jsonify(summary.toDict())
 
+  @app.patch("/api/subscriptions/<int:subscriptionId>")
+  def updateSubscriptionRoute(subscriptionId: int):
+    payload = request.get_json(silent=True) or {}
+    newAlbumPolicy = normalizeSubscriptionPolicy(payload.get("newAlbumPolicy", payload.get("new_album_policy", "")), "")
+    if not newAlbumPolicy:
+      return jsonify({"error": "newAlbumPolicy must be confirm or auto"}), 400
+    updated = subscriptionStore.updateSubscriptionPolicy(subscriptionId, newAlbumPolicy)
+    if not updated:
+      return jsonify({"error": "subscription not found"}), 404
+    subscription = subscriptionStore.get(subscriptionId)
+    return jsonify({"subscription": subscription})
+
+  @app.post("/api/subscriptions/<int:subscriptionId>/albums/actions")
+  def subscriptionAlbumActionRoute(subscriptionId: int):
+    subscription = subscriptionStore.get(subscriptionId)
+    if subscription is None:
+      return jsonify({"error": "subscription not found"}), 404
+    payload = request.get_json(silent=True) or {}
+    rawAlbumIds = payload.get("albumIds", payload.get("album_ids", payload.get("albumId", payload.get("album_id", []))))
+    if isinstance(rawAlbumIds, str):
+      albumIds = [rawAlbumIds]
+    elif isinstance(rawAlbumIds, list):
+      albumIds = [str(item) for item in rawAlbumIds]
+    else:
+      albumIds = []
+    if not albumIds:
+      return jsonify({"error": "albumIds is required"}), 400
+    action = normalizeAlbumAction(payload.get("action", ""))
+    result = applySubscriptionAlbumAction(
+      app,
+      subscriptionStore,
+      historyStore,
+      taskStore,
+      taskQueue,
+      subscription,
+      albumIds,
+      action,
+    )
+    if "error" in result:
+      return jsonify(result), 400
+    return jsonify(result)
+
   @app.delete("/api/subscriptions/<int:subscriptionId>")
   def deleteSubscriptionRoute(subscriptionId: int):
     deleted = subscriptionStore.delete(subscriptionId)
@@ -1617,18 +2167,23 @@ def createApp(
   @app.get("/api/tasks")
   def listTasksRoute():
     tasks = sorted(taskStore.listTasks(), key=lambda task: task.createdAt, reverse=True)
-    return jsonify([
-      {
+    taskPayloads: list[dict[str, object]] = []
+    for task in tasks:
+      albumId = extractAlbumIdFromUrl(task.url)
+      seenAlbum = subscriptionStore.getSeenAlbumByAlbumId(albumId)
+      payload: dict[str, object] = {
         "taskId": task.id,
         "url": task.url,
+        "albumId": albumId,
+        "albumName": seenAlbum["albumName"] if seenAlbum is not None else "",
         "status": task.status,
         "stage": task.stage,
         "progress": task.progress,
         "source": task.source,
         "createdAt": task.createdAt,
       }
-      for task in tasks
-    ])
+      taskPayloads.append(payload)
+    return jsonify(taskPayloads)
 
   @app.get("/api/tasks/<taskId>")
   def getTaskRoute(taskId: str):
