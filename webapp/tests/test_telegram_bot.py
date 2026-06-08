@@ -13,6 +13,7 @@ from webapp.telegram_bot import (
   TelegramTaskStore,
   answerTelegramCallbackQuery,
   buildReplyKeyboard,
+  buildSubscriptionSelectionKeyboard,
   buildSubscriptionReviewKeyboard,
   buildTelegramCommands,
   createArtistSubscription,
@@ -26,6 +27,7 @@ from webapp.telegram_bot import (
   formatArtistSearchResultsMessage,
   formatStartupWelcomeMessage,
   formatRetryFailedTasksMessage,
+  formatSubscriptionSelectionMessage,
   formatSubscriptionReviewMessage,
   formatSubscriptionScanSummaryMessage,
   formatTaskListMessage,
@@ -842,7 +844,11 @@ class TelegramBotTest(unittest.TestCase):
       ("unsubscribe", "12345"),
     ])
     self.assertIn("已订阅 Example Artist", messages[0][1])
-    self.assertIn("歌手订阅", messages[1][1])
+    self.assertIn("请选择歌手", messages[1][1])
+    self.assertEqual(messages[1][3], {"inline_keyboard": [[{
+      "text": "Example Artist (0)",
+      "callback_data": "ss:a:12345:0",
+    }]]})
     self.assertIn("已取消订阅 artist_id: 12345", messages[2][1])
     self.assertIn("歌手订阅扫描完成", messages[3][1])
 
@@ -986,6 +992,31 @@ class TelegramBotTest(unittest.TestCase):
     self.assertIn("New Album", message)
     self.assertEqual(keyboard["inline_keyboard"][0][0]["callback_data"], "sa:7:111:d")
 
+  def testSubscriptionSelectionPaginatesArtists(self):
+    subscriptions = [
+      {
+        "id": index,
+        "artistName": f"Artist {index}",
+        "storefront": "cn",
+        "pendingAlbumCount": index,
+      }
+      for index in range(1, 10)
+    ]
+
+    firstPageMessage = formatSubscriptionSelectionMessage(subscriptions)
+    secondPageMessage = formatSubscriptionSelectionMessage(subscriptions, page=1)
+    firstPageKeyboard = buildSubscriptionSelectionKeyboard(subscriptions)
+    secondPageKeyboard = buildSubscriptionSelectionKeyboard(subscriptions, page=1)
+
+    self.assertIn("第 1/2 页", firstPageMessage)
+    self.assertIn("1. Artist 1 CN - 待确认 1 个", firstPageMessage)
+    self.assertNotIn("Artist 9", firstPageMessage)
+    self.assertIn("第 2/2 页", secondPageMessage)
+    self.assertIn("9. Artist 9 CN - 待确认 9 个", secondPageMessage)
+    self.assertIn({"text": "下一页", "callback_data": "ssp:1"}, firstPageKeyboard["inline_keyboard"][-1])
+    self.assertIn({"text": "上一页", "callback_data": "ssp:0"}, secondPageKeyboard["inline_keyboard"][-1])
+    self.assertEqual(firstPageKeyboard["inline_keyboard"][0][0]["callback_data"], "ss:s:1:0")
+
   def testHandleUpdateEditsSubscriptionReviewPageCallback(self):
     edits = []
     answers = []
@@ -1084,6 +1115,100 @@ class TelegramBotTest(unittest.TestCase):
 
     self.assertEqual(answers, [("callback-1", "第 2 页")])
     self.assertEqual(messages, [])
+
+  def testHandleUpdateEditsSubscriptionSelectionPageCallback(self):
+    edits = []
+    answers = []
+    messages = []
+    subscriptions = [
+      {
+        "id": index,
+        "artistName": f"Artist {index}",
+        "storefront": "cn",
+        "pendingAlbumCount": index,
+      }
+      for index in range(1, 10)
+    ]
+
+    with tempfile.TemporaryDirectory() as tempDir:
+      store = TelegramTaskStore(f"{tempDir}/telegram_tasks.db")
+      handleUpdate(
+        update={
+          "update_id": 1,
+          "callback_query": {
+            "id": "callback-1",
+            "from": {"id": 12345, "is_bot": False},
+            "message": {
+              "message_id": 99,
+              "chat": {"id": 12345, "type": "private"},
+            },
+            "data": "ssp:1",
+          },
+        },
+        allowedChatId=12345,
+        store=store,
+        createTask=lambda url: {"taskId": "task-1", "status": "running"},
+        fetchSubscriptions=lambda: subscriptions,
+        answerCallback=lambda callbackQueryId, text="": answers.append((callbackQueryId, text)),
+        editMessageText=lambda chatId, messageId, text, replyMarkup=None: edits.append((chatId, messageId, text, replyMarkup)),
+        sendMessage=lambda chatId, text, replyToMessageId=None, replyMarkup=None: messages.append((chatId, text, replyToMessageId, replyMarkup)),
+      )
+
+    self.assertEqual(answers, [("callback-1", "第 2 页")])
+    self.assertEqual(messages, [])
+    self.assertEqual(len(edits), 1)
+    self.assertIn("第 2/2 页", edits[0][2])
+    self.assertIn("Artist 9", edits[0][2])
+    self.assertIn({"text": "上一页", "callback_data": "ssp:0"}, edits[0][3]["inline_keyboard"][-1])
+
+  def testHandleUpdateEditsSubscriptionReviewAfterArtistSelection(self):
+    edits = []
+    answers = []
+    messages = []
+    subscription = {
+      "id": 7,
+      "artistName": "Example Artist",
+      "recentAlbums": [{
+        "albumId": "111",
+        "albumName": "New Album",
+        "userState": "pending",
+        "detectedStatus": "missing",
+        "canDownload": True,
+      }],
+    }
+
+    with tempfile.TemporaryDirectory() as tempDir:
+      store = TelegramTaskStore(f"{tempDir}/telegram_tasks.db")
+      handleUpdate(
+        update={
+          "update_id": 1,
+          "callback_query": {
+            "id": "callback-1",
+            "from": {"id": 12345, "is_bot": False},
+            "message": {
+              "message_id": 99,
+              "chat": {"id": 12345, "type": "private"},
+            },
+            "data": "ss:s:7:0",
+          },
+        },
+        allowedChatId=12345,
+        store=store,
+        createTask=lambda url: {"taskId": "task-1", "status": "running"},
+        fetchSubscriptions=lambda: [subscription],
+        answerCallback=lambda callbackQueryId, text="": answers.append((callbackQueryId, text)),
+        editMessageText=lambda chatId, messageId, text, replyMarkup=None: edits.append((chatId, messageId, text, replyMarkup)),
+        sendMessage=lambda chatId, text, replyToMessageId=None, replyMarkup=None: messages.append((chatId, text, replyToMessageId, replyMarkup)),
+      )
+
+    self.assertEqual(answers, [("callback-1", "Example Artist")])
+    self.assertEqual(messages, [])
+    self.assertEqual(len(edits), 1)
+    self.assertIn("Example Artist 专辑确认", edits[0][2])
+    self.assertIn("New Album", edits[0][2])
+    callbackData = [button["callback_data"] for row in edits[0][3]["inline_keyboard"] for button in row]
+    self.assertIn("sa:7:111:d:0:0", callbackData)
+    self.assertIn("ssp:0", callbackData)
 
   def testHandleUpdateKeepsSubscriptionReviewPageAfterAlbumAction(self):
     calls = []
@@ -1447,7 +1572,10 @@ class TelegramBotTest(unittest.TestCase):
     self.assertIn("Example Artist", messages[1][1])
     self.assertIn("歌手订阅扫描完成", messages[2][1])
     self.assertEqual(messages[0][3], {"remove_keyboard": True})
-    self.assertEqual(messages[1][3], {"remove_keyboard": True})
+    self.assertEqual(messages[1][3], {"inline_keyboard": [[{
+      "text": "Example Artist (0)",
+      "callback_data": "ss:a:12345:0",
+    }]]})
     self.assertEqual(messages[2][3], {"remove_keyboard": True})
 
   def testRunPollingCycleMarksSubscriptionCommandProcessedAfterApiError(self):
