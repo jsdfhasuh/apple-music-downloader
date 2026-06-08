@@ -1,5 +1,6 @@
 *
 !.gitignore
+!AGENTS.md
 !agent.js
 !agent-arm64.js
 !go.mod
