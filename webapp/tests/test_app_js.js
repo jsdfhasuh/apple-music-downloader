@@ -11,6 +11,7 @@ const {
   formatSubscriptionScanSummary,
   formatHistoryRetrySummary,
   formatRetryFailedSummary,
+  getSafeImageUrl,
   getTaskAlbumName,
   getInitialViewName,
   getSingleSubscriptionScanPayload,
@@ -18,8 +19,11 @@ const {
   isTerminalTaskStatus,
   mergeLogLines,
   normalizeHistoryStatus,
+  renderArtworkImage,
   renderHistoryList,
   renderResult,
+  renderSubscriptionAlbums,
+  renderSubscriptionList,
   renderTaskList,
   retryFailedTasks,
   retryHistoryFailedTasks,
@@ -328,6 +332,69 @@ test("compareAlbumsByReleaseDateDesc sorts newest release first and missing date
   albums.sort(compareAlbumsByReleaseDateDesc)
 
   assert.deepEqual(albums.map((album) => album.albumId), ["new", "middle", "old", "missing"])
+})
+
+test("getSafeImageUrl only allows http image URLs", () => {
+  assert.equal(
+    getSafeImageUrl("https://is1-ssl.mzstatic.com/image/thumb/example/512x512bb.jpg"),
+    "https://is1-ssl.mzstatic.com/image/thumb/example/512x512bb.jpg"
+  )
+  assert.equal(getSafeImageUrl("javascript:alert(1)"), "")
+  assert.equal(getSafeImageUrl("https://[bad"), "")
+})
+
+test("renderArtworkImage renders safe images and placeholders", () => {
+  const safe = renderArtworkImage(
+    "https://is1-ssl.mzstatic.com/image/thumb/example/512x512bb.jpg",
+    "Album & Artist",
+    "subscription-album-artwork"
+  )
+  const unsafe = renderArtworkImage("javascript:alert(1)", "Bad", "subscription-album-artwork")
+
+  assert.match(safe, /<img class="subscription-album-artwork"/)
+  assert.match(safe, /src="https:\/\/is1-ssl\.mzstatic\.com\/image\/thumb\/example\/512x512bb\.jpg"/)
+  assert.match(safe, /alt="Album &amp; Artist"/)
+  assert.match(unsafe, /artwork-placeholder/)
+  assert.doesNotMatch(unsafe, /src=/)
+})
+
+test("renderSubscriptionAlbums includes album artwork", () => {
+  const html = renderSubscriptionAlbums({
+    id: 7,
+    recentAlbums: [{
+      albumId: "111",
+      albumName: "New Album",
+      albumUrl: "https://music.apple.com/cn/album/new-album/111",
+      artworkUrl: "https://is1-ssl.mzstatic.com/image/thumb/album-111/512x512bb.jpg",
+      releaseDate: "2026-06-01",
+      userState: "pending",
+      detectedStatus: "missing",
+      canDownload: true,
+    }],
+  })
+
+  assert.match(html, /class="subscription-album-artwork"/)
+  assert.match(html, /album-111\/512x512bb\.jpg/)
+  assert.match(html, /New Album/)
+})
+
+test("renderSubscriptionList includes artist artwork", () => {
+  withFakeElement("subscription-list", (element) => {
+    renderSubscriptionList([{
+      id: 7,
+      artistName: "Example Artist",
+      artistId: "12345",
+      storefront: "cn",
+      artistArtworkUrl: "https://is1-ssl.mzstatic.com/image/thumb/artist-example/512x512bb.jpg",
+      enabled: true,
+      newAlbumPolicy: "confirm",
+      recentAlbums: [],
+    }])
+
+    assert.match(element.innerHTML, /class="subscription-artist-artwork"/)
+    assert.match(element.innerHTML, /artist-example\/512x512bb\.jpg/)
+    assert.match(element.innerHTML, /Example Artist/)
+  })
 })
 
 test("showView displays only the requested panel", () => {

@@ -447,6 +447,7 @@ class ArtistSubscriptionStore:
           storefront TEXT NOT NULL,
           artist_name TEXT NOT NULL,
           artist_url TEXT NOT NULL,
+          artist_artwork_url TEXT NOT NULL DEFAULT '',
           enabled INTEGER NOT NULL DEFAULT 1,
           new_album_policy TEXT NOT NULL DEFAULT 'confirm',
           last_checked_at TEXT,
@@ -465,6 +466,7 @@ class ArtistSubscriptionStore:
           album_id TEXT NOT NULL,
           album_url TEXT NOT NULL,
           album_name TEXT NOT NULL DEFAULT '',
+          artwork_url TEXT NOT NULL DEFAULT '',
           release_date TEXT NOT NULL DEFAULT '',
           status TEXT NOT NULL DEFAULT 'seen',
           task_id TEXT NOT NULL DEFAULT '',
@@ -484,6 +486,12 @@ class ArtistSubscriptionStore:
         pass
       try:
         connection.execute(
+          "ALTER TABLE artist_subscriptions ADD COLUMN artist_artwork_url TEXT NOT NULL DEFAULT ''"
+        )
+      except sqlite3.OperationalError:
+        pass
+      try:
+        connection.execute(
           "ALTER TABLE subscription_seen_albums ADD COLUMN user_state TEXT NOT NULL DEFAULT 'subscribed'"
         )
       except sqlite3.OperationalError:
@@ -491,6 +499,12 @@ class ArtistSubscriptionStore:
       try:
         connection.execute(
           "ALTER TABLE subscription_seen_albums ADD COLUMN detected_status TEXT NOT NULL DEFAULT 'seen'"
+        )
+      except sqlite3.OperationalError:
+        pass
+      try:
+        connection.execute(
+          "ALTER TABLE subscription_seen_albums ADD COLUMN artwork_url TEXT NOT NULL DEFAULT ''"
         )
       except sqlite3.OperationalError:
         pass
@@ -517,16 +531,17 @@ class ArtistSubscriptionStore:
       created = existing is None
       connection.execute(
         """
-        INSERT INTO artist_subscriptions (artist_id, storefront, artist_name, artist_url, enabled, new_album_policy, last_error, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 1, 'confirm', '', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        INSERT INTO artist_subscriptions (artist_id, storefront, artist_name, artist_url, artist_artwork_url, enabled, new_album_policy, last_error, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 1, 'confirm', '', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         ON CONFLICT(artist_id, storefront) DO UPDATE SET
           artist_name = excluded.artist_name,
           artist_url = excluded.artist_url,
+          artist_artwork_url = excluded.artist_artwork_url,
           enabled = 1,
           last_error = '',
           updated_at = CURRENT_TIMESTAMP
         """,
-        (artist.artistId, artist.storefront, artist.name, artist.url),
+        (artist.artistId, artist.storefront, artist.name, artist.url, artist.artworkUrl),
       )
       connection.commit()
       row = connection.execute(
@@ -584,7 +599,7 @@ class ArtistSubscriptionStore:
     with closing(self._connect()) as connection:
       rows = connection.execute(
         """
-        SELECT album_id, album_url, album_name, release_date, status, task_id, user_state, detected_status, updated_at
+        SELECT album_id, album_url, album_name, artwork_url, release_date, status, task_id, user_state, detected_status, updated_at
         FROM subscription_seen_albums
         WHERE subscription_id = ?
         ORDER BY
@@ -603,7 +618,7 @@ class ArtistSubscriptionStore:
     with closing(self._connect()) as connection:
       row = connection.execute(
         """
-        SELECT album_id, album_url, album_name, release_date, status, task_id, user_state, detected_status, updated_at
+        SELECT album_id, album_url, album_name, artwork_url, release_date, status, task_id, user_state, detected_status, updated_at
         FROM subscription_seen_albums
         WHERE subscription_id = ? AND album_id = ?
         LIMIT 1
@@ -620,7 +635,7 @@ class ArtistSubscriptionStore:
     with closing(self._connect()) as connection:
       row = connection.execute(
         """
-        SELECT album_id, album_url, album_name, release_date, status, task_id, user_state, detected_status, updated_at
+        SELECT album_id, album_url, album_name, artwork_url, release_date, status, task_id, user_state, detected_status, updated_at
         FROM subscription_seen_albums
         WHERE album_id = ?
         ORDER BY updated_at DESC, id DESC
@@ -676,11 +691,12 @@ class ArtistSubscriptionStore:
     with closing(self._connect()) as connection:
       connection.execute(
         """
-        INSERT INTO subscription_seen_albums (subscription_id, album_id, album_url, album_name, release_date, status, task_id, user_state, detected_status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        INSERT INTO subscription_seen_albums (subscription_id, album_id, album_url, album_name, artwork_url, release_date, status, task_id, user_state, detected_status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         ON CONFLICT(subscription_id, album_id) DO UPDATE SET
           album_url = excluded.album_url,
           album_name = excluded.album_name,
+          artwork_url = excluded.artwork_url,
           release_date = excluded.release_date,
           status = excluded.status,
           task_id = excluded.task_id,
@@ -693,6 +709,7 @@ class ArtistSubscriptionStore:
           album.albumId,
           album.url,
           album.name,
+          album.artworkUrl,
           album.releaseDate,
           rowStatusFromDetectedStatus(resolvedDetectedStatus),
           taskId,
@@ -719,10 +736,10 @@ class ArtistSubscriptionStore:
         connection.execute(
           """
           UPDATE subscription_seen_albums
-          SET album_url = ?, album_name = ?, release_date = ?, updated_at = CURRENT_TIMESTAMP
+          SET album_url = ?, album_name = ?, artwork_url = ?, release_date = ?, updated_at = CURRENT_TIMESTAMP
           WHERE subscription_id = ? AND album_id = ?
           """,
-          (album.url, album.name, album.releaseDate, subscriptionId, album.albumId),
+          (album.url, album.name, album.artworkUrl, album.releaseDate, subscriptionId, album.albumId),
         )
         connection.commit()
     row = self.getSeenAlbum(subscriptionId, album.albumId)
@@ -864,6 +881,7 @@ class ArtistSubscriptionStore:
       "storefront": str(row["storefront"]),
       "artistName": str(row["artist_name"]),
       "artistUrl": str(row["artist_url"]),
+      "artistArtworkUrl": str(row["artist_artwork_url"]) if "artist_artwork_url" in keys else "",
       "enabled": bool(row["enabled"]),
       "newAlbumPolicy": normalizeSubscriptionPolicy(row["new_album_policy"] if "new_album_policy" in keys else "", SUBSCRIPTION_POLICY_CONFIRM),
       "lastCheckedAt": row["last_checked_at"],
@@ -890,6 +908,7 @@ class ArtistSubscriptionStore:
       "albumId": str(row["album_id"]),
       "albumUrl": str(row["album_url"]),
       "albumName": str(row["album_name"]),
+      "artworkUrl": str(row["artwork_url"]) if "artwork_url" in keys else "",
       "releaseDate": str(row["release_date"]),
       "status": str(row["status"]),
       "taskId": str(row["task_id"]),
@@ -1649,6 +1668,7 @@ def serializeArtist(artist: AppleMusicArtist) -> dict[str, str]:
     "storefront": artist.storefront,
     "artistName": artist.name,
     "artistUrl": artist.url,
+    "artistArtworkUrl": artist.artworkUrl,
   }
 
 
@@ -1761,6 +1781,7 @@ def scanSubscriptionUnlocked(
         name=album.name,
         url=normalizeUrl(album.url),
         releaseDate=album.releaseDate,
+        artworkUrl=album.artworkUrl,
       )
       seenAlbum, _created = subscriptionStore.upsertSeenAlbumMetadata(subscriptionId, normalizedAlbum)
       currentUserState = normalizeAlbumUserState(seenAlbum.get("userState"), ALBUM_USER_STATE_PENDING)
@@ -2138,6 +2159,7 @@ def createApp(
     artistId = str(payload.get("artistId", payload.get("artist_id", ""))).strip()
     storefront = str(payload.get("storefront", "")).strip().lower()
     artistName = str(payload.get("artistName", payload.get("artist_name", ""))).strip()
+    artistArtworkUrl = str(payload.get("artistArtworkUrl", payload.get("artist_artwork_url", ""))).strip()
 
     try:
       if artistUrl:
@@ -2151,6 +2173,7 @@ def createApp(
             storefront=storefront or parsedStorefront,
             name=artistName,
             url=artistUrl,
+            artworkUrl=artistArtworkUrl,
           )
         else:
           artist = createAppleMusicClient(app).getArtist(parsedStorefront, parsedArtistId)
@@ -2162,6 +2185,7 @@ def createApp(
           storefront=storefront,
           name=artistName,
           url=str(payload.get("artistUrl", payload.get("artist_url", ""))).strip(),
+          artworkUrl=artistArtworkUrl,
         )
     except Exception as exc:  # noqa: BLE001
       return jsonify({"error": str(exc)}), 502

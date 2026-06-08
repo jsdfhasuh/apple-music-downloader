@@ -33,6 +33,7 @@ SUBSCRIPTION_SELECT_PAGE_CALLBACK_PREFIX = "ssp"
 SUBSCRIPTION_SELECT_PAGE_SIZE = 8
 SUBSCRIPTION_REVIEW_PAGE_CALLBACK_PREFIX = "srp"
 SUBSCRIPTION_REVIEW_ALBUM_PAGE_SIZE = 5
+TELEGRAM_PHOTO_CAPTION_LIMIT = 1024
 SUBSCRIPTION_ALBUM_CALLBACK_ACTIONS = {
   "d": "download",
   "i": "ignore",
@@ -949,6 +950,23 @@ def sendSubscriptionReviewMessage(
   )
 
 
+def getSafeTelegramImageUrl(value: object) -> str:
+  rawUrl = str(value or "").strip()
+  if not rawUrl:
+    return ""
+  try:
+    parsed = parse.urlsplit(rawUrl)
+  except ValueError:
+    return ""
+  if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    return ""
+  return rawUrl
+
+
+def getSubscriptionArtistArtworkUrl(subscription: dict[str, object]) -> str:
+  return getSafeTelegramImageUrl(subscription.get("artistArtworkUrl", subscription.get("artist_artwork_url", "")))
+
+
 def formatSubscriptionCallbackResultMessage(
   action: str,
   album: dict[str, object] | None,
@@ -1310,9 +1328,11 @@ def handleSubscriptionCallbackQuery(
   fetchSubscriptions: Callable[[], list[dict[str, object]]],
   updateSubscriptionAlbumBySubscriptionId: Callable[[str, str, str], dict[str, object]],
   sendMessage: Callable[[int, str, int | None, dict[str, object] | None], None],
+  sendPhoto: Callable[[int, str, str, int | None, dict[str, object] | None], None],
   answerCallback: Callable[[str, str], None],
   editMessageReplyMarkup: Callable[[int, int, dict[str, object] | None], None],
   editMessageText: Callable[[int, int, str, dict[str, object] | None], None],
+  editMessageCaption: Callable[[int, int, str, dict[str, object] | None], None],
 ) -> None:
   def safeAnswerCallback(text: str) -> None:
     if not callbackId:
@@ -1327,6 +1347,16 @@ def handleSubscriptionCallbackQuery(
       sendMessage(chatId, text, replyToMessageId, replyMarkup)
     except Exception as exc:  # noqa: BLE001
       logBotMessage(f"failed to send subscription callback message: {exc}")
+
+  def safeSendPhoto(photoUrl: str, caption: str, replyMarkup: dict[str, object] | None = None) -> bool:
+    if len(caption) > TELEGRAM_PHOTO_CAPTION_LIMIT:
+      return False
+    try:
+      sendPhoto(chatId, photoUrl, caption, replyToMessageId, replyMarkup)
+      return True
+    except Exception as exc:  # noqa: BLE001
+      logBotMessage(f"failed to send subscription callback photo: {exc}")
+      return False
 
   def safeEditOrSendMessage(
     text: str,
@@ -1346,13 +1376,40 @@ def handleSubscriptionCallbackQuery(
       logBotMessage(f"{failedLogPrefix}: {exc}")
       safeSendMessage(text, replyMarkup)
 
+  def safeEditCaptionOrSendMessage(
+    text: str,
+    replyMarkup: dict[str, object] | None,
+    unchangedLogMessage: str,
+    failedLogPrefix: str,
+  ) -> None:
+    if replyToMessageId is None:
+      safeSendMessage(text, replyMarkup)
+      return
+    if len(text) > TELEGRAM_PHOTO_CAPTION_LIMIT:
+      try:
+        editMessageReplyMarkup(chatId, replyToMessageId, None)
+      except Exception as exc:  # noqa: BLE001
+        logBotMessage(f"failed to clear oversized photo caption keyboard: {exc}")
+      safeSendMessage(text, replyMarkup)
+      return
+    try:
+      editMessageCaption(chatId, replyToMessageId, text, replyMarkup)
+    except Exception as exc:  # noqa: BLE001
+      if isTelegramMessageNotModifiedError(exc):
+        logBotMessage(unchangedLogMessage)
+        return
+      logBotMessage(f"{failedLogPrefix}: {exc}")
+      safeSendMessage(text, replyMarkup)
+
   callbackId = str(callbackQuery.get("id", "") or "")
   fromUser = callbackQuery.get("from")
   userId = int(fromUser.get("id", 0)) if isinstance(fromUser, dict) else 0
   message = callbackQuery.get("message")
   chatId = userId
   replyToMessageId: int | None = None
+  isPhotoCallbackMessage = False
   if isinstance(message, dict):
+    isPhotoCallbackMessage = message.get("photo") is not None
     chat = message.get("chat")
     if isinstance(chat, dict):
       if str(chat.get("type", "")) != "private":
@@ -1399,9 +1456,20 @@ def handleSubscriptionCallbackQuery(
       return
     artistName = str(subscription.get("artistName", "未知歌手") or "未知歌手")
     safeAnswerCallback(artistName)
+    text = formatSubscriptionReviewMessage(subscription)
+    replyMarkup = buildSubscriptionReviewKeyboard(subscription, backPage=safeBackPage)
+    artistArtworkUrl = getSubscriptionArtistArtworkUrl(subscription)
+    if artistArtworkUrl:
+      if replyToMessageId is not None:
+        try:
+          editMessageReplyMarkup(chatId, replyToMessageId, None)
+        except Exception as exc:  # noqa: BLE001
+          logBotMessage(f"failed to clear subscription selection keyboard before photo: {exc}")
+      if safeSendPhoto(artistArtworkUrl, text, replyMarkup):
+        return
     safeEditOrSendMessage(
-      formatSubscriptionReviewMessage(subscription),
-      buildSubscriptionReviewKeyboard(subscription, backPage=safeBackPage),
+      text,
+      replyMarkup,
       "subscription review already up to date",
       "failed to edit subscription review",
     )
@@ -1423,12 +1491,20 @@ def handleSubscriptionCallbackQuery(
     safeAnswerCallback(f"第 {safePage + 1} 页")
     text = formatSubscriptionReviewMessage(subscription, safePage)
     replyMarkup = buildSubscriptionReviewKeyboard(subscription, safePage, backPage=backPage)
-    safeEditOrSendMessage(
-      text,
-      replyMarkup,
-      "subscription review page already up to date",
-      "failed to edit subscription review page",
-    )
+    if isPhotoCallbackMessage:
+      safeEditCaptionOrSendMessage(
+        text,
+        replyMarkup,
+        "subscription review photo caption already up to date",
+        "failed to edit subscription review photo caption",
+      )
+    else:
+      safeEditOrSendMessage(
+        text,
+        replyMarkup,
+        "subscription review page already up to date",
+        "failed to edit subscription review page",
+      )
     return
 
   parsed = parseSubscriptionAlbumCallbackData(callbackData)
@@ -1494,10 +1570,12 @@ def handleUpdate(
   updateSubscriptionPolicy: Callable[[str, str], dict[str, object]] | None = None,
   updateSubscriptionAlbum: Callable[[str, str, str], dict[str, object]] | None = None,
   sendMessage: Callable[[int, str, int | None, dict[str, object] | None], None] | None = None,
+  sendPhoto: Callable[[int, str, str, int | None, dict[str, object] | None], None] | None = None,
   updateSubscriptionAlbumBySubscriptionId: Callable[[str, str, str], dict[str, object]] | None = None,
   answerCallback: Callable[[str, str], None] | None = None,
   editMessageReplyMarkup: Callable[[int, int, dict[str, object] | None], None] | None = None,
   editMessageText: Callable[[int, int, str, dict[str, object] | None], None] | None = None,
+  editMessageCaption: Callable[[int, int, str, dict[str, object] | None], None] | None = None,
 ) -> None:
   if retryTasks is None:
     retryTasks = lambda: {}
@@ -1519,6 +1597,8 @@ def handleUpdate(
     updateSubscriptionAlbum = lambda artistId, albumId, action: {}
   if sendMessage is None:
     sendMessage = lambda chatId, text, replyToMessageId=None, replyMarkup=None: None
+  if sendPhoto is None:
+    sendPhoto = lambda chatId, photoUrl, caption, replyToMessageId=None, replyMarkup=None: None
   if updateSubscriptionAlbumBySubscriptionId is None:
     updateSubscriptionAlbumBySubscriptionId = lambda subscriptionId, albumId, action: {}
   if answerCallback is None:
@@ -1527,6 +1607,8 @@ def handleUpdate(
     editMessageReplyMarkup = lambda chatId, messageId, replyMarkup=None: None
   if editMessageText is None:
     editMessageText = lambda chatId, messageId, text, replyMarkup=None: None
+  if editMessageCaption is None:
+    editMessageCaption = lambda chatId, messageId, caption, replyMarkup=None: None
 
   callbackQuery = update.get("callback_query")
   if isinstance(callbackQuery, dict):
@@ -1536,9 +1618,11 @@ def handleUpdate(
       fetchSubscriptions=fetchSubscriptions,
       updateSubscriptionAlbumBySubscriptionId=updateSubscriptionAlbumBySubscriptionId,
       sendMessage=sendMessage,
+      sendPhoto=sendPhoto,
       answerCallback=answerCallback,
       editMessageReplyMarkup=editMessageReplyMarkup,
       editMessageText=editMessageText,
+      editMessageCaption=editMessageCaption,
     )
     return
 
@@ -1925,6 +2009,22 @@ def sendTelegramMessage(
   callTelegramApi(botToken, "sendMessage", payload)
 
 
+def sendTelegramPhoto(
+  botToken: str,
+  chatId: int,
+  photoUrl: str,
+  caption: str,
+  replyToMessageId: int | None = None,
+  replyMarkup: dict[str, object] | None = None,
+) -> None:
+  payload: dict[str, object] = {"chat_id": chatId, "photo": photoUrl, "caption": caption}
+  if replyToMessageId is not None:
+    payload["reply_to_message_id"] = replyToMessageId
+  if replyMarkup is not None:
+    payload["reply_markup"] = replyMarkup
+  callTelegramApi(botToken, "sendPhoto", payload)
+
+
 def answerTelegramCallbackQuery(botToken: str, callbackQueryId: str, text: str = "") -> None:
   payload: dict[str, object] = {"callback_query_id": callbackQueryId}
   if text:
@@ -1964,6 +2064,23 @@ def editTelegramMessageText(
   callTelegramApi(botToken, "editMessageText", payload)
 
 
+def editTelegramMessageCaption(
+  botToken: str,
+  chatId: int,
+  messageId: int,
+  caption: str,
+  replyMarkup: dict[str, object] | None = None,
+) -> None:
+  payload: dict[str, object] = {
+    "chat_id": chatId,
+    "message_id": messageId,
+    "caption": caption,
+  }
+  if replyMarkup is not None:
+    payload["reply_markup"] = replyMarkup
+  callTelegramApi(botToken, "editMessageCaption", payload)
+
+
 def getUpdates(botToken: str, offset: int | None, timeoutSeconds: int) -> list[dict[str, object]]:
   payload: dict[str, object] = {"timeout": timeoutSeconds}
   if offset is not None:
@@ -1993,10 +2110,12 @@ def runPollingCycle(
   updateSubscriptionPolicy: Callable[[str, str], dict[str, object]] | None = None,
   updateSubscriptionAlbum: Callable[[str, str, str], dict[str, object]] | None = None,
   sendMessage: Callable[[int, str, int | None, dict[str, object] | None], None] | None = None,
+  sendPhoto: Callable[[int, str, str, int | None, dict[str, object] | None], None] | None = None,
   updateSubscriptionAlbumBySubscriptionId: Callable[[str, str, str], dict[str, object]] | None = None,
   answerCallback: Callable[[str, str], None] | None = None,
   editMessageReplyMarkup: Callable[[int, int, dict[str, object] | None], None] | None = None,
   editMessageText: Callable[[int, int, str, dict[str, object] | None], None] | None = None,
+  editMessageCaption: Callable[[int, int, str, dict[str, object] | None], None] | None = None,
 ) -> int | None:
   if retryTasks is None:
     retryTasks = lambda: {}
@@ -2004,6 +2123,8 @@ def runPollingCycle(
     fetchTasks = lambda: []
   if sendMessage is None:
     sendMessage = lambda chatId, text, replyToMessageId=None, replyMarkup=None: None
+  if sendPhoto is None:
+    sendPhoto = lambda chatId, photoUrl, caption, replyToMessageId=None, replyMarkup=None: None
   if updateSubscriptionAlbumBySubscriptionId is None:
     updateSubscriptionAlbumBySubscriptionId = lambda subscriptionId, albumId, action: {}
   if answerCallback is None:
@@ -2012,6 +2133,8 @@ def runPollingCycle(
     editMessageReplyMarkup = lambda chatId, messageId, replyMarkup=None: None
   if editMessageText is None:
     editMessageText = lambda chatId, messageId, text, replyMarkup=None: None
+  if editMessageCaption is None:
+    editMessageCaption = lambda chatId, messageId, caption, replyMarkup=None: None
 
   nextOffset = offset
   updates = getUpdatesFn(offset, updatesTimeoutSeconds)
@@ -2037,10 +2160,12 @@ def runPollingCycle(
       updateSubscriptionPolicy=updateSubscriptionPolicy,
       updateSubscriptionAlbum=updateSubscriptionAlbum,
       sendMessage=sendMessage,
+      sendPhoto=sendPhoto,
       updateSubscriptionAlbumBySubscriptionId=updateSubscriptionAlbumBySubscriptionId,
       answerCallback=answerCallback,
       editMessageReplyMarkup=editMessageReplyMarkup,
       editMessageText=editMessageText,
+      editMessageCaption=editMessageCaption,
     )
     store.markUpdateProcessed(updateId)
     store.pruneProcessedUpdates()
@@ -2091,6 +2216,15 @@ def runPollingLoop() -> None:
         answerCallback=lambda callbackQueryId, text="": answerTelegramCallbackQuery(config.botToken, callbackQueryId, text),
         editMessageReplyMarkup=lambda chatId, messageId, replyMarkup=None: editTelegramMessageReplyMarkup(config.botToken, chatId, messageId, replyMarkup),
         editMessageText=lambda chatId, messageId, text, replyMarkup=None: editTelegramMessageText(config.botToken, chatId, messageId, text, replyMarkup),
+        editMessageCaption=lambda chatId, messageId, caption, replyMarkup=None: editTelegramMessageCaption(config.botToken, chatId, messageId, caption, replyMarkup),
+        sendPhoto=lambda chatId, photoUrl, caption, replyToMessageId=None, replyMarkup=None: sendTelegramPhoto(
+          config.botToken,
+          chatId,
+          photoUrl,
+          caption,
+          replyToMessageId,
+          replyMarkup,
+        ),
         sendMessage=lambda chatId, text, replyToMessageId=None, replyMarkup=None: sendTelegramMessage(
           config.botToken,
           chatId,

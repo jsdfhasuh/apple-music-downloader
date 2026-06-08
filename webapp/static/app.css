@@ -756,6 +756,52 @@ select:focus {
   margin-top: 11px;
 }
 
+.artist-result-main,
+.subscription-artist-main {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+
+.artist-result-main > div,
+.subscription-artist-main > div {
+  min-width: 0;
+}
+
+.artist-result-artwork,
+.subscription-artist-artwork,
+.subscription-album-artwork,
+.artwork-placeholder {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: #eef2f7;
+  color: var(--muted);
+  object-fit: cover;
+  font-size: 10px;
+  font-weight: 850;
+}
+
+.artist-result-artwork {
+  width: 44px;
+  height: 44px;
+}
+
+.subscription-artist-artwork {
+  width: 48px;
+  height: 48px;
+}
+
+.subscription-album-artwork {
+  width: 42px;
+  height: 42px;
+}
+
 .subscription-stats {
   justify-content: flex-start;
   flex-wrap: wrap;
@@ -838,7 +884,7 @@ select:focus {
 
 .subscription-album-item {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto minmax(180px, auto);
+  grid-template-columns: auto 42px minmax(0, 1fr) auto minmax(180px, auto);
   align-items: center;
   gap: 10px;
   min-width: 0;
@@ -1086,7 +1132,7 @@ select:focus {
   }
 
   .subscription-album-item {
-    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-columns: auto 42px minmax(0, 1fr);
   }
 
   .subscription-album-state,

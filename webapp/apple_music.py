@@ -20,6 +20,7 @@ class AppleMusicArtist:
   storefront: str
   name: str
   url: str
+  artworkUrl: str = ""
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,7 @@ class AppleMusicAlbum:
   name: str
   url: str
   releaseDate: str = ""
+  artworkUrl: str = ""
 
 
 def parseAppleMusicUrl(url: str) -> tuple[str, str, str] | None:
@@ -75,6 +77,27 @@ def normalizeDeveloperToken(rawValue: str | None) -> str:
   if token.lower().startswith("bearer "):
     token = token[7:].strip()
   return token
+
+
+def formatArtworkUrl(artwork: object, size: int = 512) -> str:
+  if not isinstance(artwork, dict):
+    return ""
+  template = str(artwork.get("url", "") or "").strip()
+  if not template:
+    return ""
+  formatted = (
+    template
+    .replace("{w}", str(size))
+    .replace("{h}", str(size))
+    .replace("{f}", "jpg")
+  )
+  try:
+    parsed = parse.urlsplit(formatted)
+  except ValueError:
+    return ""
+  if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    return ""
+  return formatted
 
 
 class AppleMusicClient:
@@ -180,10 +203,11 @@ class AppleMusicClient:
     artistId = str(item.get("id", "")).strip()
     name = str(attributes.get("name", "")).strip() or artistId
     url = str(attributes.get("url", "")).strip()
+    artworkUrl = formatArtworkUrl(attributes.get("artwork"), 512)
     if not url:
       slug = parse.quote(name.lower().replace(" ", "-"))
       url = f"https://music.apple.com/{storefront}/artist/{slug}/{artistId}"
-    return AppleMusicArtist(artistId=artistId, storefront=storefront, name=name, url=url)
+    return AppleMusicArtist(artistId=artistId, storefront=storefront, name=name, url=url, artworkUrl=artworkUrl)
 
   def _parseAlbum(self, item: dict[str, Any]) -> AppleMusicAlbum:
     attributes = item.get("attributes", {})
@@ -193,7 +217,8 @@ class AppleMusicClient:
     name = str(attributes.get("name", "")).strip() or albumId
     url = str(attributes.get("url", "")).strip()
     releaseDate = str(attributes.get("releaseDate", "")).strip()
-    return AppleMusicAlbum(albumId=albumId, name=name, url=url, releaseDate=releaseDate)
+    artworkUrl = formatArtworkUrl(attributes.get("artwork"), 512)
+    return AppleMusicAlbum(albumId=albumId, name=name, url=url, releaseDate=releaseDate, artworkUrl=artworkUrl)
 
 
 def fetchAppleMusicBearerToken(storefront: str = "us") -> str:

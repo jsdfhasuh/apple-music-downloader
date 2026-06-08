@@ -19,6 +19,7 @@ from webapp.telegram_bot import (
   createArtistSubscription,
   createDownloadTask,
   deleteArtistSubscription,
+  editTelegramMessageCaption,
   editTelegramMessageText,
   editTelegramMessageReplyMarkup,
   extractAppleMusicUrl,
@@ -31,6 +32,7 @@ from webapp.telegram_bot import (
   formatSubscriptionReviewMessage,
   formatSubscriptionScanSummaryMessage,
   formatTaskListMessage,
+  getSafeTelegramImageUrl,
   getTelegramConfig,
   handleUpdate,
   initializeTelegramBot,
@@ -44,6 +46,7 @@ from webapp.telegram_bot import (
   searchArtists,
   setTelegramCommands,
   sendTelegramMessage,
+  sendTelegramPhoto,
   updateArtistSubscriptionAlbumBySubscriptionId,
 )
 
@@ -1210,6 +1213,122 @@ class TelegramBotTest(unittest.TestCase):
     self.assertIn("sa:7:111:d:0:0", callbackData)
     self.assertIn("ssp:0", callbackData)
 
+  def testHandleUpdateSendsArtistPhotoAfterSubscriptionSelection(self):
+    edits = []
+    textEdits = []
+    answers = []
+    messages = []
+    photos = []
+    subscription = {
+      "id": 7,
+      "artistName": "Example Artist",
+      "artistArtworkUrl": "https://is1-ssl.mzstatic.com/image/thumb/example/512x512bb.jpg",
+      "recentAlbums": [{
+        "albumId": "111",
+        "albumName": "New Album",
+        "userState": "pending",
+        "detectedStatus": "missing",
+        "canDownload": True,
+      }],
+    }
+
+    with tempfile.TemporaryDirectory() as tempDir:
+      store = TelegramTaskStore(f"{tempDir}/telegram_tasks.db")
+      handleUpdate(
+        update={
+          "update_id": 1,
+          "callback_query": {
+            "id": "callback-1",
+            "from": {"id": 12345, "is_bot": False},
+            "message": {
+              "message_id": 99,
+              "chat": {"id": 12345, "type": "private"},
+            },
+            "data": "ss:s:7:0",
+          },
+        },
+        allowedChatId=12345,
+        store=store,
+        createTask=lambda url: {"taskId": "task-1", "status": "running"},
+        fetchSubscriptions=lambda: [subscription],
+        answerCallback=lambda callbackQueryId, text="": answers.append((callbackQueryId, text)),
+        editMessageReplyMarkup=lambda chatId, messageId, replyMarkup=None: edits.append((chatId, messageId, replyMarkup)),
+        editMessageText=lambda chatId, messageId, text, replyMarkup=None: textEdits.append((chatId, messageId, text, replyMarkup)),
+        sendPhoto=lambda chatId, photoUrl, caption, replyToMessageId=None, replyMarkup=None: photos.append((chatId, photoUrl, caption, replyToMessageId, replyMarkup)),
+        sendMessage=lambda chatId, text, replyToMessageId=None, replyMarkup=None: messages.append((chatId, text, replyToMessageId, replyMarkup)),
+      )
+
+    self.assertEqual(answers, [("callback-1", "Example Artist")])
+    self.assertEqual(edits, [(12345, 99, None)])
+    self.assertEqual(textEdits, [])
+    self.assertEqual(messages, [])
+    self.assertEqual(len(photos), 1)
+    self.assertEqual(photos[0][0], 12345)
+    self.assertEqual(photos[0][1], "https://is1-ssl.mzstatic.com/image/thumb/example/512x512bb.jpg")
+    self.assertIn("Example Artist 专辑确认", photos[0][2])
+    self.assertIn("New Album", photos[0][2])
+    self.assertEqual(photos[0][3], 99)
+    callbackData = [button["callback_data"] for row in photos[0][4]["inline_keyboard"] for button in row]
+    self.assertIn("sa:7:111:d:0:0", callbackData)
+    self.assertIn("ssp:0", callbackData)
+
+  def testHandleUpdateEditsSubscriptionReviewPhotoCaptionPageCallback(self):
+    captionEdits = []
+    textEdits = []
+    answers = []
+    messages = []
+    subscription = {
+      "id": 7,
+      "artistName": "Example Artist",
+      "recentAlbums": [
+        {
+          "albumId": str(index),
+          "albumName": f"Album {index}",
+          "releaseDate": f"2026-06-{index:02d}",
+          "userState": "pending",
+          "detectedStatus": "missing",
+          "canDownload": True,
+        }
+        for index in range(1, 7)
+      ],
+    }
+
+    with tempfile.TemporaryDirectory() as tempDir:
+      store = TelegramTaskStore(f"{tempDir}/telegram_tasks.db")
+      handleUpdate(
+        update={
+          "update_id": 1,
+          "callback_query": {
+            "id": "callback-1",
+            "from": {"id": 12345, "is_bot": False},
+            "message": {
+              "message_id": 99,
+              "chat": {"id": 12345, "type": "private"},
+              "photo": [{"file_id": "photo-1"}],
+            },
+            "data": "srp:7:1",
+          },
+        },
+        allowedChatId=12345,
+        store=store,
+        createTask=lambda url: {"taskId": "task-1", "status": "running"},
+        fetchSubscriptions=lambda: [subscription],
+        answerCallback=lambda callbackQueryId, text="": answers.append((callbackQueryId, text)),
+        editMessageCaption=lambda chatId, messageId, caption, replyMarkup=None: captionEdits.append((chatId, messageId, caption, replyMarkup)),
+        editMessageText=lambda chatId, messageId, text, replyMarkup=None: textEdits.append((chatId, messageId, text, replyMarkup)),
+        sendMessage=lambda chatId, text, replyToMessageId=None, replyMarkup=None: messages.append((chatId, text, replyToMessageId, replyMarkup)),
+      )
+
+    self.assertEqual(answers, [("callback-1", "第 2 页")])
+    self.assertEqual(textEdits, [])
+    self.assertEqual(messages, [])
+    self.assertEqual(len(captionEdits), 1)
+    self.assertEqual(captionEdits[0][0], 12345)
+    self.assertEqual(captionEdits[0][1], 99)
+    self.assertIn("第 2/2 页", captionEdits[0][2])
+    self.assertIn("6. Album 1", captionEdits[0][2])
+    self.assertIn({"text": "上一页", "callback_data": "srp:7:0"}, captionEdits[0][3]["inline_keyboard"][-1])
+
   def testHandleUpdateKeepsSubscriptionReviewPageAfterAlbumAction(self):
     calls = []
     fetchCalls = []
@@ -2244,6 +2363,47 @@ class TelegramBotTest(unittest.TestCase):
     self.assertEqual(calls[0][1], "sendMessage")
     self.assertIn("reply_markup", calls[0][2])
 
+  def testSendTelegramPhotoSupportsCaptionAndReplyMarkup(self):
+    calls = []
+
+    def fakeCallTelegramApi(botToken, method, payload):
+      calls.append((botToken, method, payload))
+      return {}
+
+    originalCallTelegramApi = telegram_bot.callTelegramApi
+    telegram_bot.callTelegramApi = fakeCallTelegramApi
+    try:
+      sendTelegramPhoto(
+        "bot-token",
+        12345,
+        "https://is1-ssl.mzstatic.com/image/thumb/example/512x512bb.jpg",
+        "caption",
+        10,
+        {"inline_keyboard": [[{"text": "下一页", "callback_data": "srp:7:1"}]]},
+      )
+    finally:
+      telegram_bot.callTelegramApi = originalCallTelegramApi
+
+    self.assertEqual(calls, [(
+      "bot-token",
+      "sendPhoto",
+      {
+        "chat_id": 12345,
+        "photo": "https://is1-ssl.mzstatic.com/image/thumb/example/512x512bb.jpg",
+        "caption": "caption",
+        "reply_to_message_id": 10,
+        "reply_markup": {"inline_keyboard": [[{"text": "下一页", "callback_data": "srp:7:1"}]]},
+      },
+    )])
+
+  def testGetSafeTelegramImageUrlOnlyAllowsHttpUrls(self):
+    self.assertEqual(
+      getSafeTelegramImageUrl("https://is1-ssl.mzstatic.com/image/thumb/example/512x512bb.jpg"),
+      "https://is1-ssl.mzstatic.com/image/thumb/example/512x512bb.jpg",
+    )
+    self.assertEqual(getSafeTelegramImageUrl("javascript:alert(1)"), "")
+    self.assertEqual(getSafeTelegramImageUrl("https://[bad"), "")
+
   def testAnswerTelegramCallbackQueryCallsTelegramApi(self):
     calls = []
 
@@ -2311,6 +2471,37 @@ class TelegramBotTest(unittest.TestCase):
         "chat_id": 12345,
         "message_id": 99,
         "text": "第 2 页",
+        "reply_markup": {"inline_keyboard": [[{"text": "上一页", "callback_data": "srp:7:0"}]]},
+      },
+    )])
+
+  def testEditTelegramMessageCaptionCanUpdatePaginatedReview(self):
+    calls = []
+
+    def fakeCallTelegramApi(botToken, method, payload):
+      calls.append((botToken, method, payload))
+      return {}
+
+    originalCallTelegramApi = telegram_bot.callTelegramApi
+    telegram_bot.callTelegramApi = fakeCallTelegramApi
+    try:
+      editTelegramMessageCaption(
+        "bot-token",
+        12345,
+        99,
+        "第 2 页",
+        {"inline_keyboard": [[{"text": "上一页", "callback_data": "srp:7:0"}]]},
+      )
+    finally:
+      telegram_bot.callTelegramApi = originalCallTelegramApi
+
+    self.assertEqual(calls, [(
+      "bot-token",
+      "editMessageCaption",
+      {
+        "chat_id": 12345,
+        "message_id": 99,
+        "caption": "第 2 页",
         "reply_markup": {"inline_keyboard": [[{"text": "上一页", "callback_data": "srp:7:0"}]]},
       },
     )])

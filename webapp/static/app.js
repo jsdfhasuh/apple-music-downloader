@@ -86,6 +86,7 @@ const demoStore = {
       storefront: "us",
       artistName: "Taylor Swift",
       artistUrl: "https://music.apple.com/us/artist/taylor-swift/159260351",
+      artistArtworkUrl: "https://is1-ssl.mzstatic.com/image/thumb/Features125/v4/demo/512x512bb.jpg",
       enabled: true,
       newAlbumPolicy: "confirm",
       albumCount: 3,
@@ -102,6 +103,7 @@ const demoStore = {
           albumId: "1819419299",
           albumName: "Prema",
           albumUrl: "https://music.apple.com/cn/album/prema/1819419299",
+          artworkUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/demo1/512x512bb.jpg",
           releaseDate: "2026-06-05",
           status: "running",
           userState: "subscribed",
@@ -111,6 +113,7 @@ const demoStore = {
           albumId: "1524803417",
           albumName: "Folklore",
           albumUrl: "https://music.apple.com/cn/album/folklore/1524803417",
+          artworkUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music115/v4/demo2/512x512bb.jpg",
           releaseDate: "2020-07-24",
           status: "queued",
           userState: "subscribed",
@@ -120,6 +123,7 @@ const demoStore = {
           albumId: "1893599771",
           albumName: "Lemonade - The 2nd Album",
           albumUrl: "https://music.apple.com/cn/album/lemonade-the-2nd-album/1893599771",
+          artworkUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/demo3/512x512bb.jpg",
           releaseDate: "2026-05-18",
           status: "completed",
           userState: "subscribed",
@@ -133,6 +137,7 @@ const demoStore = {
       storefront: "cn",
       artistName: "陈奕迅",
       artistUrl: "https://music.apple.com/cn/artist/eason-chan/471744",
+      artistArtworkUrl: "https://is1-ssl.mzstatic.com/image/thumb/Features115/v4/demo/512x512bb.jpg",
       enabled: true,
       newAlbumPolicy: "confirm",
       albumCount: 2,
@@ -149,6 +154,7 @@ const demoStore = {
           albumId: "47174401",
           albumName: "CHIN UP!",
           albumUrl: "https://music.apple.com/cn/album/chin-up/47174401",
+          artworkUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/demo4/512x512bb.jpg",
           releaseDate: "2025-10-10",
           status: "completed",
           userState: "subscribed",
@@ -158,6 +164,7 @@ const demoStore = {
           albumId: "47174402",
           albumName: "准备中",
           albumUrl: "https://music.apple.com/cn/album/demo/47174402",
+          artworkUrl: "https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/demo5/512x512bb.jpg",
           releaseDate: "",
           status: "seen",
           userState: "pending",
@@ -538,6 +545,30 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+
+function getSafeImageUrl(value) {
+  const rawUrl = String(value || "").trim();
+  if (!/^https?:\/\//i.test(rawUrl)) {
+    return "";
+  }
+  try {
+    const parsed = new URL(rawUrl);
+    return ["http:", "https:"].includes(parsed.protocol) ? parsed.href : "";
+  } catch {
+    return "";
+  }
+}
+
+
+function renderArtworkImage(url, alt, className) {
+  const safeUrl = getSafeImageUrl(url);
+  const escapedAlt = escapeHtml(alt || "artwork");
+  if (!safeUrl) {
+    return `<div class="${className} artwork-placeholder" aria-hidden="true">封面</div>`;
+  }
+  return `<img class="${className}" src="${escapeHtml(safeUrl)}" alt="${escapedAlt}" loading="lazy">`;
 }
 
 
@@ -1298,9 +1329,12 @@ function renderArtistSearchResults(results) {
   }
   container.innerHTML = results.map((artist) => `
     <div class="artist-result">
-      <div>
-        <strong>${escapeHtml(artist.artistName || "未知歌手")}</strong>
-        <p>${escapeHtml((artist.storefront || "").toUpperCase())}</p>
+      <div class="artist-result-main">
+        ${renderArtworkImage(artist.artistArtworkUrl, artist.artistName || "未知歌手", "artist-result-artwork")}
+        <div>
+          <strong>${escapeHtml(artist.artistName || "未知歌手")}</strong>
+          <p>${escapeHtml((artist.storefront || "").toUpperCase())}</p>
+        </div>
       </div>
       <button type="button" class="secondary-button artist-subscribe-btn" data-artist-id="${escapeHtml(artist.artistId)}">订阅</button>
     </div>
@@ -1317,6 +1351,7 @@ function renderArtistSearchResults(results) {
         storefront: artist.storefront,
         artistName: artist.artistName,
         artistUrl: artist.artistUrl,
+        artistArtworkUrl: artist.artistArtworkUrl,
       }).catch((error) => {
         setSubscriptionError(error.message || "订阅失败");
       });
@@ -1464,6 +1499,7 @@ function renderSubscriptionAlbums(subscription) {
         <label class="subscription-album-check">
           <input type="checkbox" class="subscription-album-select" data-subscription-id="${subscription.id}" data-album-id="${escapeHtml(album.albumId || "")}" ${selectable ? "" : "disabled"}>
         </label>
+        ${renderArtworkImage(album.artworkUrl, albumTitle, "subscription-album-artwork")}
         <div class="subscription-album-main">
           ${albumUrl ? `<a href="${escapeHtml(albumUrl)}" target="_blank" rel="noreferrer">${escapeHtml(albumTitle)}</a>` : `<strong>${escapeHtml(albumTitle)}</strong>`}
           <p>${releaseDate}<span>ID ${escapeHtml(album.albumId || "-")}</span></p>
@@ -1495,9 +1531,12 @@ function renderSubscriptionList(subscriptions) {
   container.innerHTML = subscriptions.map((subscription) => `
     <div class="subscription-item">
       <div class="subscription-item-top">
-        <div>
-          <strong>${escapeHtml(subscription.artistName || "未知歌手")}</strong>
-          <p>${escapeHtml((subscription.storefront || "").toUpperCase())} · ${escapeHtml(subscription.artistId || "")}</p>
+        <div class="subscription-artist-main">
+          ${renderArtworkImage(subscription.artistArtworkUrl, subscription.artistName || "未知歌手", "subscription-artist-artwork")}
+          <div>
+            <strong>${escapeHtml(subscription.artistName || "未知歌手")}</strong>
+            <p>${escapeHtml((subscription.storefront || "").toUpperCase())} · ${escapeHtml(subscription.artistId || "")}</p>
+          </div>
         </div>
         <div class="subscription-policy-wrap">
           <span class="badge subscription-status">${subscription.enabled ? "enabled" : "disabled"}</span>
@@ -1861,6 +1900,7 @@ if (typeof module !== "undefined") {
     formatHistoryRetrySummary,
     formatAlbumTitleFromUrl,
     formatRetryFailedSummary,
+    getSafeImageUrl,
     getAlbumDetectedStatus,
     getAlbumStatusLabel,
     getAlbumUserStateLabel,
@@ -1871,6 +1911,9 @@ if (typeof module !== "undefined") {
     isTerminalTaskStatus,
     mergeLogLines,
     normalizeHistoryStatus,
+    renderArtworkImage,
+    renderSubscriptionAlbums,
+    renderSubscriptionList,
     renderHistoryList,
     renderResult,
     renderTaskList,

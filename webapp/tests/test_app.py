@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 
-from webapp.apple_music import AppleMusicAlbum, AppleMusicArtist
+from webapp.apple_music import AppleMusicAlbum, AppleMusicArtist, formatArtworkUrl
 from webapp.app import ArtistSubscriptionStore, DownloadHistoryStore, DownloadTask, DownloaderRunner, PipelineRunner, createApp, updateTaskFromLine
 
 
@@ -51,6 +51,7 @@ class FakeAppleMusicClient:
         storefront="cn",
         name="Example Artist",
         url="https://music.apple.com/cn/artist/example-artist/12345",
+        artworkUrl="https://is1-ssl.mzstatic.com/image/thumb/artist-example/512x512bb.jpg",
       )
     ]
     self.artist = self.searchResults[0]
@@ -65,6 +66,7 @@ class FakeAppleMusicClient:
       storefront=storefront,
       name=self.artist.name,
       url=f"https://music.apple.com/{storefront}/artist/example-artist/{artistId}",
+      artworkUrl=self.artist.artworkUrl,
     )
 
   def listArtistAlbums(self, storefront, artistId):
@@ -1551,6 +1553,16 @@ class FlaskDashboardTest(unittest.TestCase):
     self.assertEqual(response.status_code, 200)
     self.assertEqual(payload["results"][0]["artistId"], "12345")
     self.assertEqual(payload["results"][0]["artistName"], "Example Artist")
+    self.assertEqual(payload["results"][0]["artistArtworkUrl"], "https://is1-ssl.mzstatic.com/image/thumb/artist-example/512x512bb.jpg")
+
+  def testFormatArtworkUrlSubstitutesTemplateAndRejectsUnsafeUrls(self):
+    self.assertEqual(
+      formatArtworkUrl({"url": "https://is1-ssl.mzstatic.com/image/thumb/demo/{w}x{h}bb.{f}"}, 256),
+      "https://is1-ssl.mzstatic.com/image/thumb/demo/256x256bb.jpg",
+    )
+    self.assertEqual(formatArtworkUrl({"url": "javascript:alert(1)"}), "")
+    self.assertEqual(formatArtworkUrl({"url": "https://[bad"}), "")
+    self.assertEqual(formatArtworkUrl(None), "")
 
   def testLegacySubscriptionMigrationDefaultsPolicyToConfirm(self):
     dbPath = Path(self.tempDir.name) / "legacy-subscriptions.db"
@@ -1579,6 +1591,29 @@ class FlaskDashboardTest(unittest.TestCase):
         VALUES ('12345', 'cn', 'Example Artist', 'https://music.apple.com/cn/artist/example/12345')
         """
       )
+      connection.execute(
+        """
+        CREATE TABLE subscription_seen_albums (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          subscription_id INTEGER NOT NULL,
+          album_id TEXT NOT NULL,
+          album_url TEXT NOT NULL,
+          album_name TEXT NOT NULL DEFAULT '',
+          release_date TEXT NOT NULL DEFAULT '',
+          status TEXT NOT NULL DEFAULT 'seen',
+          task_id TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(subscription_id, album_id)
+        )
+        """
+      )
+      connection.execute(
+        """
+        INSERT INTO subscription_seen_albums (subscription_id, album_id, album_url, album_name, release_date)
+        VALUES (1, 'legacy-album', 'https://music.apple.com/cn/album/legacy/1', 'Legacy Album', '2024-01-01')
+        """
+      )
       connection.commit()
     finally:
       connection.close()
@@ -1587,6 +1622,8 @@ class FlaskDashboardTest(unittest.TestCase):
     subscriptions = store.listAll()
 
     self.assertEqual(subscriptions[0]["newAlbumPolicy"], "confirm")
+    self.assertEqual(subscriptions[0]["artistArtworkUrl"], "")
+    self.assertEqual(subscriptions[0]["recentAlbums"][0]["artworkUrl"], "")
 
   def testCreateSubscriptionScansAndPendsMissingAlbums(self):
     fakeAppleMusic = FakeAppleMusicClient()
@@ -1596,18 +1633,21 @@ class FlaskDashboardTest(unittest.TestCase):
         name="Already Done",
         url="https://music.apple.com/cn/album/already-done/111",
         releaseDate="2024-01-01",
+        artworkUrl="https://is1-ssl.mzstatic.com/image/thumb/album-111/512x512bb.jpg",
       ),
       AppleMusicAlbum(
         albumId="222",
         name="Failed Before",
         url="https://music.apple.com/cn/album/failed-before/222",
         releaseDate="2024-02-01",
+        artworkUrl="https://is1-ssl.mzstatic.com/image/thumb/album-222/512x512bb.jpg",
       ),
       AppleMusicAlbum(
         albumId="333",
         name="New Album",
         url="https://music.apple.com/cn/album/new-album/333",
         releaseDate="2024-03-01",
+        artworkUrl="https://is1-ssl.mzstatic.com/image/thumb/album-333/512x512bb.jpg",
       ),
     ]
     self.client.application.config["APPLE_MUSIC_CLIENT_FACTORY"] = lambda: fakeAppleMusic
@@ -1653,20 +1693,21 @@ class FlaskDashboardTest(unittest.TestCase):
     connection = sqlite3.connect(historyStore.dbPath)
     try:
       rows = connection.execute(
-        "SELECT album_id, status, user_state, detected_status FROM subscription_seen_albums ORDER BY album_id"
+        "SELECT album_id, status, user_state, detected_status, artwork_url FROM subscription_seen_albums ORDER BY album_id"
       ).fetchall()
     finally:
       connection.close()
     self.assertEqual(
-      {albumId: (status, userState, detectedStatus) for albumId, status, userState, detectedStatus in rows},
+      {albumId: (status, userState, detectedStatus, artworkUrl) for albumId, status, userState, detectedStatus, artworkUrl in rows},
       {
-        "111": ("completed", "subscribed", "completed"),
-        "222": ("failed", "pending", "failed_history"),
-        "333": ("seen", "pending", "missing"),
+        "111": ("completed", "subscribed", "completed", "https://is1-ssl.mzstatic.com/image/thumb/album-111/512x512bb.jpg"),
+        "222": ("failed", "pending", "failed_history", "https://is1-ssl.mzstatic.com/image/thumb/album-222/512x512bb.jpg"),
+        "333": ("seen", "pending", "missing", "https://is1-ssl.mzstatic.com/image/thumb/album-333/512x512bb.jpg"),
       },
     )
 
     subscriptions = self.client.get("/api/subscriptions").get_json()
+    self.assertEqual(subscriptions[0]["artistArtworkUrl"], "https://is1-ssl.mzstatic.com/image/thumb/artist-example/512x512bb.jpg")
     recentAlbums = {
       album["albumId"]: album
       for album in subscriptions[0]["recentAlbums"]
@@ -1677,6 +1718,7 @@ class FlaskDashboardTest(unittest.TestCase):
     self.assertEqual(recentAlbums["222"]["detectedStatus"], "failed_history")
     self.assertEqual(recentAlbums["333"]["albumName"], "New Album")
     self.assertEqual(recentAlbums["333"]["releaseDate"], "2024-03-01")
+    self.assertEqual(recentAlbums["333"]["artworkUrl"], "https://is1-ssl.mzstatic.com/image/thumb/album-333/512x512bb.jpg")
 
   def testSubscriptionAutoPolicyQueuesAlbumsAfterDetection(self):
     fakeAppleMusic = FakeAppleMusicClient()
