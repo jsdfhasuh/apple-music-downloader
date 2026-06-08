@@ -22,6 +22,22 @@ FAILED_TASKS_BUTTON_TEXT = "查看失败任务"
 RUNNING_TASKS_BUTTON_TEXT = "查看运行中任务"
 RECENT_RESULTS_BUTTON_TEXT = "最近结果"
 FORCE_DOWNLOAD_HINT_BUTTON_TEXT = "强制下载说明"
+SUBSCRIPTION_HINT_BUTTON_TEXT = "订阅说明"
+SUBSCRIPTIONS_BUTTON_TEXT = "查看订阅"
+SCAN_SUBSCRIPTIONS_BUTTON_TEXT = "扫描订阅"
+MENU_BUTTON_TEXT = "显示菜单"
+HIDE_MENU_BUTTON_TEXT = "收起菜单"
+SUBSCRIPTION_ALBUM_CALLBACK_PREFIX = "sa"
+SUBSCRIPTION_REVIEW_ALBUM_LIMIT = 10
+SUBSCRIPTION_ALBUM_CALLBACK_ACTIONS = {
+  "d": "download",
+  "i": "ignore",
+  "m": "mark_imported",
+  "p": "pending",
+}
+SUBSCRIPTION_ALBUM_ACTION_CALLBACK_CODES = {
+  value: key for key, value in SUBSCRIPTION_ALBUM_CALLBACK_ACTIONS.items()
+}
 
 
 @dataclass
@@ -361,11 +377,17 @@ def buildReplyKeyboard() -> dict[str, object]:
       [{"text": DOWNLOAD_HINT_BUTTON_TEXT}, {"text": FORCE_DOWNLOAD_HINT_BUTTON_TEXT}],
       [{"text": RETRY_FAILED_BUTTON_TEXT}, {"text": QUEUE_BUTTON_TEXT}],
       [{"text": FAILED_TASKS_BUTTON_TEXT}, {"text": RUNNING_TASKS_BUTTON_TEXT}],
-      [{"text": RECENT_RESULTS_BUTTON_TEXT}, {"text": HELP_BUTTON_TEXT}],
+      [{"text": SUBSCRIPTION_HINT_BUTTON_TEXT}, {"text": SUBSCRIPTIONS_BUTTON_TEXT}],
+      [{"text": SCAN_SUBSCRIPTIONS_BUTTON_TEXT}, {"text": RECENT_RESULTS_BUTTON_TEXT}],
+      [{"text": HELP_BUTTON_TEXT}, {"text": HIDE_MENU_BUTTON_TEXT}],
     ],
     "resize_keyboard": True,
-    "is_persistent": True,
+    "one_time_keyboard": True,
   }
+
+
+def buildRemoveKeyboard() -> dict[str, object]:
+  return {"remove_keyboard": True}
 
 
 def formatHelpMessage() -> str:
@@ -373,17 +395,32 @@ def formatHelpMessage() -> str:
     "直接发送 Apple Music 链接即可下载，支持一条消息多个链接。\n"
     "强制下载请使用 /force <Apple Music URL>，也支持一条消息多个链接。\n"
     "歌手订阅：/artist_search <关键词> 搜索，/subscribe <artist_url> 订阅，/subscriptions 查看，/unsubscribe <artist_id> 取消，/scan_subscriptions 手动扫描。\n"
-    "可用菜单：下载说明、强制下载说明、重试失败任务、查看队列、查看失败任务、查看运行中任务、最近结果、帮助\n"
-    "可用命令：/start /help /force /retry_failed /queue /failed /running /recent /artist_search /subscribe /subscriptions /unsubscribe /scan_subscriptions"
+    "订阅专辑：/subscription_policy <artist_id> confirm|auto 切换策略，/subscription_album <artist_id> <album_id> download|ignore|imported|pending 处理专辑。\n"
+    "快捷菜单不会长期展示，发送 /menu 打开，发送 /hide_menu 收起。\n"
+    "可用菜单：下载说明、强制下载说明、重试失败任务、查看队列、查看失败任务、查看运行中任务、订阅说明、查看订阅、扫描订阅、最近结果、帮助、收起菜单\n"
+    "可用命令：/start /menu /hide_menu /help /force /retry_failed /queue /failed /running /recent /artist_search /subscribe /subscriptions /unsubscribe /scan_subscriptions /subscription_policy /subscription_album"
   )
 
 
 def formatStartupWelcomeMessage() -> str:
-  return "机器人已启动\n直接发送 Apple Music 链接即可下载，支持一条消息多个链接\n发送 /help 查看完整命令和菜单说明。"
+  return "机器人已启动\n直接发送 Apple Music 链接即可下载，支持一条消息多个链接\n发送 /menu 打开快捷菜单，发送 /help 查看完整命令说明。"
 
 
 def formatForceDownloadHelpMessage() -> str:
   return "强制下载用法：\n/force https://music.apple.com/...\n支持一条消息多个链接，这会对提取到的全部链接强制创建新任务，不复用已完成记录。"
+
+
+def formatSubscriptionHelpMessage() -> str:
+  return (
+    "歌手订阅用法：\n"
+    "/artist_search <关键词> 搜索歌手\n"
+    "/subscribe https://music.apple.com/.../artist/... 订阅歌手\n"
+    "/subscriptions 查看已订阅歌手\n"
+    "/unsubscribe <artist_id> 取消订阅\n"
+    "/scan_subscriptions 手动扫描订阅\n"
+    "/subscription_policy <artist_id> confirm|auto 切换新专辑策略\n"
+    "/subscription_album <artist_id> <album_id> download|ignore|imported|pending 处理专辑"
+  )
 
 
 def createTaskWithOptionalForce(
@@ -443,6 +480,11 @@ def isKeyboardCommand(text: str) -> bool:
     FAILED_TASKS_BUTTON_TEXT,
     RUNNING_TASKS_BUTTON_TEXT,
     RECENT_RESULTS_BUTTON_TEXT,
+    SUBSCRIPTION_HINT_BUTTON_TEXT,
+    SUBSCRIPTIONS_BUTTON_TEXT,
+    SCAN_SUBSCRIPTIONS_BUTTON_TEXT,
+    MENU_BUTTON_TEXT,
+    HIDE_MENU_BUTTON_TEXT,
   }
 
 
@@ -483,12 +525,15 @@ def formatSubscriptionScanSummaryMessage(payload: dict[str, object]) -> str:
   scannedCount = int(payload.get("scannedCount", 1))
   foundCount = int(payload.get("foundCount", 0) or 0)
   queuedCount = int(payload.get("queuedCount", 0) or 0)
+  pendingCount = int(payload.get("pendingCount", 0) or 0)
   skippedCompletedCount = int(payload.get("skippedCompletedCount", 0) or 0)
   skippedActiveCount = int(payload.get("skippedActiveCount", 0) or 0)
+  skippedIgnoredCount = int(payload.get("skippedIgnoredCount", 0) or 0)
+  skippedImportedCount = int(payload.get("skippedImportedCount", 0) or 0)
   errorCount = int(payload.get("errorCount", 0) or 0)
   lines = [
     f"歌手订阅扫描完成：{scannedCount} 个订阅",
-    f"发现 {foundCount} 个专辑，入队 {queuedCount} 个，历史跳过 {skippedCompletedCount} 个，队列跳过 {skippedActiveCount} 个，错误 {errorCount} 个",
+    f"发现 {foundCount} 个专辑，待确认 {pendingCount} 个，入队 {queuedCount} 个，历史跳过 {skippedCompletedCount} 个，队列跳过 {skippedActiveCount} 个，忽略 {skippedIgnoredCount} 个，已导入 {skippedImportedCount} 个，错误 {errorCount} 个",
   ]
   errors = payload.get("errors")
   if isinstance(errors, list) and errors:
@@ -520,6 +565,248 @@ def formatSubscriptionCreatedMessage(payload: dict[str, object]) -> str:
   return "\n".join(lines)
 
 
+def normalizeSubscriptionAlbumUserState(userState: object) -> str:
+  normalized = str(userState or "").strip().lower()
+  if normalized in {"pending", "subscribed", "ignored", "imported"}:
+    return normalized
+  return "subscribed"
+
+
+def getSubscriptionAlbumDetectedStatus(album: dict[str, object]) -> str:
+  detectedStatus = str(album.get("detectedStatus", album.get("detected_status", "")) or "").strip().lower()
+  if detectedStatus:
+    return detectedStatus
+  status = str(album.get("status", "") or "").strip().lower()
+  if status == "failed":
+    return "failed_history"
+  return status or "missing"
+
+
+def getSubscriptionAlbumStatusLabel(status: str) -> str:
+  labels = {
+    "queued": "已在队列",
+    "running": "下载中",
+    "completed": "已完成",
+    "failed_history": "失败历史",
+    "stale_history": "过期历史",
+    "missing": "待处理",
+    "seen": "已发现",
+  }
+  return labels.get(status, status or "未知")
+
+
+def getSubscriptionAlbumTitle(album: dict[str, object]) -> str:
+  title = str(album.get("albumName", album.get("album_name", "")) or "").strip()
+  if title:
+    return title
+  url = str(album.get("albumUrl", album.get("album_url", "")) or "").strip()
+  if url:
+    parts = [part for part in url.rstrip("/").split("/") if part]
+    if len(parts) >= 2:
+      return parse.unquote(parts[-2]).replace("-", " ").strip() or parts[-1]
+  return str(album.get("albumId", album.get("album_id", "")) or "未知专辑")
+
+
+def sortSubscriptionAlbums(albums: list[dict[str, object]]) -> list[dict[str, object]]:
+  return sorted(
+    albums,
+    key=lambda album: (
+      str(album.get("releaseDate", album.get("release_date", "")) or ""),
+      str(album.get("updatedAt", album.get("updated_at", "")) or ""),
+      str(album.get("albumId", album.get("album_id", "")) or ""),
+    ),
+    reverse=True,
+  )
+
+
+def canReviewSubscriptionAlbum(album: dict[str, object]) -> bool:
+  if album.get("canDownload") is False:
+    return False
+  userState = normalizeSubscriptionAlbumUserState(album.get("userState", album.get("user_state", "")))
+  if userState != "pending":
+    return False
+  return getSubscriptionAlbumDetectedStatus(album) in {"missing", "failed_history", "stale_history"}
+
+
+def listSubscriptionReviewAlbums(subscription: dict[str, object], limit: int = SUBSCRIPTION_REVIEW_ALBUM_LIMIT) -> list[dict[str, object]]:
+  albums = subscription.get("recentAlbums", [])
+  if not isinstance(albums, list):
+    return []
+  reviewAlbums = [
+    album
+    for album in albums
+    if isinstance(album, dict) and canReviewSubscriptionAlbum(album)
+  ]
+  return sortSubscriptionAlbums(reviewAlbums)[:limit]
+
+
+def summarizeSubscriptionReviewAlbums(subscription: dict[str, object]) -> dict[str, int]:
+  albums = subscription.get("recentAlbums", [])
+  summary = {
+    "albumCount": 0,
+    "pendingCount": 0,
+    "activeCount": 0,
+    "completedCount": 0,
+    "ignoredCount": 0,
+    "importedCount": 0,
+  }
+  if not isinstance(albums, list):
+    return summary
+  for album in albums:
+    if not isinstance(album, dict):
+      continue
+    summary["albumCount"] += 1
+    userState = normalizeSubscriptionAlbumUserState(album.get("userState", album.get("user_state", "")))
+    detectedStatus = getSubscriptionAlbumDetectedStatus(album)
+    if userState == "pending" and canReviewSubscriptionAlbum(album):
+      summary["pendingCount"] += 1
+    if detectedStatus in {"queued", "running"}:
+      summary["activeCount"] += 1
+    if detectedStatus == "completed":
+      summary["completedCount"] += 1
+    if userState == "ignored":
+      summary["ignoredCount"] += 1
+    if userState == "imported":
+      summary["importedCount"] += 1
+  return summary
+
+
+def formatSubscriptionReviewMessage(subscription: dict[str, object], limit: int = SUBSCRIPTION_REVIEW_ALBUM_LIMIT) -> str:
+  artistName = str(subscription.get("artistName", "未知歌手") or "未知歌手")
+  summary = summarizeSubscriptionReviewAlbums(subscription)
+  reviewAlbums = listSubscriptionReviewAlbums(subscription, limit)
+  lines = [
+    f"{artistName} 专辑确认",
+    (
+      f"已发现 {summary['albumCount']} 个，待确认 {summary['pendingCount']} 个，"
+      f"进行中 {summary['activeCount']} 个，已完成 {summary['completedCount']} 个，"
+      f"已忽略 {summary['ignoredCount']} 个，已导入 {summary['importedCount']} 个"
+    ),
+  ]
+  if not reviewAlbums:
+    lines.append("没有需要处理的专辑。")
+    return "\n".join(lines)
+
+  lines.append("待确认专辑：")
+  for index, album in enumerate(reviewAlbums, start=1):
+    releaseDate = str(album.get("releaseDate", album.get("release_date", "")) or "").strip()
+    detectedStatus = getSubscriptionAlbumDetectedStatus(album)
+    suffix = f" ({releaseDate})" if releaseDate else ""
+    lines.append(f"{index}. {getSubscriptionAlbumTitle(album)}{suffix} - {getSubscriptionAlbumStatusLabel(detectedStatus)}")
+
+  hiddenCount = summary["pendingCount"] - len(reviewAlbums)
+  if hiddenCount > 0:
+    lines.append(f"另有 {hiddenCount} 个待确认专辑未显示，请到 Web 订阅页处理。")
+  return "\n".join(lines)
+
+
+def buildSubscriptionAlbumCallbackData(subscriptionId: str, albumId: str, action: str) -> str:
+  actionCode = SUBSCRIPTION_ALBUM_ACTION_CALLBACK_CODES.get(action, "")
+  quotedAlbumId = parse.quote(str(albumId), safe="")
+  return f"{SUBSCRIPTION_ALBUM_CALLBACK_PREFIX}:{subscriptionId}:{quotedAlbumId}:{actionCode}"
+
+
+def parseSubscriptionAlbumCallbackData(data: str) -> tuple[str, str, str] | None:
+  parts = str(data or "").split(":")
+  if len(parts) != 4 or parts[0] != SUBSCRIPTION_ALBUM_CALLBACK_PREFIX:
+    return None
+  subscriptionId = parts[1].strip()
+  albumId = parse.unquote(parts[2].strip())
+  action = SUBSCRIPTION_ALBUM_CALLBACK_ACTIONS.get(parts[3].strip())
+  if not subscriptionId or not albumId or not action:
+    return None
+  return subscriptionId, albumId, action
+
+
+def buildSubscriptionReviewKeyboard(subscription: dict[str, object], limit: int = SUBSCRIPTION_REVIEW_ALBUM_LIMIT) -> dict[str, object] | None:
+  subscriptionId = str(subscription.get("id", "") or "").strip()
+  if not subscriptionId:
+    return None
+  rows: list[list[dict[str, str]]] = []
+  for index, album in enumerate(listSubscriptionReviewAlbums(subscription, limit), start=1):
+    albumId = str(album.get("albumId", album.get("album_id", "")) or "").strip()
+    if not albumId:
+      continue
+    row: list[dict[str, str]] = []
+    for label, action in (("下载", "download"), ("忽略", "ignore"), ("已导入", "mark_imported")):
+      callbackData = buildSubscriptionAlbumCallbackData(subscriptionId, albumId, action)
+      if len(callbackData.encode("utf-8")) <= 64:
+        row.append({"text": f"{index} {label}", "callback_data": callbackData})
+    if row:
+      rows.append(row)
+  if not rows:
+    return None
+  return {"inline_keyboard": rows}
+
+
+def findSubscriptionByIdentity(
+  subscriptions: list[dict[str, object]],
+  subscriptionId: str = "",
+  artistId: str = "",
+) -> dict[str, object] | None:
+  for subscription in subscriptions:
+    if subscriptionId and str(subscription.get("id", "") or "") == subscriptionId:
+      return subscription
+    if artistId and str(subscription.get("artistId", "") or "") == artistId:
+      return subscription
+  return None
+
+
+def findAlbumInSubscription(subscription: dict[str, object] | None, albumId: str) -> dict[str, object] | None:
+  if subscription is None:
+    return None
+  albums = subscription.get("recentAlbums", [])
+  if not isinstance(albums, list):
+    return None
+  for album in albums:
+    if isinstance(album, dict) and str(album.get("albumId", album.get("album_id", "")) or "") == albumId:
+      return album
+  return None
+
+
+def resolveCreatedSubscriptionWithAlbums(
+  payload: dict[str, object],
+  fetchSubscriptions: Callable[[], list[dict[str, object]]],
+) -> dict[str, object] | None:
+  subscription = payload.get("subscription")
+  if not isinstance(subscription, dict):
+    return None
+  subscriptionId = str(subscription.get("id", "") or "")
+  artistId = str(subscription.get("artistId", "") or "")
+  subscriptions = fetchSubscriptions()
+  return findSubscriptionByIdentity(subscriptions, subscriptionId=subscriptionId, artistId=artistId)
+
+
+def sendSubscriptionReviewMessage(
+  chatId: int,
+  replyToMessageId: int | None,
+  subscription: dict[str, object],
+  sendMessage: Callable[[int, str, int | None, dict[str, object] | None], None],
+) -> None:
+  sendMessage(
+    chatId,
+    formatSubscriptionReviewMessage(subscription),
+    replyToMessageId,
+    buildSubscriptionReviewKeyboard(subscription),
+  )
+
+
+def formatSubscriptionCallbackResultMessage(
+  action: str,
+  album: dict[str, object] | None,
+  payload: dict[str, object],
+) -> str:
+  title = getSubscriptionAlbumTitle(album or {})
+  if action == "download":
+    return f"已请求下载：{title}\n{formatSubscriptionAlbumActionMessage(payload)}"
+  labels = {
+    "ignore": "已忽略",
+    "mark_imported": "已标记已导入",
+    "pending": "已恢复待确认",
+  }
+  return f"{labels.get(action, '已更新')}：{title}"
+
+
 def formatSubscriptionsMessage(subscriptions: list[dict[str, object]]) -> str:
   if not subscriptions:
     return "当前没有歌手订阅"
@@ -530,9 +817,61 @@ def formatSubscriptionsMessage(subscriptions: list[dict[str, object]]) -> str:
     storefront = str(item.get("storefront", "")).upper()
     lastCheckedAt = str(item.get("lastCheckedAt", "") or "未扫描")
     albumCount = int(item.get("albumCount", 0) or 0)
+    pendingAlbumCount = int(item.get("pendingAlbumCount", 0) or 0)
+    ignoredAlbumCount = int(item.get("ignoredAlbumCount", 0) or 0)
+    importedAlbumCount = int(item.get("importedAlbumCount", 0) or 0)
+    policy = str(item.get("newAlbumPolicy", "") or "confirm")
     lines.append(f"- {artistName} {storefront} / artist_id: {artistId}")
-    lines.append(f"  已发现 {albumCount} 个专辑，上次扫描：{lastCheckedAt}")
+    lines.append(f"  策略：{policy}，已发现 {albumCount} 个专辑，待确认 {pendingAlbumCount} 个，忽略 {ignoredAlbumCount} 个，已导入 {importedAlbumCount} 个，上次扫描：{lastCheckedAt}")
   return "\n".join(lines)
+
+
+def parseSubscriptionPolicyCommand(text: str) -> tuple[str, str] | None:
+  argument = getCommandArgument(text)
+  parts = argument.split()
+  if len(parts) != 2:
+    return None
+  artistId, policy = parts
+  normalizedPolicy = policy.strip().lower()
+  if normalizedPolicy not in {"confirm", "auto"}:
+    return None
+  return artistId.strip(), normalizedPolicy
+
+
+def parseSubscriptionAlbumCommand(text: str) -> tuple[str, str, str] | None:
+  argument = getCommandArgument(text)
+  parts = argument.split()
+  if len(parts) != 3:
+    return None
+  artistId, albumId, action = parts
+  normalizedAction = action.strip().lower().replace("-", "_")
+  if normalizedAction == "imported":
+    normalizedAction = "mark_imported"
+  if normalizedAction not in {"download", "ignore", "mark_imported", "pending"}:
+    return None
+  return artistId.strip(), albumId.strip(), normalizedAction
+
+
+def formatSubscriptionPolicyMessage(payload: dict[str, object]) -> str:
+  subscription = payload.get("subscription")
+  if not isinstance(subscription, dict):
+    return "订阅策略已更新"
+  artistName = str(subscription.get("artistName", "未知歌手"))
+  policy = str(subscription.get("newAlbumPolicy", "confirm"))
+  return f"{artistName} 新专辑策略已更新为 {policy}"
+
+
+def formatSubscriptionAlbumActionMessage(payload: dict[str, object]) -> str:
+  action = str(payload.get("action", ""))
+  updatedCount = int(payload.get("updatedCount", 0) or 0)
+  if action == "download":
+    return formatSubscriptionScanSummaryMessage(payload)
+  labels = {
+    "ignore": "已忽略",
+    "mark_imported": "已标记导入",
+    "pending": "已恢复待确认",
+  }
+  return f"{labels.get(action, '已更新')} {updatedCount} 个专辑"
 
 
 def formatCommandErrorMessage(action: str, exc: Exception) -> str:
@@ -552,6 +891,8 @@ def formatCommandErrorMessage(action: str, exc: Exception) -> str:
 def buildTelegramCommands() -> list[dict[str, str]]:
   return [
     {"command": "start", "description": "显示帮助和菜单"},
+    {"command": "menu", "description": "打开快捷菜单"},
+    {"command": "hide_menu", "description": "收起快捷菜单"},
     {"command": "help", "description": "查看帮助"},
     {"command": "force", "description": "强制重新下载指定链接"},
     {"command": "artist_search", "description": "搜索可订阅歌手"},
@@ -559,6 +900,8 @@ def buildTelegramCommands() -> list[dict[str, str]]:
     {"command": "subscriptions", "description": "查看歌手订阅"},
     {"command": "unsubscribe", "description": "取消歌手订阅"},
     {"command": "scan_subscriptions", "description": "手动扫描歌手订阅"},
+    {"command": "subscription_policy", "description": "切换歌手订阅策略"},
+    {"command": "subscription_album", "description": "处理订阅专辑"},
     {"command": "retry_failed", "description": "重试失败任务"},
     {"command": "queue", "description": "查看当前队列"},
     {"command": "failed", "description": "查看失败任务"},
@@ -589,7 +932,7 @@ def initializeTelegramBot(
     )
 
   setCommands(botToken)
-  sendMessage(allowedChatId, formatStartupWelcomeMessage(), None, buildReplyKeyboard())
+  sendMessage(allowedChatId, formatStartupWelcomeMessage(), None, None)
 
 
 def formatCompletedMessage(task: dict[str, object]) -> str:
@@ -620,6 +963,85 @@ def isBotAuthoredMessage(message: dict[str, object]) -> bool:
   return message.get("sender_chat") is not None
 
 
+def handleSubscriptionCallbackQuery(
+  callbackQuery: dict[str, object],
+  allowedChatId: int,
+  fetchSubscriptions: Callable[[], list[dict[str, object]]],
+  updateSubscriptionAlbumBySubscriptionId: Callable[[str, str, str], dict[str, object]],
+  sendMessage: Callable[[int, str, int | None, dict[str, object] | None], None],
+  answerCallback: Callable[[str, str], None],
+  editMessageReplyMarkup: Callable[[int, int, dict[str, object] | None], None],
+) -> None:
+  def safeAnswerCallback(text: str) -> None:
+    if not callbackId:
+      return
+    try:
+      answerCallback(callbackId, text)
+    except Exception as exc:  # noqa: BLE001
+      logBotMessage(f"failed to answer subscription callback: {exc}")
+
+  def safeSendMessage(text: str, replyMarkup: dict[str, object] | None = None) -> None:
+    try:
+      sendMessage(chatId, text, replyToMessageId, replyMarkup)
+    except Exception as exc:  # noqa: BLE001
+      logBotMessage(f"failed to send subscription callback message: {exc}")
+
+  callbackId = str(callbackQuery.get("id", "") or "")
+  fromUser = callbackQuery.get("from")
+  userId = int(fromUser.get("id", 0)) if isinstance(fromUser, dict) else 0
+  message = callbackQuery.get("message")
+  chatId = userId
+  replyToMessageId: int | None = None
+  if isinstance(message, dict):
+    chat = message.get("chat")
+    if isinstance(chat, dict):
+      if str(chat.get("type", "")) != "private":
+        return
+      chatId = int(chat.get("id", userId) or userId)
+    replyToMessageId = int(message.get("message_id", 0) or 0) or None
+  if not isAllowedChat(chatId, allowedChatId):
+    return
+  parsed = parseSubscriptionAlbumCallbackData(str(callbackQuery.get("data", "") or ""))
+  if parsed is None:
+    safeAnswerCallback("无法识别的订阅操作")
+    return
+
+  subscriptionId, albumId, action = parsed
+  subscription: dict[str, object] | None = None
+  album: dict[str, object] | None = None
+  try:
+    subscription = findSubscriptionByIdentity(fetchSubscriptions(), subscriptionId=subscriptionId)
+    album = findAlbumInSubscription(subscription, albumId)
+  except Exception:  # noqa: BLE001
+    subscription = None
+    album = None
+
+  try:
+    payload = updateSubscriptionAlbumBySubscriptionId(subscriptionId, albumId, action)
+  except Exception as exc:  # noqa: BLE001
+    safeAnswerCallback("处理失败")
+    safeSendMessage(formatCommandErrorMessage("处理订阅专辑", exc))
+    return
+
+  safeAnswerCallback("已处理")
+  if replyToMessageId is not None:
+    try:
+      editMessageReplyMarkup(chatId, replyToMessageId, None)
+    except Exception as exc:  # noqa: BLE001
+      logBotMessage(f"failed to clear subscription callback keyboard: {exc}")
+  safeSendMessage(formatSubscriptionCallbackResultMessage(action, album, payload))
+  try:
+    refreshedSubscription = findSubscriptionByIdentity(fetchSubscriptions(), subscriptionId=subscriptionId)
+  except Exception as exc:  # noqa: BLE001
+    safeSendMessage(formatCommandErrorMessage("刷新订阅确认", exc))
+    return
+  if refreshedSubscription is not None:
+    try:
+      sendSubscriptionReviewMessage(chatId, replyToMessageId, refreshedSubscription, sendMessage)
+    except Exception as exc:  # noqa: BLE001
+      logBotMessage(f"failed to send refreshed subscription review: {exc}")
+
+
 def handleUpdate(
   update: dict[str, object],
   allowedChatId: int,
@@ -632,7 +1054,12 @@ def handleUpdate(
   fetchSubscriptions: Callable[[], list[dict[str, object]]] | None = None,
   deleteSubscription: Callable[[str], dict[str, object]] | None = None,
   scanSubscriptions: Callable[[], dict[str, object]] | None = None,
+  updateSubscriptionPolicy: Callable[[str, str], dict[str, object]] | None = None,
+  updateSubscriptionAlbum: Callable[[str, str, str], dict[str, object]] | None = None,
   sendMessage: Callable[[int, str, int | None, dict[str, object] | None], None] | None = None,
+  updateSubscriptionAlbumBySubscriptionId: Callable[[str, str, str], dict[str, object]] | None = None,
+  answerCallback: Callable[[str, str], None] | None = None,
+  editMessageReplyMarkup: Callable[[int, int, dict[str, object] | None], None] | None = None,
 ) -> None:
   if retryTasks is None:
     retryTasks = lambda: {}
@@ -648,8 +1075,31 @@ def handleUpdate(
     deleteSubscription = lambda artistId: {}
   if scanSubscriptions is None:
     scanSubscriptions = lambda: {}
+  if updateSubscriptionPolicy is None:
+    updateSubscriptionPolicy = lambda artistId, policy: {}
+  if updateSubscriptionAlbum is None:
+    updateSubscriptionAlbum = lambda artistId, albumId, action: {}
   if sendMessage is None:
     sendMessage = lambda chatId, text, replyToMessageId=None, replyMarkup=None: None
+  if updateSubscriptionAlbumBySubscriptionId is None:
+    updateSubscriptionAlbumBySubscriptionId = lambda subscriptionId, albumId, action: {}
+  if answerCallback is None:
+    answerCallback = lambda callbackQueryId, text="": None
+  if editMessageReplyMarkup is None:
+    editMessageReplyMarkup = lambda chatId, messageId, replyMarkup=None: None
+
+  callbackQuery = update.get("callback_query")
+  if isinstance(callbackQuery, dict):
+    handleSubscriptionCallbackQuery(
+      callbackQuery=callbackQuery,
+      allowedChatId=allowedChatId,
+      fetchSubscriptions=fetchSubscriptions,
+      updateSubscriptionAlbumBySubscriptionId=updateSubscriptionAlbumBySubscriptionId,
+      sendMessage=sendMessage,
+      answerCallback=answerCallback,
+      editMessageReplyMarkup=editMessageReplyMarkup,
+    )
+    return
 
   message = update.get("message")
   if not isinstance(message, dict):
@@ -670,70 +1120,116 @@ def handleUpdate(
   messageId = int(message.get("message_id", 0))
   command = normalizeCommand(text)
   forceRequested = command == "force"
-  if text == FORCE_DOWNLOAD_HINT_BUTTON_TEXT:
-    sendMessage(chatId, formatForceDownloadHelpMessage(), messageId, buildReplyKeyboard())
+  keyboardActionReplyMarkup = buildRemoveKeyboard() if isKeyboardCommand(text) else None
+  if text == HIDE_MENU_BUTTON_TEXT or command == "hide_menu":
+    sendMessage(chatId, "快捷菜单已收起。发送 /menu 可重新打开。", messageId, buildRemoveKeyboard())
     return
-  if text in {HELP_BUTTON_TEXT, DOWNLOAD_HINT_BUTTON_TEXT} or command in {"start", "help"}:
+  if text == MENU_BUTTON_TEXT or command == "menu":
+    sendMessage(chatId, "快捷菜单已打开，用完后会自动收起。", messageId, buildReplyKeyboard())
+    return
+  if text == FORCE_DOWNLOAD_HINT_BUTTON_TEXT:
+    sendMessage(chatId, formatForceDownloadHelpMessage(), messageId, keyboardActionReplyMarkup)
+    return
+  if text == SUBSCRIPTION_HINT_BUTTON_TEXT:
+    sendMessage(chatId, formatSubscriptionHelpMessage(), messageId, buildRemoveKeyboard())
+    return
+  if command == "start":
     sendMessage(chatId, formatHelpMessage(), messageId, buildReplyKeyboard())
+    return
+  if text in {HELP_BUTTON_TEXT, DOWNLOAD_HINT_BUTTON_TEXT} or command == "help":
+    sendMessage(chatId, formatHelpMessage(), messageId, keyboardActionReplyMarkup)
     return
   if command == "artist_search":
     term = getCommandArgument(text)
     if not term:
-      sendMessage(chatId, "用法：/artist_search 歌手名", messageId, buildReplyKeyboard())
+      sendMessage(chatId, "用法：/artist_search 歌手名", messageId)
       return
     try:
       searchResults = searchArtists(term)
     except Exception as exc:  # noqa: BLE001
-      sendMessage(chatId, formatCommandErrorMessage("搜索歌手", exc), messageId, buildReplyKeyboard())
+      sendMessage(chatId, formatCommandErrorMessage("搜索歌手", exc), messageId)
       return
-    sendMessage(chatId, formatArtistSearchResultsMessage(searchResults), messageId, buildReplyKeyboard())
+    sendMessage(chatId, formatArtistSearchResultsMessage(searchResults), messageId)
     return
   if command == "subscribe":
     artistUrl = getCommandArgument(text)
     if not artistUrl:
-      sendMessage(chatId, "用法：/subscribe https://music.apple.com/.../artist/...", messageId, buildReplyKeyboard())
+      sendMessage(chatId, "用法：/subscribe https://music.apple.com/.../artist/...", messageId)
       return
     try:
       subscriptionPayload = createSubscription(artistUrl)
     except Exception as exc:  # noqa: BLE001
-      sendMessage(chatId, formatCommandErrorMessage("订阅歌手", exc), messageId, buildReplyKeyboard())
+      sendMessage(chatId, formatCommandErrorMessage("订阅歌手", exc), messageId)
       return
-    sendMessage(chatId, formatSubscriptionCreatedMessage(subscriptionPayload), messageId, buildReplyKeyboard())
+    sendMessage(chatId, formatSubscriptionCreatedMessage(subscriptionPayload), messageId)
+    try:
+      reviewedSubscription = resolveCreatedSubscriptionWithAlbums(subscriptionPayload, fetchSubscriptions)
+    except Exception as exc:  # noqa: BLE001
+      sendMessage(chatId, formatCommandErrorMessage("获取订阅专辑", exc), messageId)
+      return
+    if reviewedSubscription is not None:
+      sendSubscriptionReviewMessage(chatId, messageId, reviewedSubscription, sendMessage)
     return
-  if command == "subscriptions":
+  if text == SUBSCRIPTIONS_BUTTON_TEXT or command == "subscriptions":
     try:
       subscriptions = fetchSubscriptions()
     except Exception as exc:  # noqa: BLE001
-      sendMessage(chatId, formatCommandErrorMessage("获取订阅列表", exc), messageId, buildReplyKeyboard())
+      sendMessage(chatId, formatCommandErrorMessage("获取订阅列表", exc), messageId, keyboardActionReplyMarkup)
       return
-    sendMessage(chatId, formatSubscriptionsMessage(subscriptions), messageId, buildReplyKeyboard())
+    sendMessage(chatId, formatSubscriptionsMessage(subscriptions), messageId, keyboardActionReplyMarkup)
     return
   if command == "unsubscribe":
     artistId = getCommandArgument(text)
     if not artistId:
-      sendMessage(chatId, "用法：/unsubscribe <artist_id>", messageId, buildReplyKeyboard())
+      sendMessage(chatId, "用法：/unsubscribe <artist_id>", messageId)
       return
     try:
       deleteSubscription(artistId)
     except Exception as exc:  # noqa: BLE001
-      sendMessage(chatId, formatCommandErrorMessage("取消订阅", exc), messageId, buildReplyKeyboard())
+      sendMessage(chatId, formatCommandErrorMessage("取消订阅", exc), messageId)
       return
-    sendMessage(chatId, f"已取消订阅 artist_id: {artistId}", messageId, buildReplyKeyboard())
+    sendMessage(chatId, f"已取消订阅 artist_id: {artistId}", messageId)
     return
-  if command == "scan_subscriptions":
+  if text == SCAN_SUBSCRIPTIONS_BUTTON_TEXT or command == "scan_subscriptions":
     try:
       scanPayload = scanSubscriptions()
     except Exception as exc:  # noqa: BLE001
-      sendMessage(chatId, formatCommandErrorMessage("扫描订阅", exc), messageId, buildReplyKeyboard())
+      sendMessage(chatId, formatCommandErrorMessage("扫描订阅", exc), messageId, keyboardActionReplyMarkup)
       return
-    sendMessage(chatId, formatSubscriptionScanSummaryMessage(scanPayload), messageId, buildReplyKeyboard())
+    sendMessage(chatId, formatSubscriptionScanSummaryMessage(scanPayload), messageId, keyboardActionReplyMarkup)
+    return
+  if command == "subscription_policy":
+    parsedPolicyCommand = parseSubscriptionPolicyCommand(text)
+    if parsedPolicyCommand is None:
+      sendMessage(chatId, "用法：/subscription_policy <artist_id> confirm|auto", messageId)
+      return
+    artistId, policy = parsedPolicyCommand
+    try:
+      policyPayload = updateSubscriptionPolicy(artistId, policy)
+    except Exception as exc:  # noqa: BLE001
+      sendMessage(chatId, formatCommandErrorMessage("更新订阅策略", exc), messageId)
+      return
+    sendMessage(chatId, formatSubscriptionPolicyMessage(policyPayload), messageId)
+    return
+  if command == "subscription_album":
+    parsedAlbumCommand = parseSubscriptionAlbumCommand(text)
+    if parsedAlbumCommand is None:
+      sendMessage(chatId, "用法：/subscription_album <artist_id> <album_id> download|ignore|imported|pending", messageId)
+      return
+    artistId, albumId, action = parsedAlbumCommand
+    try:
+      albumPayload = updateSubscriptionAlbum(artistId, albumId, action)
+    except Exception as exc:  # noqa: BLE001
+      sendMessage(chatId, formatCommandErrorMessage("处理订阅专辑", exc), messageId)
+      return
+    sendMessage(chatId, formatSubscriptionAlbumActionMessage(albumPayload), messageId)
     return
   urls = extractAppleMusicUrls(text)
   if forceRequested and not urls:
-    sendMessage(chatId, formatForceDownloadHelpMessage(), messageId, buildReplyKeyboard())
+    sendMessage(chatId, formatForceDownloadHelpMessage(), messageId)
     return
   if text == RETRY_FAILED_BUTTON_TEXT or command == "retry_failed":
-    sendMessage(chatId, formatRetryFailedTasksMessage(retryTasks()), messageId, buildReplyKeyboard())
+    sendMessage(chatId, formatRetryFailedTasksMessage(retryTasks()), messageId, keyboardActionReplyMarkup)
     return
   tasks = fetchTasks() if text in {
     QUEUE_BUTTON_TEXT,
@@ -742,16 +1238,16 @@ def handleUpdate(
     RECENT_RESULTS_BUTTON_TEXT,
   } or command in {"queue", "failed", "running", "recent"} else []
   if text == QUEUE_BUTTON_TEXT or command == "queue":
-    sendMessage(chatId, formatTaskListMessage(tasks), messageId, buildReplyKeyboard())
+    sendMessage(chatId, formatTaskListMessage(tasks), messageId, keyboardActionReplyMarkup)
     return
   if text == FAILED_TASKS_BUTTON_TEXT or command == "failed":
-    sendMessage(chatId, formatTaskListMessage(filterTasksByStatus(tasks, "failed"), "失败任务"), messageId, buildReplyKeyboard())
+    sendMessage(chatId, formatTaskListMessage(filterTasksByStatus(tasks, "failed"), "失败任务"), messageId, keyboardActionReplyMarkup)
     return
   if text == RUNNING_TASKS_BUTTON_TEXT or command == "running":
-    sendMessage(chatId, formatTaskListMessage(filterTasksByStatus(tasks, "running"), "运行中任务"), messageId, buildReplyKeyboard())
+    sendMessage(chatId, formatTaskListMessage(filterTasksByStatus(tasks, "running"), "运行中任务"), messageId, keyboardActionReplyMarkup)
     return
   if text == RECENT_RESULTS_BUTTON_TEXT or command == "recent":
-    sendMessage(chatId, formatTaskListMessage(filterTasksByStatus(tasks, "completed"), "最近结果"), messageId, buildReplyKeyboard())
+    sendMessage(chatId, formatTaskListMessage(filterTasksByStatus(tasks, "completed"), "最近结果"), messageId, keyboardActionReplyMarkup)
     return
   if not urls:
     return
@@ -894,6 +1390,13 @@ def listArtistSubscriptions(webappBaseUrl: str) -> list[dict[str, object]]:
   return callListApi(f"{webappBaseUrl}/api/subscriptions")
 
 
+def findArtistSubscriptionByArtistId(webappBaseUrl: str, artistId: str) -> dict[str, object]:
+  for subscription in listArtistSubscriptions(webappBaseUrl):
+    if str(subscription.get("artistId", "")) == str(artistId):
+      return subscription
+  raise ValueError("subscription not found")
+
+
 def deleteArtistSubscription(webappBaseUrl: str, artistId: str) -> dict[str, object]:
   quotedArtistId = parse.quote(artistId, safe="")
   return callJsonApi(
@@ -904,6 +1407,40 @@ def deleteArtistSubscription(webappBaseUrl: str, artistId: str) -> dict[str, obj
 
 def scanArtistSubscriptions(webappBaseUrl: str) -> dict[str, object]:
   return callJsonApi(f"{webappBaseUrl}/api/subscriptions/scan", method="POST")
+
+
+def updateArtistSubscriptionPolicy(webappBaseUrl: str, artistId: str, newAlbumPolicy: str) -> dict[str, object]:
+  subscription = findArtistSubscriptionByArtistId(webappBaseUrl, artistId)
+  subscriptionId = str(subscription.get("id", ""))
+  if not subscriptionId:
+    raise ValueError("subscription not found")
+  return callJsonApi(
+    f"{webappBaseUrl}/api/subscriptions/{parse.quote(subscriptionId, safe='')}",
+    method="PATCH",
+    payload={"newAlbumPolicy": newAlbumPolicy},
+  )
+
+
+def updateArtistSubscriptionAlbum(webappBaseUrl: str, artistId: str, albumId: str, action: str) -> dict[str, object]:
+  subscription = findArtistSubscriptionByArtistId(webappBaseUrl, artistId)
+  subscriptionId = str(subscription.get("id", ""))
+  if not subscriptionId:
+    raise ValueError("subscription not found")
+  return callJsonApi(
+    f"{webappBaseUrl}/api/subscriptions/{parse.quote(subscriptionId, safe='')}/albums/actions",
+    method="POST",
+    payload={"albumIds": [albumId], "action": action},
+  )
+
+
+def updateArtistSubscriptionAlbumBySubscriptionId(webappBaseUrl: str, subscriptionId: str, albumId: str, action: str) -> dict[str, object]:
+  if not str(subscriptionId).strip():
+    raise ValueError("subscription not found")
+  return callJsonApi(
+    f"{webappBaseUrl}/api/subscriptions/{parse.quote(str(subscriptionId), safe='')}/albums/actions",
+    method="POST",
+    payload={"albumIds": [albumId], "action": action},
+  )
 
 
 def callTelegramApi(botToken: str, method: str, payload: dict[str, object]) -> dict[str, object]:
@@ -941,6 +1478,28 @@ def sendTelegramMessage(
   callTelegramApi(botToken, "sendMessage", payload)
 
 
+def answerTelegramCallbackQuery(botToken: str, callbackQueryId: str, text: str = "") -> None:
+  payload: dict[str, object] = {"callback_query_id": callbackQueryId}
+  if text:
+    payload["text"] = text
+  callTelegramApi(botToken, "answerCallbackQuery", payload)
+
+
+def editTelegramMessageReplyMarkup(
+  botToken: str,
+  chatId: int,
+  messageId: int,
+  replyMarkup: dict[str, object] | None = None,
+) -> None:
+  payload: dict[str, object] = {
+    "chat_id": chatId,
+    "message_id": messageId,
+  }
+  if replyMarkup is not None:
+    payload["reply_markup"] = replyMarkup
+  callTelegramApi(botToken, "editMessageReplyMarkup", payload)
+
+
 def getUpdates(botToken: str, offset: int | None, timeoutSeconds: int) -> list[dict[str, object]]:
   payload: dict[str, object] = {"timeout": timeoutSeconds}
   if offset is not None:
@@ -967,7 +1526,12 @@ def runPollingCycle(
   fetchSubscriptions: Callable[[], list[dict[str, object]]] | None = None,
   deleteSubscription: Callable[[str], dict[str, object]] | None = None,
   scanSubscriptions: Callable[[], dict[str, object]] | None = None,
+  updateSubscriptionPolicy: Callable[[str, str], dict[str, object]] | None = None,
+  updateSubscriptionAlbum: Callable[[str, str, str], dict[str, object]] | None = None,
   sendMessage: Callable[[int, str, int | None, dict[str, object] | None], None] | None = None,
+  updateSubscriptionAlbumBySubscriptionId: Callable[[str, str, str], dict[str, object]] | None = None,
+  answerCallback: Callable[[str, str], None] | None = None,
+  editMessageReplyMarkup: Callable[[int, int, dict[str, object] | None], None] | None = None,
 ) -> int | None:
   if retryTasks is None:
     retryTasks = lambda: {}
@@ -975,6 +1539,12 @@ def runPollingCycle(
     fetchTasks = lambda: []
   if sendMessage is None:
     sendMessage = lambda chatId, text, replyToMessageId=None, replyMarkup=None: None
+  if updateSubscriptionAlbumBySubscriptionId is None:
+    updateSubscriptionAlbumBySubscriptionId = lambda subscriptionId, albumId, action: {}
+  if answerCallback is None:
+    answerCallback = lambda callbackQueryId, text="": None
+  if editMessageReplyMarkup is None:
+    editMessageReplyMarkup = lambda chatId, messageId, replyMarkup=None: None
 
   nextOffset = offset
   updates = getUpdatesFn(offset, updatesTimeoutSeconds)
@@ -997,7 +1567,12 @@ def runPollingCycle(
       fetchSubscriptions=fetchSubscriptions,
       deleteSubscription=deleteSubscription,
       scanSubscriptions=scanSubscriptions,
+      updateSubscriptionPolicy=updateSubscriptionPolicy,
+      updateSubscriptionAlbum=updateSubscriptionAlbum,
       sendMessage=sendMessage,
+      updateSubscriptionAlbumBySubscriptionId=updateSubscriptionAlbumBySubscriptionId,
+      answerCallback=answerCallback,
+      editMessageReplyMarkup=editMessageReplyMarkup,
     )
     store.markUpdateProcessed(updateId)
     store.pruneProcessedUpdates()
@@ -1042,6 +1617,11 @@ def runPollingLoop() -> None:
         fetchSubscriptions=lambda: listArtistSubscriptions(config.webappBaseUrl),
         deleteSubscription=lambda artistId: deleteArtistSubscription(config.webappBaseUrl, artistId),
         scanSubscriptions=lambda: scanArtistSubscriptions(config.webappBaseUrl),
+        updateSubscriptionPolicy=lambda artistId, policy: updateArtistSubscriptionPolicy(config.webappBaseUrl, artistId, policy),
+        updateSubscriptionAlbum=lambda artistId, albumId, action: updateArtistSubscriptionAlbum(config.webappBaseUrl, artistId, albumId, action),
+        updateSubscriptionAlbumBySubscriptionId=lambda subscriptionId, albumId, action: updateArtistSubscriptionAlbumBySubscriptionId(config.webappBaseUrl, subscriptionId, albumId, action),
+        answerCallback=lambda callbackQueryId, text="": answerTelegramCallbackQuery(config.botToken, callbackQueryId, text),
+        editMessageReplyMarkup=lambda chatId, messageId, replyMarkup=None: editTelegramMessageReplyMarkup(config.botToken, chatId, messageId, replyMarkup),
         sendMessage=lambda chatId, text, replyToMessageId=None, replyMarkup=None: sendTelegramMessage(
           config.botToken,
           chatId,

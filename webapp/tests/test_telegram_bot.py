@@ -11,16 +11,21 @@ import webapp.telegram_bot as telegram_bot
 
 from webapp.telegram_bot import (
   TelegramTaskStore,
+  answerTelegramCallbackQuery,
+  buildReplyKeyboard,
+  buildSubscriptionReviewKeyboard,
   buildTelegramCommands,
   createArtistSubscription,
   createDownloadTask,
   deleteArtistSubscription,
+  editTelegramMessageReplyMarkup,
   extractAppleMusicUrl,
   extractAppleMusicUrls,
   filterTasksByStatus,
   formatArtistSearchResultsMessage,
   formatStartupWelcomeMessage,
   formatRetryFailedTasksMessage,
+  formatSubscriptionReviewMessage,
   formatSubscriptionScanSummaryMessage,
   formatTaskListMessage,
   getTelegramConfig,
@@ -36,6 +41,7 @@ from webapp.telegram_bot import (
   searchArtists,
   setTelegramCommands,
   sendTelegramMessage,
+  updateArtistSubscriptionAlbumBySubscriptionId,
 )
 
 
@@ -479,7 +485,7 @@ class TelegramBotTest(unittest.TestCase):
     self.assertEqual(messages[0][1], "该链接已下载，直接返回历史记录")
     self.assertEqual(tasks, [])
 
-  def testHandleUpdateShowsHelpKeyboard(self):
+  def testHandleUpdateShowsHelpAndRemovesKeyboardAfterButtonUse(self):
     messages = []
 
     def fakeSendMessage(chatId, text, replyToMessageId=None, replyMarkup=None):
@@ -506,7 +512,7 @@ class TelegramBotTest(unittest.TestCase):
 
     self.assertEqual(len(messages), 1)
     self.assertIn("直接发送 Apple Music 链接即可下载", messages[0][1])
-    self.assertIsInstance(messages[0][3], dict)
+    self.assertEqual(messages[0][3], {"remove_keyboard": True})
 
   def testHandleUpdateSupportsSlashHelp(self):
     messages = []
@@ -535,6 +541,36 @@ class TelegramBotTest(unittest.TestCase):
 
     self.assertEqual(len(messages), 1)
     self.assertIn("直接发送 Apple Music 链接即可下载", messages[0][1])
+    self.assertIsNone(messages[0][3])
+
+  def testHandleUpdateShowsAndHidesMenu(self):
+    messages = []
+
+    def fakeSendMessage(chatId, text, replyToMessageId=None, replyMarkup=None):
+      messages.append((chatId, text, replyToMessageId, replyMarkup))
+
+    with tempfile.TemporaryDirectory() as tempDir:
+      store = TelegramTaskStore(f"{tempDir}/telegram_tasks.db")
+      for updateId, text in [(1, "/menu"), (2, "/hide_menu")]:
+        handleUpdate(
+          update={
+            "update_id": updateId,
+            "message": {
+              "message_id": updateId + 9,
+              "chat": {"id": 12345, "type": "private"},
+              "text": text,
+            },
+          },
+          allowedChatId=12345,
+          store=store,
+          createTask=lambda url: {"taskId": "task-1", "status": "running"},
+          sendMessage=fakeSendMessage,
+        )
+
+    self.assertEqual(len(messages), 2)
+    self.assertTrue(messages[0][3]["one_time_keyboard"])
+    self.assertNotIn("is_persistent", messages[0][3])
+    self.assertEqual(messages[1][3], {"remove_keyboard": True})
 
   def testHandleUpdateShowsForceDownloadHint(self):
     messages = []
@@ -563,6 +599,7 @@ class TelegramBotTest(unittest.TestCase):
 
     self.assertEqual(len(messages), 1)
     self.assertIn("/force https://music.apple.com/", messages[0][1])
+    self.assertEqual(messages[0][3], {"remove_keyboard": True})
 
   def testHandleUpdateSupportsForceCommand(self):
     calls = []
@@ -807,6 +844,371 @@ class TelegramBotTest(unittest.TestCase):
     self.assertIn("歌手订阅", messages[1][1])
     self.assertIn("已取消订阅 artist_id: 12345", messages[2][1])
     self.assertIn("歌手订阅扫描完成", messages[3][1])
+
+  def testHandleUpdateSendsSubscriptionAlbumReviewAfterSubscribe(self):
+    messages = []
+    calls = []
+
+    def fakeSendMessage(chatId, text, replyToMessageId=None, replyMarkup=None):
+      messages.append((chatId, text, replyToMessageId, replyMarkup))
+
+    with tempfile.TemporaryDirectory() as tempDir:
+      store = TelegramTaskStore(f"{tempDir}/telegram_tasks.db")
+      handleUpdate(
+        update={
+          "update_id": 1,
+          "message": {
+            "message_id": 10,
+            "chat": {"id": 12345, "type": "private"},
+            "text": "/subscribe https://music.apple.com/cn/artist/example-artist/12345",
+          },
+        },
+        allowedChatId=12345,
+        store=store,
+        createTask=lambda url: {"taskId": "task-1", "status": "running"},
+        createSubscription=lambda artistUrl: calls.append(("subscribe", artistUrl)) or {
+          "subscription": {"id": 7, "artistName": "Example Artist", "artistId": "12345"},
+          "scan": {
+            "foundCount": 4,
+            "pendingCount": 1,
+            "queuedCount": 0,
+            "skippedCompletedCount": 1,
+            "skippedActiveCount": 1,
+            "errorCount": 0,
+          },
+        },
+        fetchSubscriptions=lambda: calls.append(("fetch",)) or [{
+          "id": 7,
+          "artistName": "Example Artist",
+          "artistId": "12345",
+          "recentAlbums": [
+            {
+              "albumId": "111",
+              "albumName": "New Album",
+              "releaseDate": "2026-06-01",
+              "userState": "pending",
+              "detectedStatus": "missing",
+              "canDownload": True,
+            },
+            {
+              "albumId": "222",
+              "albumName": "Queued Album",
+              "userState": "pending",
+              "detectedStatus": "queued",
+              "canDownload": False,
+            },
+            {
+              "albumId": "333",
+              "albumName": "Completed Album",
+              "userState": "subscribed",
+              "detectedStatus": "completed",
+              "canDownload": False,
+            },
+          ],
+        }],
+        sendMessage=fakeSendMessage,
+      )
+
+    self.assertEqual(calls[0], ("subscribe", "https://music.apple.com/cn/artist/example-artist/12345"))
+    self.assertEqual(calls[1], ("fetch",))
+    self.assertEqual(len(messages), 2)
+    self.assertIn("已订阅 Example Artist", messages[0][1])
+    self.assertIn("Example Artist 专辑确认", messages[1][1])
+    self.assertIn("New Album", messages[1][1])
+    self.assertIn("进行中 1 个", messages[1][1])
+    replyMarkup = messages[1][3]
+    self.assertIsInstance(replyMarkup, dict)
+    inlineKeyboard = replyMarkup["inline_keyboard"]
+    callbackData = [button["callback_data"] for row in inlineKeyboard for button in row]
+    self.assertIn("sa:7:111:d", callbackData)
+    self.assertIn("sa:7:111:i", callbackData)
+    self.assertIn("sa:7:111:m", callbackData)
+    self.assertFalse(any(":222:" in item for item in callbackData))
+
+  def testHandleUpdateSendsNoPendingSubscriptionReviewWithoutKeyboard(self):
+    messages = []
+
+    def fakeSendMessage(chatId, text, replyToMessageId=None, replyMarkup=None):
+      messages.append((chatId, text, replyToMessageId, replyMarkup))
+
+    with tempfile.TemporaryDirectory() as tempDir:
+      store = TelegramTaskStore(f"{tempDir}/telegram_tasks.db")
+      handleUpdate(
+        update={
+          "update_id": 1,
+          "message": {
+            "message_id": 10,
+            "chat": {"id": 12345, "type": "private"},
+            "text": "/subscribe https://music.apple.com/cn/artist/example-artist/12345",
+          },
+        },
+        allowedChatId=12345,
+        store=store,
+        createTask=lambda url: {"taskId": "task-1", "status": "running"},
+        createSubscription=lambda artistUrl: {
+          "subscription": {"id": 7, "artistName": "Example Artist", "artistId": "12345"},
+          "scan": {"foundCount": 2, "pendingCount": 0, "errorCount": 0},
+        },
+        fetchSubscriptions=lambda: [{
+          "id": 7,
+          "artistName": "Example Artist",
+          "artistId": "12345",
+          "recentAlbums": [
+            {"albumId": "111", "albumName": "Done Album", "userState": "subscribed", "detectedStatus": "completed", "canDownload": False},
+            {"albumId": "222", "albumName": "Ignored Album", "userState": "ignored", "detectedStatus": "missing", "canDownload": False},
+          ],
+        }],
+        sendMessage=fakeSendMessage,
+      )
+
+    self.assertEqual(len(messages), 2)
+    self.assertIn("没有需要处理的专辑", messages[1][1])
+    self.assertIsNone(messages[1][3])
+
+  def testHandleUpdateProcessesSubscriptionAlbumCallback(self):
+    messages = []
+    answers = []
+    edits = []
+    calls = []
+    refreshed = [{
+      "id": 7,
+      "artistName": "Example Artist",
+      "artistId": "12345",
+      "recentAlbums": [
+        {
+          "albumId": "111",
+          "albumName": "New Album",
+          "userState": "pending",
+          "detectedStatus": "missing",
+          "canDownload": True,
+        }
+      ],
+    }]
+
+    def fakeFetchSubscriptions():
+      calls.append(("fetch",))
+      return refreshed
+
+    def fakeSendMessage(chatId, text, replyToMessageId=None, replyMarkup=None):
+      messages.append((chatId, text, replyToMessageId, replyMarkup))
+
+    with tempfile.TemporaryDirectory() as tempDir:
+      store = TelegramTaskStore(f"{tempDir}/telegram_tasks.db")
+      handleUpdate(
+        update={
+          "update_id": 1,
+          "callback_query": {
+            "id": "callback-1",
+            "from": {"id": 12345, "is_bot": False},
+            "message": {
+              "message_id": 99,
+              "chat": {"id": 12345, "type": "private"},
+            },
+            "data": "sa:7:111:i",
+          },
+        },
+        allowedChatId=12345,
+        store=store,
+        createTask=lambda url: {"taskId": "task-1", "status": "running"},
+        fetchSubscriptions=fakeFetchSubscriptions,
+        updateSubscriptionAlbumBySubscriptionId=lambda subscriptionId, albumId, action: calls.append(("album", subscriptionId, albumId, action)) or {
+          "action": action,
+          "updatedCount": 1,
+        },
+        answerCallback=lambda callbackQueryId, text="": answers.append((callbackQueryId, text)),
+        editMessageReplyMarkup=lambda chatId, messageId, replyMarkup=None: edits.append((chatId, messageId, replyMarkup)),
+        sendMessage=fakeSendMessage,
+      )
+
+    self.assertEqual(answers, [("callback-1", "已处理")])
+    self.assertEqual(edits, [(12345, 99, None)])
+    self.assertEqual(calls, [
+      ("fetch",),
+      ("album", "7", "111", "ignore"),
+      ("fetch",),
+    ])
+    self.assertIn("已忽略：New Album", messages[0][1])
+    self.assertIn("Example Artist 专辑确认", messages[1][1])
+
+  def testRunPollingCycleMarksCallbackProcessedWhenTelegramFollowupFails(self):
+    actionCalls = []
+
+    with tempfile.TemporaryDirectory() as tempDir:
+      store = TelegramTaskStore(f"{tempDir}/telegram_tasks.db")
+      nextOffset = runPollingCycle(
+        offset=7,
+        allowedChatId=12345,
+        updatesTimeoutSeconds=30,
+        store=store,
+        getUpdatesFn=lambda offset, timeoutSeconds: [
+          {
+            "update_id": 8,
+            "callback_query": {
+              "id": "callback-1",
+              "from": {"id": 12345, "is_bot": False},
+              "message": {
+                "message_id": 99,
+                "chat": {"id": 12345, "type": "private"},
+              },
+              "data": "sa:7:111:i",
+            },
+          }
+        ],
+        createTask=lambda url: {"taskId": "task-1", "status": "running"},
+        fetchTask=lambda taskId: {"status": "running"},
+        fetchSubscriptions=lambda: [{
+          "id": 7,
+          "artistName": "Example Artist",
+          "artistId": "12345",
+          "recentAlbums": [{
+            "albumId": "111",
+            "albumName": "New Album",
+            "userState": "pending",
+            "detectedStatus": "missing",
+            "canDownload": True,
+          }],
+        }],
+        updateSubscriptionAlbumBySubscriptionId=lambda subscriptionId, albumId, action: actionCalls.append((subscriptionId, albumId, action)) or {
+          "action": action,
+          "updatedCount": 1,
+        },
+        answerCallback=lambda callbackQueryId, text="": (_ for _ in ()).throw(RuntimeError("answer failed")),
+        editMessageReplyMarkup=lambda chatId, messageId, replyMarkup=None: (_ for _ in ()).throw(RuntimeError("edit failed")),
+        sendMessage=lambda chatId, text, replyToMessageId=None, replyMarkup=None: (_ for _ in ()).throw(RuntimeError("send failed")),
+      )
+
+      self.assertTrue(store.hasProcessedUpdate(8))
+      self.assertEqual(store.getLastUpdateId(), 8)
+
+    self.assertEqual(nextOffset, 9)
+    self.assertEqual(actionCalls, [("7", "111", "ignore")])
+
+  def testHandleUpdateSupportsSubscriptionPolicyAndAlbumCommands(self):
+    messages = []
+    calls = []
+
+    def fakeSendMessage(chatId, text, replyToMessageId=None, replyMarkup=None):
+      messages.append((chatId, text, replyToMessageId, replyMarkup))
+
+    with tempfile.TemporaryDirectory() as tempDir:
+      store = TelegramTaskStore(f"{tempDir}/telegram_tasks.db")
+      handleUpdate(
+        update={
+          "update_id": 1,
+          "message": {
+            "message_id": 10,
+            "chat": {"id": 12345, "type": "private"},
+            "text": "/subscription_policy 12345 auto",
+          },
+        },
+        allowedChatId=12345,
+        store=store,
+        createTask=lambda url: {"taskId": "task-1", "status": "running"},
+        updateSubscriptionPolicy=lambda artistId, policy: calls.append(("policy", artistId, policy)) or {
+          "subscription": {"artistName": "Example Artist", "newAlbumPolicy": policy},
+        },
+        sendMessage=fakeSendMessage,
+      )
+      handleUpdate(
+        update={
+          "update_id": 2,
+          "message": {
+            "message_id": 11,
+            "chat": {"id": 12345, "type": "private"},
+            "text": "/subscription_album 12345 67890 imported",
+          },
+        },
+        allowedChatId=12345,
+        store=store,
+        createTask=lambda url: {"taskId": "task-1", "status": "running"},
+        updateSubscriptionAlbum=lambda artistId, albumId, action: calls.append(("album", artistId, albumId, action)) or {
+          "action": action,
+          "updatedCount": 1,
+        },
+        sendMessage=fakeSendMessage,
+      )
+
+    self.assertEqual(calls, [
+      ("policy", "12345", "auto"),
+      ("album", "12345", "67890", "mark_imported"),
+    ])
+    self.assertIn("策略已更新为 auto", messages[0][1])
+    self.assertIn("已标记导入 1 个专辑", messages[1][1])
+
+  def testHandleUpdateSupportsSubscriptionKeyboardShortcuts(self):
+    messages = []
+    calls = []
+
+    def fakeSendMessage(chatId, text, replyToMessageId=None, replyMarkup=None):
+      messages.append((chatId, text, replyToMessageId, replyMarkup))
+
+    with tempfile.TemporaryDirectory() as tempDir:
+      store = TelegramTaskStore(f"{tempDir}/telegram_tasks.db")
+      handleUpdate(
+        update={
+          "update_id": 1,
+          "message": {
+            "message_id": 10,
+            "chat": {"id": 12345, "type": "private"},
+            "text": "订阅说明",
+          },
+        },
+        allowedChatId=12345,
+        store=store,
+        createTask=lambda url: {"taskId": "task-1", "status": "running"},
+        sendMessage=fakeSendMessage,
+      )
+
+      handleUpdate(
+        update={
+          "update_id": 2,
+          "message": {
+            "message_id": 11,
+            "chat": {"id": 12345, "type": "private"},
+            "text": "查看订阅",
+          },
+        },
+        allowedChatId=12345,
+        store=store,
+        createTask=lambda url: {"taskId": "task-1", "status": "running"},
+        fetchSubscriptions=lambda: calls.append("subscriptions") or [{
+          "artistName": "Example Artist",
+          "artistId": "12345",
+          "storefront": "cn",
+        }],
+        sendMessage=fakeSendMessage,
+      )
+
+      handleUpdate(
+        update={
+          "update_id": 3,
+          "message": {
+            "message_id": 12,
+            "chat": {"id": 12345, "type": "private"},
+            "text": "扫描订阅",
+          },
+        },
+        allowedChatId=12345,
+        store=store,
+        createTask=lambda url: {"taskId": "task-1", "status": "running"},
+        scanSubscriptions=lambda: calls.append("scan") or {
+          "scannedCount": 1,
+          "foundCount": 2,
+          "queuedCount": 1,
+          "skippedCompletedCount": 1,
+          "skippedActiveCount": 0,
+          "errorCount": 0,
+        },
+        sendMessage=fakeSendMessage,
+      )
+
+    self.assertEqual(calls, ["subscriptions", "scan"])
+    self.assertIn("/artist_search <关键词>", messages[0][1])
+    self.assertIn("Example Artist", messages[1][1])
+    self.assertIn("歌手订阅扫描完成", messages[2][1])
+    self.assertEqual(messages[0][3], {"remove_keyboard": True})
+    self.assertEqual(messages[1][3], {"remove_keyboard": True})
+    self.assertEqual(messages[2][3], {"remove_keyboard": True})
 
   def testRunPollingCycleMarksSubscriptionCommandProcessedAfterApiError(self):
     messages = []
@@ -1184,7 +1586,7 @@ class TelegramBotTest(unittest.TestCase):
 
         configPath = config_loader.resolveConfigPath()
 
-      self.assertEqual(configPath, repoPath / "config.yaml")
+      self.assertEqual(configPath.resolve(), (repoPath / "config.yaml").resolve())
     finally:
       config_loader.__file__ = originalFile
 
@@ -1203,7 +1605,7 @@ class TelegramBotTest(unittest.TestCase):
 
         configPath = config_loader.resolveConfigPath()
 
-      self.assertEqual(configPath, dataPath / "config.yaml")
+      self.assertEqual(configPath.resolve(), (dataPath / "config.yaml").resolve())
     finally:
       config_loader.__file__ = originalFile
 
@@ -1347,6 +1749,26 @@ class TelegramBotTest(unittest.TestCase):
         "errorCount": 0,
       }),
     )
+    reviewSubscription = {
+      "id": 7,
+      "artistName": "Example Artist",
+      "recentAlbums": [{
+        "albumId": "111",
+        "albumName": "New Album",
+        "userState": "pending",
+        "detectedStatus": "missing",
+        "canDownload": True,
+      }],
+    }
+    self.assertIn("New Album", formatSubscriptionReviewMessage(reviewSubscription))
+    self.assertEqual(
+      buildSubscriptionReviewKeyboard(reviewSubscription),
+      {"inline_keyboard": [[
+        {"text": "1 下载", "callback_data": "sa:7:111:d"},
+        {"text": "1 忽略", "callback_data": "sa:7:111:i"},
+        {"text": "1 已导入", "callback_data": "sa:7:111:m"},
+      ]]},
+    )
 
   def testSendTelegramMessageSupportsReplyMarkup(self):
     calls = []
@@ -1370,6 +1792,72 @@ class TelegramBotTest(unittest.TestCase):
 
     self.assertEqual(calls[0][1], "sendMessage")
     self.assertIn("reply_markup", calls[0][2])
+
+  def testAnswerTelegramCallbackQueryCallsTelegramApi(self):
+    calls = []
+
+    def fakeCallTelegramApi(botToken, method, payload):
+      calls.append((botToken, method, payload))
+      return {}
+
+    originalCallTelegramApi = telegram_bot.callTelegramApi
+    telegram_bot.callTelegramApi = fakeCallTelegramApi
+    try:
+      answerTelegramCallbackQuery("bot-token", "callback-1", "已处理")
+    finally:
+      telegram_bot.callTelegramApi = originalCallTelegramApi
+
+    self.assertEqual(calls, [(
+      "bot-token",
+      "answerCallbackQuery",
+      {"callback_query_id": "callback-1", "text": "已处理"},
+    )])
+
+  def testEditTelegramMessageReplyMarkupCanRemoveInlineKeyboard(self):
+    calls = []
+
+    def fakeCallTelegramApi(botToken, method, payload):
+      calls.append((botToken, method, payload))
+      return {}
+
+    originalCallTelegramApi = telegram_bot.callTelegramApi
+    telegram_bot.callTelegramApi = fakeCallTelegramApi
+    try:
+      editTelegramMessageReplyMarkup("bot-token", 12345, 99)
+    finally:
+      telegram_bot.callTelegramApi = originalCallTelegramApi
+
+    self.assertEqual(calls, [(
+      "bot-token",
+      "editMessageReplyMarkup",
+      {"chat_id": 12345, "message_id": 99},
+    )])
+
+  def testUpdateArtistSubscriptionAlbumBySubscriptionIdCallsActionsApi(self):
+    calls = []
+
+    def fakeCallJsonApi(url, method="GET", payload=None):
+      calls.append((url, method, payload))
+      return {"updatedCount": 1}
+
+    originalCallJsonApi = telegram_bot.callJsonApi
+    telegram_bot.callJsonApi = fakeCallJsonApi
+    try:
+      result = updateArtistSubscriptionAlbumBySubscriptionId(
+        "http://127.0.0.1:5000",
+        "7",
+        "111",
+        "ignore",
+      )
+    finally:
+      telegram_bot.callJsonApi = originalCallJsonApi
+
+    self.assertEqual(result, {"updatedCount": 1})
+    self.assertEqual(calls, [(
+      "http://127.0.0.1:5000/api/subscriptions/7/albums/actions",
+      "POST",
+      {"albumIds": ["111"], "action": "ignore"},
+    )])
 
   def testFormatRetryFailedTasksMessageReportsNoFailures(self):
     self.assertEqual(
@@ -1407,8 +1895,28 @@ class TelegramBotTest(unittest.TestCase):
     commands = buildTelegramCommands()
 
     self.assertEqual(commands[0]["command"], "start")
+    self.assertTrue(any(item["command"] == "menu" for item in commands))
+    self.assertTrue(any(item["command"] == "hide_menu" for item in commands))
     self.assertTrue(any(item["command"] == "retry_failed" for item in commands))
     self.assertTrue(any(item["command"] == "force" for item in commands))
+    self.assertTrue(any(item["command"] == "subscriptions" for item in commands))
+    self.assertTrue(any(item["command"] == "subscription_policy" for item in commands))
+    self.assertTrue(any(item["command"] == "subscription_album" for item in commands))
+
+  def testBuildReplyKeyboardIsOneTimeAndIncludesSubscriptionShortcuts(self):
+    keyboard = buildReplyKeyboard()
+    buttonTexts = [
+      button["text"]
+      for row in keyboard["keyboard"]
+      for button in row
+    ]
+
+    self.assertTrue(keyboard["one_time_keyboard"])
+    self.assertNotIn("is_persistent", keyboard)
+    self.assertIn("订阅说明", buttonTexts)
+    self.assertIn("查看订阅", buttonTexts)
+    self.assertIn("扫描订阅", buttonTexts)
+    self.assertIn("收起菜单", buttonTexts)
 
   def testSetTelegramCommandsCallsSetMyCommands(self):
     calls = []
@@ -1454,7 +1962,7 @@ class TelegramBotTest(unittest.TestCase):
     self.assertEqual(len(messageCalls), 1)
     self.assertEqual(messageCalls[0][0], 12345)
     self.assertIn("机器人已启动", messageCalls[0][1])
-    self.assertIsInstance(messageCalls[0][3], dict)
+    self.assertIsNone(messageCalls[0][3])
 
 
 if __name__ == "__main__":
