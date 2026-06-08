@@ -28,7 +28,8 @@ SCAN_SUBSCRIPTIONS_BUTTON_TEXT = "扫描订阅"
 MENU_BUTTON_TEXT = "显示菜单"
 HIDE_MENU_BUTTON_TEXT = "收起菜单"
 SUBSCRIPTION_ALBUM_CALLBACK_PREFIX = "sa"
-SUBSCRIPTION_REVIEW_ALBUM_LIMIT = 10
+SUBSCRIPTION_REVIEW_PAGE_CALLBACK_PREFIX = "srp"
+SUBSCRIPTION_REVIEW_ALBUM_PAGE_SIZE = 5
 SUBSCRIPTION_ALBUM_CALLBACK_ACTIONS = {
   "d": "download",
   "i": "ignore",
@@ -629,7 +630,7 @@ def canReviewSubscriptionAlbum(album: dict[str, object]) -> bool:
   return getSubscriptionAlbumDetectedStatus(album) in {"missing", "failed_history", "stale_history"}
 
 
-def listSubscriptionReviewAlbums(subscription: dict[str, object], limit: int = SUBSCRIPTION_REVIEW_ALBUM_LIMIT) -> list[dict[str, object]]:
+def listSubscriptionReviewAlbums(subscription: dict[str, object], limit: int | None = None) -> list[dict[str, object]]:
   albums = subscription.get("recentAlbums", [])
   if not isinstance(albums, list):
     return []
@@ -638,7 +639,50 @@ def listSubscriptionReviewAlbums(subscription: dict[str, object], limit: int = S
     for album in albums
     if isinstance(album, dict) and canReviewSubscriptionAlbum(album)
   ]
-  return sortSubscriptionAlbums(reviewAlbums)[:limit]
+  sortedAlbums = sortSubscriptionAlbums(reviewAlbums)
+  if limit is None:
+    return sortedAlbums
+  return sortedAlbums[:limit]
+
+
+def normalizeSubscriptionReviewPageSize(pageSize: int = SUBSCRIPTION_REVIEW_ALBUM_PAGE_SIZE) -> int:
+  try:
+    normalizedPageSize = int(pageSize)
+  except (TypeError, ValueError):
+    normalizedPageSize = SUBSCRIPTION_REVIEW_ALBUM_PAGE_SIZE
+  return max(1, normalizedPageSize)
+
+
+def getSubscriptionReviewPageCount(subscription: dict[str, object], pageSize: int = SUBSCRIPTION_REVIEW_ALBUM_PAGE_SIZE) -> int:
+  safePageSize = normalizeSubscriptionReviewPageSize(pageSize)
+  reviewAlbumCount = len(listSubscriptionReviewAlbums(subscription))
+  if reviewAlbumCount == 0:
+    return 0
+  return ((reviewAlbumCount - 1) // safePageSize) + 1
+
+
+def clampSubscriptionReviewPage(subscription: dict[str, object], page: int, pageSize: int = SUBSCRIPTION_REVIEW_ALBUM_PAGE_SIZE) -> int:
+  pageCount = getSubscriptionReviewPageCount(subscription, pageSize)
+  if pageCount == 0:
+    return 0
+  try:
+    requestedPage = int(page)
+  except (TypeError, ValueError):
+    requestedPage = 0
+  return max(0, min(requestedPage, pageCount - 1))
+
+
+def listSubscriptionReviewPageAlbums(
+  subscription: dict[str, object],
+  page: int = 0,
+  pageSize: int = SUBSCRIPTION_REVIEW_ALBUM_PAGE_SIZE,
+) -> tuple[list[dict[str, object]], int, int]:
+  safePageSize = normalizeSubscriptionReviewPageSize(pageSize)
+  safePage = clampSubscriptionReviewPage(subscription, page, safePageSize)
+  reviewAlbums = listSubscriptionReviewAlbums(subscription)
+  pageCount = getSubscriptionReviewPageCount(subscription, safePageSize)
+  start = safePage * safePageSize
+  return reviewAlbums[start:start + safePageSize], safePage, pageCount
 
 
 def summarizeSubscriptionReviewAlbums(subscription: dict[str, object]) -> dict[str, int]:
@@ -672,10 +716,15 @@ def summarizeSubscriptionReviewAlbums(subscription: dict[str, object]) -> dict[s
   return summary
 
 
-def formatSubscriptionReviewMessage(subscription: dict[str, object], limit: int = SUBSCRIPTION_REVIEW_ALBUM_LIMIT) -> str:
+def formatSubscriptionReviewMessage(
+  subscription: dict[str, object],
+  page: int = 0,
+  pageSize: int = SUBSCRIPTION_REVIEW_ALBUM_PAGE_SIZE,
+) -> str:
   artistName = str(subscription.get("artistName", "未知歌手") or "未知歌手")
   summary = summarizeSubscriptionReviewAlbums(subscription)
-  reviewAlbums = listSubscriptionReviewAlbums(subscription, limit)
+  safePageSize = normalizeSubscriptionReviewPageSize(pageSize)
+  reviewAlbums, safePage, pageCount = listSubscriptionReviewPageAlbums(subscription, page, safePageSize)
   lines = [
     f"{artistName} 专辑确认",
     (
@@ -688,53 +737,112 @@ def formatSubscriptionReviewMessage(subscription: dict[str, object], limit: int 
     lines.append("没有需要处理的专辑。")
     return "\n".join(lines)
 
-  lines.append("待确认专辑：")
-  for index, album in enumerate(reviewAlbums, start=1):
+  lines.append(f"待确认专辑：第 {safePage + 1}/{pageCount} 页")
+  startIndex = safePage * safePageSize
+  for index, album in enumerate(reviewAlbums, start=startIndex + 1):
     releaseDate = str(album.get("releaseDate", album.get("release_date", "")) or "").strip()
     detectedStatus = getSubscriptionAlbumDetectedStatus(album)
     suffix = f" ({releaseDate})" if releaseDate else ""
     lines.append(f"{index}. {getSubscriptionAlbumTitle(album)}{suffix} - {getSubscriptionAlbumStatusLabel(detectedStatus)}")
 
-  hiddenCount = summary["pendingCount"] - len(reviewAlbums)
+  hiddenCount = summary["pendingCount"] - (safePage + 1) * safePageSize
   if hiddenCount > 0:
-    lines.append(f"另有 {hiddenCount} 个待确认专辑未显示，请到 Web 订阅页处理。")
+    lines.append(f"还有 {hiddenCount} 个待确认专辑，点下一页继续处理。")
   return "\n".join(lines)
 
 
-def buildSubscriptionAlbumCallbackData(subscriptionId: str, albumId: str, action: str) -> str:
+def buildSubscriptionAlbumCallbackData(subscriptionId: str, albumId: str, action: str, page: int | None = None) -> str:
   actionCode = SUBSCRIPTION_ALBUM_ACTION_CALLBACK_CODES.get(action, "")
   quotedAlbumId = parse.quote(str(albumId), safe="")
-  return f"{SUBSCRIPTION_ALBUM_CALLBACK_PREFIX}:{subscriptionId}:{quotedAlbumId}:{actionCode}"
+  callbackData = f"{SUBSCRIPTION_ALBUM_CALLBACK_PREFIX}:{subscriptionId}:{quotedAlbumId}:{actionCode}"
+  if page is None:
+    return callbackData
+  try:
+    safePage = int(page)
+  except (TypeError, ValueError):
+    safePage = 0
+  return f"{callbackData}:{max(0, safePage)}"
 
 
-def parseSubscriptionAlbumCallbackData(data: str) -> tuple[str, str, str] | None:
+def parseSubscriptionAlbumCallbackData(data: str) -> tuple[str, str, str, int | None] | None:
   parts = str(data or "").split(":")
-  if len(parts) != 4 or parts[0] != SUBSCRIPTION_ALBUM_CALLBACK_PREFIX:
+  if len(parts) not in {4, 5} or parts[0] != SUBSCRIPTION_ALBUM_CALLBACK_PREFIX:
     return None
   subscriptionId = parts[1].strip()
   albumId = parse.unquote(parts[2].strip())
   action = SUBSCRIPTION_ALBUM_CALLBACK_ACTIONS.get(parts[3].strip())
   if not subscriptionId or not albumId or not action:
     return None
-  return subscriptionId, albumId, action
+  page: int | None = None
+  if len(parts) == 5:
+    try:
+      page = int(parts[4])
+    except ValueError:
+      return None
+    if page < 0:
+      return None
+  return subscriptionId, albumId, action, page
 
 
-def buildSubscriptionReviewKeyboard(subscription: dict[str, object], limit: int = SUBSCRIPTION_REVIEW_ALBUM_LIMIT) -> dict[str, object] | None:
+def buildSubscriptionReviewPageCallbackData(subscriptionId: str, page: int) -> str:
+  return f"{SUBSCRIPTION_REVIEW_PAGE_CALLBACK_PREFIX}:{subscriptionId}:{max(0, page)}"
+
+
+def parseSubscriptionReviewPageCallbackData(data: str) -> tuple[str, int] | None:
+  parts = str(data or "").split(":")
+  if len(parts) != 3 or parts[0] != SUBSCRIPTION_REVIEW_PAGE_CALLBACK_PREFIX:
+    return None
+  subscriptionId = parts[1].strip()
+  if not subscriptionId:
+    return None
+  try:
+    page = int(parts[2])
+  except ValueError:
+    return None
+  if page < 0:
+    return None
+  return subscriptionId, page
+
+
+def buildSubscriptionReviewKeyboard(
+  subscription: dict[str, object],
+  page: int = 0,
+  pageSize: int = SUBSCRIPTION_REVIEW_ALBUM_PAGE_SIZE,
+) -> dict[str, object] | None:
   subscriptionId = str(subscription.get("id", "") or "").strip()
   if not subscriptionId:
     return None
   rows: list[list[dict[str, str]]] = []
-  for index, album in enumerate(listSubscriptionReviewAlbums(subscription, limit), start=1):
+  safePageSize = normalizeSubscriptionReviewPageSize(pageSize)
+  reviewAlbums, safePage, pageCount = listSubscriptionReviewPageAlbums(subscription, page, safePageSize)
+  startIndex = safePage * safePageSize
+  for index, album in enumerate(reviewAlbums, start=startIndex + 1):
     albumId = str(album.get("albumId", album.get("album_id", "")) or "").strip()
     if not albumId:
       continue
     row: list[dict[str, str]] = []
     for label, action in (("下载", "download"), ("完成", "mark_completed"), ("忽略", "ignore"), ("已导入", "mark_imported")):
-      callbackData = buildSubscriptionAlbumCallbackData(subscriptionId, albumId, action)
+      callbackPage = safePage if safePage > 0 else None
+      callbackData = buildSubscriptionAlbumCallbackData(subscriptionId, albumId, action, callbackPage)
+      if len(callbackData.encode("utf-8")) > 64 and callbackPage is not None:
+        callbackData = buildSubscriptionAlbumCallbackData(subscriptionId, albumId, action)
       if len(callbackData.encode("utf-8")) <= 64:
         row.append({"text": f"{index} {label}", "callback_data": callbackData})
     if row:
       rows.append(row)
+  if pageCount > 1:
+    pageRow: list[dict[str, str]] = []
+    if safePage > 0:
+      pageRow.append({
+        "text": "上一页",
+        "callback_data": buildSubscriptionReviewPageCallbackData(subscriptionId, safePage - 1),
+      })
+    if safePage < pageCount - 1:
+      pageRow.append({
+        "text": "下一页",
+        "callback_data": buildSubscriptionReviewPageCallbackData(subscriptionId, safePage + 1),
+      })
+    rows.append(pageRow)
   if not rows:
     return None
   return {"inline_keyboard": rows}
@@ -783,12 +891,13 @@ def sendSubscriptionReviewMessage(
   replyToMessageId: int | None,
   subscription: dict[str, object],
   sendMessage: Callable[[int, str, int | None, dict[str, object] | None], None],
+  page: int = 0,
 ) -> None:
   sendMessage(
     chatId,
-    formatSubscriptionReviewMessage(subscription),
+    formatSubscriptionReviewMessage(subscription, page),
     replyToMessageId,
-    buildSubscriptionReviewKeyboard(subscription),
+    buildSubscriptionReviewKeyboard(subscription, page),
   )
 
 
@@ -893,6 +1002,19 @@ def formatCommandErrorMessage(action: str, exc: Exception) -> str:
   return f"{action}失败：{message}"
 
 
+def isTelegramMessageNotModifiedError(exc: Exception) -> bool:
+  message = str(exc).lower()
+  if "message is not modified" in message:
+    return True
+  if not isinstance(exc, error.HTTPError):
+    return False
+  try:
+    body = exc.read().decode("utf-8", errors="replace").lower()
+  except Exception:  # noqa: BLE001
+    return False
+  return "message is not modified" in body
+
+
 def buildTelegramCommands() -> list[dict[str, str]]:
   return [
     {"command": "start", "description": "显示帮助和菜单"},
@@ -976,6 +1098,7 @@ def handleSubscriptionCallbackQuery(
   sendMessage: Callable[[int, str, int | None, dict[str, object] | None], None],
   answerCallback: Callable[[str, str], None],
   editMessageReplyMarkup: Callable[[int, int, dict[str, object] | None], None],
+  editMessageText: Callable[[int, int, str, dict[str, object] | None], None],
 ) -> None:
   def safeAnswerCallback(text: str) -> None:
     if not callbackId:
@@ -1006,12 +1129,42 @@ def handleSubscriptionCallbackQuery(
     replyToMessageId = int(message.get("message_id", 0) or 0) or None
   if not isAllowedChat(chatId, allowedChatId):
     return
-  parsed = parseSubscriptionAlbumCallbackData(str(callbackQuery.get("data", "") or ""))
+  callbackData = str(callbackQuery.get("data", "") or "")
+  parsedPage = parseSubscriptionReviewPageCallbackData(callbackData)
+  if parsedPage is not None:
+    subscriptionId, page = parsedPage
+    try:
+      subscription = findSubscriptionByIdentity(fetchSubscriptions(), subscriptionId=subscriptionId)
+    except Exception as exc:  # noqa: BLE001
+      safeAnswerCallback("翻页失败")
+      safeSendMessage(formatCommandErrorMessage("刷新订阅分页", exc))
+      return
+    if subscription is None:
+      safeAnswerCallback("订阅不存在")
+      return
+    safePage = clampSubscriptionReviewPage(subscription, page)
+    safeAnswerCallback(f"第 {safePage + 1} 页")
+    text = formatSubscriptionReviewMessage(subscription, safePage)
+    replyMarkup = buildSubscriptionReviewKeyboard(subscription, safePage)
+    if replyToMessageId is None:
+      safeSendMessage(text, replyMarkup)
+      return
+    try:
+      editMessageText(chatId, replyToMessageId, text, replyMarkup)
+    except Exception as exc:  # noqa: BLE001
+      if isTelegramMessageNotModifiedError(exc):
+        logBotMessage("subscription review page already up to date")
+        return
+      logBotMessage(f"failed to edit subscription review page: {exc}")
+      safeSendMessage(text, replyMarkup)
+    return
+
+  parsed = parseSubscriptionAlbumCallbackData(callbackData)
   if parsed is None:
     safeAnswerCallback("无法识别的订阅操作")
     return
 
-  subscriptionId, albumId, action = parsed
+  subscriptionId, albumId, action, sourcePage = parsed
   subscription: dict[str, object] | None = None
   album: dict[str, object] | None = None
   try:
@@ -1042,7 +1195,7 @@ def handleSubscriptionCallbackQuery(
     return
   if refreshedSubscription is not None:
     try:
-      sendSubscriptionReviewMessage(chatId, replyToMessageId, refreshedSubscription, sendMessage)
+      sendSubscriptionReviewMessage(chatId, replyToMessageId, refreshedSubscription, sendMessage, page=sourcePage or 0)
     except Exception as exc:  # noqa: BLE001
       logBotMessage(f"failed to send refreshed subscription review: {exc}")
 
@@ -1065,6 +1218,7 @@ def handleUpdate(
   updateSubscriptionAlbumBySubscriptionId: Callable[[str, str, str], dict[str, object]] | None = None,
   answerCallback: Callable[[str, str], None] | None = None,
   editMessageReplyMarkup: Callable[[int, int, dict[str, object] | None], None] | None = None,
+  editMessageText: Callable[[int, int, str, dict[str, object] | None], None] | None = None,
 ) -> None:
   if retryTasks is None:
     retryTasks = lambda: {}
@@ -1092,6 +1246,8 @@ def handleUpdate(
     answerCallback = lambda callbackQueryId, text="": None
   if editMessageReplyMarkup is None:
     editMessageReplyMarkup = lambda chatId, messageId, replyMarkup=None: None
+  if editMessageText is None:
+    editMessageText = lambda chatId, messageId, text, replyMarkup=None: None
 
   callbackQuery = update.get("callback_query")
   if isinstance(callbackQuery, dict):
@@ -1103,6 +1259,7 @@ def handleUpdate(
       sendMessage=sendMessage,
       answerCallback=answerCallback,
       editMessageReplyMarkup=editMessageReplyMarkup,
+      editMessageText=editMessageText,
     )
     return
 
@@ -1505,6 +1662,23 @@ def editTelegramMessageReplyMarkup(
   callTelegramApi(botToken, "editMessageReplyMarkup", payload)
 
 
+def editTelegramMessageText(
+  botToken: str,
+  chatId: int,
+  messageId: int,
+  text: str,
+  replyMarkup: dict[str, object] | None = None,
+) -> None:
+  payload: dict[str, object] = {
+    "chat_id": chatId,
+    "message_id": messageId,
+    "text": text,
+  }
+  if replyMarkup is not None:
+    payload["reply_markup"] = replyMarkup
+  callTelegramApi(botToken, "editMessageText", payload)
+
+
 def getUpdates(botToken: str, offset: int | None, timeoutSeconds: int) -> list[dict[str, object]]:
   payload: dict[str, object] = {"timeout": timeoutSeconds}
   if offset is not None:
@@ -1537,6 +1711,7 @@ def runPollingCycle(
   updateSubscriptionAlbumBySubscriptionId: Callable[[str, str, str], dict[str, object]] | None = None,
   answerCallback: Callable[[str, str], None] | None = None,
   editMessageReplyMarkup: Callable[[int, int, dict[str, object] | None], None] | None = None,
+  editMessageText: Callable[[int, int, str, dict[str, object] | None], None] | None = None,
 ) -> int | None:
   if retryTasks is None:
     retryTasks = lambda: {}
@@ -1550,6 +1725,8 @@ def runPollingCycle(
     answerCallback = lambda callbackQueryId, text="": None
   if editMessageReplyMarkup is None:
     editMessageReplyMarkup = lambda chatId, messageId, replyMarkup=None: None
+  if editMessageText is None:
+    editMessageText = lambda chatId, messageId, text, replyMarkup=None: None
 
   nextOffset = offset
   updates = getUpdatesFn(offset, updatesTimeoutSeconds)
@@ -1578,6 +1755,7 @@ def runPollingCycle(
       updateSubscriptionAlbumBySubscriptionId=updateSubscriptionAlbumBySubscriptionId,
       answerCallback=answerCallback,
       editMessageReplyMarkup=editMessageReplyMarkup,
+      editMessageText=editMessageText,
     )
     store.markUpdateProcessed(updateId)
     store.pruneProcessedUpdates()
@@ -1627,6 +1805,7 @@ def runPollingLoop() -> None:
         updateSubscriptionAlbumBySubscriptionId=lambda subscriptionId, albumId, action: updateArtistSubscriptionAlbumBySubscriptionId(config.webappBaseUrl, subscriptionId, albumId, action),
         answerCallback=lambda callbackQueryId, text="": answerTelegramCallbackQuery(config.botToken, callbackQueryId, text),
         editMessageReplyMarkup=lambda chatId, messageId, replyMarkup=None: editTelegramMessageReplyMarkup(config.botToken, chatId, messageId, replyMarkup),
+        editMessageText=lambda chatId, messageId, text, replyMarkup=None: editTelegramMessageText(config.botToken, chatId, messageId, text, replyMarkup),
         sendMessage=lambda chatId, text, replyToMessageId=None, replyMarkup=None: sendTelegramMessage(
           config.botToken,
           chatId,
