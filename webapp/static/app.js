@@ -6,12 +6,269 @@ const state = {
   taskPoller: null,
   historyPoller: null,
   subscriptionPoller: null,
+  demoPoller: null,
+  demoMode: false,
+  demoLogIndex: 0,
   logLines: [],
   pendingLogLines: [],
   logFlushScheduled: false,
 };
 
 const MAX_LOG_LINES = 300;
+const SIDEBAR_COLLAPSED_KEY = "amd-sidebar-collapsed";
+
+const demoStore = {
+  tasks: [
+    {
+      taskId: "demo-running",
+      url: "https://music.apple.com/cn/album/prema/1819419299",
+      codec: "alac",
+      source: "web",
+      albumName: "Prema",
+      createdAt: Date.now() / 1000,
+      status: "running",
+      stage: "downloading",
+      progress: 42,
+      result: [],
+      error: "",
+    },
+    {
+      taskId: "demo-queued",
+      url: "https://music.apple.com/cn/album/folklore/1524803417",
+      codec: "alac",
+      source: "subscription",
+      albumName: "Folklore",
+      createdAt: Date.now() / 1000 - 80,
+      status: "queued",
+      stage: "queued",
+      progress: 0,
+      result: [],
+      error: "",
+    },
+    {
+      taskId: "demo-failed",
+      url: "https://music.apple.com/cn/album/dynamite-remixes/1529621453",
+      codec: "atmos",
+      source: "telegram",
+      albumName: "Dynamite (Remixes)",
+      createdAt: Date.now() / 1000 - 180,
+      status: "failed",
+      stage: "failed",
+      progress: 18,
+      result: [],
+      error: "widevine key exchange returned HTTP 503",
+    },
+  ],
+  history: [
+    {
+      url: "https://music.apple.com/cn/album/lemonade-the-2nd-album/1893599771?ls",
+      status: "completed",
+      source: "web",
+      codec: "alac",
+      task_id: "demo-history-1",
+      album_id: "1893599771",
+      updated_at: "2026-06-07 08:42:10",
+    },
+    {
+      url: "https://music.apple.com/cn/album/dynamite-remixes/1529621453",
+      status: "failed",
+      source: "telegram",
+      codec: "atmos",
+      task_id: "demo-history-2",
+      album_id: "1529621453",
+      updated_at: "2026-06-07 08:38:03",
+    },
+  ],
+  subscriptions: [
+    {
+      id: 1,
+      artistId: "159260351",
+      storefront: "us",
+      artistName: "Taylor Swift",
+      artistUrl: "https://music.apple.com/us/artist/taylor-swift/159260351",
+      enabled: true,
+      newAlbumPolicy: "confirm",
+      albumCount: 3,
+      pendingAlbumCount: 0,
+      activeAlbumCount: 2,
+      completedAlbumCount: 1,
+      failedAlbumCount: 0,
+      ignoredAlbumCount: 0,
+      importedAlbumCount: 0,
+      lastCheckedAt: "2026-06-07 08:40:00",
+      lastError: "",
+      recentAlbums: [
+        {
+          albumId: "1819419299",
+          albumName: "Prema",
+          albumUrl: "https://music.apple.com/cn/album/prema/1819419299",
+          releaseDate: "2026-06-05",
+          status: "running",
+          userState: "subscribed",
+          detectedStatus: "running",
+        },
+        {
+          albumId: "1524803417",
+          albumName: "Folklore",
+          albumUrl: "https://music.apple.com/cn/album/folklore/1524803417",
+          releaseDate: "2020-07-24",
+          status: "queued",
+          userState: "subscribed",
+          detectedStatus: "queued",
+        },
+        {
+          albumId: "1893599771",
+          albumName: "Lemonade - The 2nd Album",
+          albumUrl: "https://music.apple.com/cn/album/lemonade-the-2nd-album/1893599771",
+          releaseDate: "2026-05-18",
+          status: "completed",
+          userState: "subscribed",
+          detectedStatus: "completed",
+        },
+      ],
+    },
+    {
+      id: 2,
+      artistId: "471744",
+      storefront: "cn",
+      artistName: "陈奕迅",
+      artistUrl: "https://music.apple.com/cn/artist/eason-chan/471744",
+      enabled: true,
+      newAlbumPolicy: "confirm",
+      albumCount: 2,
+      pendingAlbumCount: 1,
+      activeAlbumCount: 0,
+      completedAlbumCount: 1,
+      failedAlbumCount: 0,
+      ignoredAlbumCount: 0,
+      importedAlbumCount: 0,
+      lastCheckedAt: "2026-06-07 07:12:00",
+      lastError: "",
+      recentAlbums: [
+        {
+          albumId: "47174401",
+          albumName: "CHIN UP!",
+          albumUrl: "https://music.apple.com/cn/album/chin-up/47174401",
+          releaseDate: "2025-10-10",
+          status: "completed",
+          userState: "subscribed",
+          detectedStatus: "completed",
+        },
+        {
+          albumId: "47174402",
+          albumName: "准备中",
+          albumUrl: "https://music.apple.com/cn/album/demo/47174402",
+          releaseDate: "",
+          status: "seen",
+          userState: "pending",
+          detectedStatus: "missing",
+          canDownload: true,
+        },
+      ],
+    },
+  ],
+};
+
+const DEMO_LOG_LINES = [
+  "解析 Apple Music metadata...",
+  "匹配到 ALAC 最高音质资源",
+  "连接远程下载器容器 applemusic_download",
+  "开始分块下载主音轨",
+  "下载进度超过 60%，歌词与封面元数据已写入",
+  "调用 FFmpeg 转换为 FLAC",
+  "准备生成 album.nfo 并移动到 completed 目录",
+];
+
+
+function isDemoModeEnabled() {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  const params = new URLSearchParams(window.location.search);
+  return params.get("demo") === "1" || window.localStorage.getItem("amd-demo") === "1";
+}
+
+
+function cloneDemo(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+
+function getInitialViewName() {
+  if (typeof window === "undefined") {
+    return "console";
+  }
+  const candidate = window.location.hash.replace("#", "");
+  return ["console", "queue", "subscriptions", "history"].includes(candidate) ? candidate : "console";
+}
+
+
+function showView(viewName, updateHash = true) {
+  const safeView = ["console", "queue", "subscriptions", "history"].includes(viewName) ? viewName : "console";
+  for (const panel of document.querySelectorAll(".view-panel")) {
+    panel.hidden = panel.dataset.view !== safeView;
+  }
+  for (const link of document.querySelectorAll(".nav-link[data-view-target]")) {
+    link.classList.toggle("active", link.dataset.viewTarget === safeView);
+  }
+  if (updateHash && window.location.hash !== `#${safeView}`) {
+    window.history.replaceState(null, "", `#${safeView}`);
+  }
+}
+
+
+function bindViewNavigation() {
+  for (const link of document.querySelectorAll(".nav-link[data-view-target]")) {
+    link.addEventListener("click", (event) => {
+      event.preventDefault();
+      showView(link.dataset.viewTarget || "console");
+    });
+  }
+  window.addEventListener("hashchange", () => {
+    showView(getInitialViewName(), false);
+  });
+}
+
+
+function isSidebarCollapsedStored() {
+  if (typeof window === "undefined" || !window.localStorage) {
+    return false;
+  }
+  return window.localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1";
+}
+
+
+function setSidebarCollapsed(collapsed, persist = true) {
+  if (typeof document === "undefined") {
+    return;
+  }
+  document.body.classList.toggle("sidebar-collapsed", collapsed);
+
+  const toggle = document.getElementById("sidebar-toggle");
+  if (toggle) {
+    const label = collapsed ? "展开侧栏" : "收起侧栏";
+    toggle.setAttribute("aria-expanded", String(!collapsed));
+    toggle.setAttribute("aria-label", label);
+    toggle.setAttribute("title", label);
+  }
+
+  if (persist && typeof window !== "undefined" && window.localStorage) {
+    window.localStorage.setItem(SIDEBAR_COLLAPSED_KEY, collapsed ? "1" : "0");
+  }
+}
+
+
+function bindSidebarToggle() {
+  const toggle = document.getElementById("sidebar-toggle");
+  if (!toggle) {
+    return;
+  }
+
+  setSidebarCollapsed(isSidebarCollapsedStored(), false);
+  toggle.addEventListener("click", () => {
+    setSidebarCollapsed(!document.body.classList.contains("sidebar-collapsed"));
+  });
+}
 
 
 function isTerminalTaskStatus(status) {
@@ -101,6 +358,9 @@ function formatRetryFailedSummary(payload) {
 
 
 async function retryFailedTasks() {
+  if (state.demoMode) {
+    return { retriedCount: 1, skippedCompletedCount: 0, skippedRunningCount: 1 };
+  }
   const response = await fetch("/api/tasks/retry-failed", {
     method: "POST"
   });
@@ -133,6 +393,9 @@ function formatHistoryRetrySummary(payload) {
 
 
 async function retryHistoryFailedTasks() {
+  if (state.demoMode) {
+    return { retriedCount: 1, skippedCompletedCount: 1, skippedRunningCount: 0 };
+  }
   const response = await fetch("/api/history/retry-failed", {
     method: "POST"
   });
@@ -145,6 +408,21 @@ async function retryHistoryFailedTasks() {
 
 
 async function retrySingleHistory(url) {
+  if (state.demoMode) {
+    demoStore.tasks.unshift({
+      taskId: `demo-retry-${Date.now()}`,
+      url,
+      codec: "alac",
+      source: "web",
+      createdAt: Date.now() / 1000,
+      status: "queued",
+      stage: "queued",
+      progress: 0,
+      result: [],
+      error: "",
+    });
+    return { taskId: demoStore.tasks[0].taskId, status: "queued" };
+  }
   const response = await fetch("/api/history/retry", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -162,11 +440,14 @@ function formatSubscriptionScanSummary(payload) {
   const scannedCount = Number(payload.scannedCount ?? 1);
   const foundCount = Number(payload.foundCount ?? 0);
   const queuedCount = Number(payload.queuedCount ?? 0);
+  const pendingCount = Number(payload.pendingCount ?? 0);
   const skippedCompletedCount = Number(payload.skippedCompletedCount ?? 0);
   const skippedActiveCount = Number(payload.skippedActiveCount ?? 0);
+  const skippedIgnoredCount = Number(payload.skippedIgnoredCount ?? 0);
+  const skippedImportedCount = Number(payload.skippedImportedCount ?? 0);
   const errorCount = Number(payload.errorCount ?? 0);
 
-  return `扫描 ${scannedCount} 个订阅，发现 ${foundCount} 个专辑，入队 ${queuedCount} 个，历史跳过 ${skippedCompletedCount} 个，队列跳过 ${skippedActiveCount} 个，错误 ${errorCount} 个`;
+  return `扫描 ${scannedCount} 个订阅，发现 ${foundCount} 个专辑，待确认 ${pendingCount} 个，入队 ${queuedCount} 个，历史跳过 ${skippedCompletedCount} 个，队列跳过 ${skippedActiveCount} 个，忽略 ${skippedIgnoredCount} 个，已导入 ${skippedImportedCount} 个，错误 ${errorCount} 个`;
 }
 
 
@@ -175,8 +456,11 @@ function getSingleSubscriptionScanPayload(payload) {
     scannedCount: 1,
     foundCount: payload.foundCount || 0,
     queuedCount: payload.queuedCount || 0,
+    pendingCount: payload.pendingCount || 0,
     skippedCompletedCount: payload.skippedCompletedCount || 0,
     skippedActiveCount: payload.skippedActiveCount || 0,
+    skippedIgnoredCount: payload.skippedIgnoredCount || 0,
+    skippedImportedCount: payload.skippedImportedCount || 0,
     errorCount: payload.errorCount || 0,
   };
 }
@@ -192,7 +476,68 @@ function escapeHtml(value) {
 }
 
 
+function normalizeHistoryStatus(status) {
+  const normalized = String(status || "").trim().toLowerCase();
+  return ["completed", "failed", "running", "queued"].includes(normalized) ? normalized : "unknown";
+}
+
+
+function formatAlbumTitleFromUrl(url) {
+  const rawUrl = String(url || "").trim();
+  if (!rawUrl) {
+    return "";
+  }
+  let pathname = "";
+  try {
+    pathname = new URL(rawUrl).pathname;
+  } catch {
+    pathname = rawUrl.split("?")[0];
+  }
+  const parts = pathname.split("/").filter(Boolean);
+  const albumIndex = parts.indexOf("album");
+  const slug = albumIndex >= 0 ? parts[albumIndex + 1] : "";
+  if (!slug) {
+    return "";
+  }
+  return decodeURIComponent(slug)
+    .split("-")
+    .filter(Boolean)
+    .map((word) => word ? `${word.charAt(0).toUpperCase()}${word.slice(1)}` : "")
+    .join(" ");
+}
+
+
+function getTaskAlbumName(task) {
+  if (!task) {
+    return "";
+  }
+  if (task.albumName) {
+    return String(task.albumName);
+  }
+  if (Array.isArray(task.result) && task.result.length > 0 && task.result[0]?.album) {
+    return String(task.result[0].album);
+  }
+  return formatAlbumTitleFromUrl(task.url);
+}
+
+
 async function searchArtists(term) {
+  if (state.demoMode) {
+    return [
+      {
+        artistId: "159260351",
+        storefront: "us",
+        artistName: term || "Taylor Swift",
+        artistUrl: "https://music.apple.com/us/artist/taylor-swift/159260351",
+      },
+      {
+        artistId: "471744",
+        storefront: "cn",
+        artistName: "陈奕迅",
+        artistUrl: "https://music.apple.com/cn/artist/eason-chan/471744",
+      },
+    ];
+  }
   const response = await fetch("/api/subscriptions/search", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -207,6 +552,41 @@ async function searchArtists(term) {
 
 
 async function createSubscription(payload) {
+  if (state.demoMode) {
+    const id = Date.now();
+    demoStore.subscriptions.unshift({
+      id,
+      artistId: payload.artistId || String(id),
+      storefront: payload.storefront || "cn",
+      artistName: payload.artistName || "Demo Artist",
+      artistUrl: payload.artistUrl || "",
+      enabled: true,
+      newAlbumPolicy: "confirm",
+      albumCount: 0,
+      pendingAlbumCount: 0,
+      activeAlbumCount: 0,
+      completedAlbumCount: 0,
+      failedAlbumCount: 0,
+      ignoredAlbumCount: 0,
+      importedAlbumCount: 0,
+      lastCheckedAt: "",
+      lastError: "",
+      recentAlbums: [],
+    });
+    return {
+      subscription: demoStore.subscriptions[0],
+      scan: {
+        foundCount: 3,
+        queuedCount: 0,
+        pendingCount: 3,
+        skippedCompletedCount: 2,
+        skippedActiveCount: 0,
+        skippedIgnoredCount: 0,
+        skippedImportedCount: 0,
+        errorCount: 0,
+      },
+    };
+  }
   const response = await fetch("/api/subscriptions", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -221,6 +601,9 @@ async function createSubscription(payload) {
 
 
 async function fetchSubscriptions() {
+  if (state.demoMode) {
+    return cloneDemo(demoStore.subscriptions);
+  }
   const response = await fetch("/api/subscriptions");
   if (!response.ok) {
     return [];
@@ -230,6 +613,19 @@ async function fetchSubscriptions() {
 
 
 async function scanSubscription(subscriptionId) {
+  if (state.demoMode) {
+    return {
+      subscriptionId,
+      foundCount: 4,
+      queuedCount: 0,
+      pendingCount: 1,
+      skippedCompletedCount: 2,
+      skippedActiveCount: 0,
+      skippedIgnoredCount: 1,
+      skippedImportedCount: 0,
+      errorCount: 0,
+    };
+  }
   const response = await fetch(`/api/subscriptions/${subscriptionId}/scan`, {
     method: "POST"
   });
@@ -242,6 +638,19 @@ async function scanSubscription(subscriptionId) {
 
 
 async function scanAllSubscriptions() {
+  if (state.demoMode) {
+    return {
+      scannedCount: demoStore.subscriptions.length,
+      foundCount: 8,
+      queuedCount: 2,
+      pendingCount: 2,
+      skippedCompletedCount: 5,
+      skippedActiveCount: 1,
+      skippedIgnoredCount: 1,
+      skippedImportedCount: 1,
+      errorCount: 0,
+    };
+  }
   const response = await fetch("/api/subscriptions/scan", {
     method: "POST"
   });
@@ -253,7 +662,87 @@ async function scanAllSubscriptions() {
 }
 
 
+async function updateSubscriptionPolicy(subscriptionId, newAlbumPolicy) {
+  if (state.demoMode) {
+    const subscription = demoStore.subscriptions.find((item) => String(item.id) === String(subscriptionId));
+    if (subscription) {
+      subscription.newAlbumPolicy = newAlbumPolicy === "auto" ? "auto" : "confirm";
+    }
+    return { subscription };
+  }
+  const response = await fetch(`/api/subscriptions/${subscriptionId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ newAlbumPolicy })
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.error || "策略更新失败")
+  }
+  return payload;
+}
+
+
+async function applySubscriptionAlbumAction(subscriptionId, albumIds, action) {
+  const normalizedAlbumIds = Array.isArray(albumIds) ? albumIds : [albumIds];
+  if (state.demoMode) {
+    const subscription = demoStore.subscriptions.find((item) => String(item.id) === String(subscriptionId));
+    const updatedAlbumIds = [];
+    let queuedCount = 0;
+    if (subscription && Array.isArray(subscription.recentAlbums)) {
+      for (const album of subscription.recentAlbums) {
+        if (!normalizedAlbumIds.includes(String(album.albumId))) {
+          continue;
+        }
+        if (action === "download") {
+          album.userState = "subscribed";
+          album.detectedStatus = "queued";
+          album.status = "queued";
+          queuedCount += 1;
+        } else if (action === "ignore") {
+          album.userState = "ignored";
+        } else if (action === "mark_imported") {
+          album.userState = "imported";
+        } else if (action === "pending") {
+          album.userState = "pending";
+        }
+        updatedAlbumIds.push(String(album.albumId));
+      }
+    }
+    return {
+      action,
+      updatedCount: updatedAlbumIds.length,
+      updatedAlbumIds,
+      queuedCount,
+      pendingCount: 0,
+      skippedCompletedCount: 0,
+      skippedActiveCount: 0,
+      skippedIgnoredCount: 0,
+      skippedImportedCount: 0,
+      errorCount: 0,
+    };
+  }
+  const response = await fetch(`/api/subscriptions/${subscriptionId}/albums/actions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ albumIds: normalizedAlbumIds, action })
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.error || "专辑操作失败")
+  }
+  return payload;
+}
+
+
 async function deleteSubscription(subscriptionId) {
+  if (state.demoMode) {
+    const index = demoStore.subscriptions.findIndex((item) => String(item.id) === String(subscriptionId));
+    if (index >= 0) {
+      demoStore.subscriptions.splice(index, 1);
+    }
+    return { deleted: true };
+  }
   const response = await fetch(`/api/subscriptions/${subscriptionId}`, {
     method: "DELETE"
   });
@@ -316,6 +805,119 @@ function setSubmissionNote(message) {
 }
 
 
+function getDemoTasks() {
+  return cloneDemo(demoStore.tasks);
+}
+
+
+function getDemoTask(taskId) {
+  return demoStore.tasks.find((task) => task.taskId === taskId) || null;
+}
+
+
+function getDemoResult(task) {
+  if (!task || task.status === "queued") {
+    return [];
+  }
+  if (task.result && task.result.length > 0) {
+    return task.result;
+  }
+  if (task.status === "failed") {
+    return [];
+  }
+  return [
+    {
+      song: "Demo Track",
+      artist: "Demo Artist",
+      album: "Demo Album",
+      path: "C:\\downloads\\completed\\Demo Artist\\Demo Album\\01 Demo Track.flac",
+    },
+  ];
+}
+
+
+function setDemoLogs(task) {
+  const logs = document.getElementById("logs-output");
+  const progress = Number(task?.progress || 0);
+  const visibleLogs = [
+    "[demo] 本地预览模式已启用，不会提交真实下载任务",
+    `[demo] 当前任务: ${task?.url || "-"}`,
+    ...DEMO_LOG_LINES.slice(0, Math.max(2, Math.ceil(progress / 18))),
+  ];
+  state.logLines = visibleLogs;
+  state.pendingLogLines = [];
+  logs.textContent = `${visibleLogs.join("\n")}\n`;
+  logs.scrollTop = logs.scrollHeight;
+}
+
+
+function applyDemoTaskSnapshot(taskId) {
+  const task = getDemoTask(taskId);
+  if (!task) {
+    clearTaskDetails();
+    return;
+  }
+  document.getElementById("current-url").textContent = task.url;
+  setStage(task.stage);
+  setProgress(Number(task.progress || 0));
+  setStatus(task.status, task.error || task.stage || "");
+  renderResult(getDemoResult(task));
+  setDemoLogs(task);
+}
+
+
+function advanceDemoTask() {
+  const task = demoStore.tasks.find((item) => item.status === "running");
+  if (!task) {
+    return;
+  }
+  task.progress = Math.min(96, Number(task.progress || 0) + 3);
+  if (task.progress >= 90) {
+    task.stage = "building_nfo";
+  } else if (task.progress >= 72) {
+    task.stage = "post_processing";
+  } else {
+    task.stage = "downloading";
+  }
+  if (task.taskId === state.selectedTaskId) {
+    applyDemoTaskSnapshot(task.taskId);
+  }
+}
+
+
+function submitDemoTask(url, force) {
+  const task = {
+    taskId: `demo-${Date.now()}`,
+    url,
+    codec: "alac",
+    source: "web",
+    createdAt: Date.now() / 1000,
+    status: demoStore.tasks.some((item) => item.status === "running") ? "queued" : "running",
+    stage: demoStore.tasks.some((item) => item.status === "running") ? "queued" : "downloading",
+    progress: 0,
+    result: [],
+    error: "",
+  };
+  demoStore.tasks.unshift(task);
+  state.manualSelection = false;
+  selectTask(task.taskId, false);
+  setSubmissionNote(force ? "Demo：已模拟创建强制下载任务" : "Demo：已模拟创建下载任务");
+  document.getElementById("url-input").value = "";
+  refreshTaskList().catch(() => {});
+}
+
+
+function startDemoSimulation() {
+  if (state.demoPoller) {
+    window.clearInterval(state.demoPoller);
+  }
+  state.demoPoller = window.setInterval(() => {
+    advanceDemoTask();
+    refreshTaskList().catch(() => {});
+  }, 1800);
+}
+
+
 function getTaskSummaryCounts(tasks) {
   return {
     activeCount: tasks.filter((task) => task.status === "running").length,
@@ -334,9 +936,9 @@ function renderResult(result) {
   }
   container.innerHTML = result.map((item) => `
     <article class="result-item">
-      <strong>${item.song || "未知歌曲"}</strong>
-      <p>${item.artist || "未知歌手"} · ${item.album || "未知专辑"}</p>
-      <p class="result-path">${item.path || ""}</p>
+      <strong>${escapeHtml(item.song || "未知歌曲")}</strong>
+      <p>${escapeHtml(item.artist || "未知歌手")} · ${escapeHtml(item.album || "未知专辑")}</p>
+      <p class="result-path">${escapeHtml(item.path || "")}</p>
     </article>
   `).join("");
 }
@@ -425,6 +1027,11 @@ function selectTask(taskId, manualSelection = false) {
     state.manualSelection = true;
   }
   renderSelectedTask();
+  if (state.demoMode) {
+    closeStream();
+    applyDemoTaskSnapshot(taskId);
+    return;
+  }
   if (shouldOpenNewStream(state.streamTaskId, taskId) || isNewSelection) {
     document.getElementById("logs-output").textContent = "";
     resetLogState();
@@ -454,19 +1061,24 @@ function renderTaskList(tasks) {
     return;
   }
 
-  container.innerHTML = tasks.map((task) => `
-    <button type="button" class="task-item${task.taskId === state.selectedTaskId ? " selected" : ""}" data-task-id="${task.taskId}">
-      <div class="task-item-top">
-        <span class="badge task-source ${task.source === "telegram" ? "telegram" : task.source === "subscription" ? "subscription" : "web"}">${task.source}</span>
-        <span class="task-progress">${Number(task.progress || 0)}%</span>
-      </div>
-      <p class="task-url">${task.url || "-"}</p>
-      <div class="task-meta-row">
-        <span>${task.status || "pending"}</span>
-        <span>${task.stage || "idle"}</span>
-      </div>
-    </button>
-  `).join("");
+  container.innerHTML = tasks.map((task) => {
+    const source = task.source === "telegram" ? "telegram" : task.source === "subscription" ? "subscription" : "web";
+    const albumName = getTaskAlbumName(task) || "未知专辑";
+    return `
+      <button type="button" class="task-item${task.taskId === state.selectedTaskId ? " selected" : ""}" data-task-id="${escapeHtml(task.taskId || "")}">
+        <div class="task-item-top">
+          <span class="badge task-source ${source}">${escapeHtml(task.source || source)}</span>
+          <span class="task-progress">${Number(task.progress || 0)}%</span>
+        </div>
+        <strong class="task-album-title">${escapeHtml(albumName)}</strong>
+        <p class="task-url">${escapeHtml(task.url || "-")}</p>
+        <div class="task-meta-row">
+          <span>${escapeHtml(task.status || "pending")}</span>
+          <span>${escapeHtml(task.stage || "idle")}</span>
+        </div>
+      </button>
+    `;
+  }).join("");
 
   for (const item of container.querySelectorAll(".task-item")) {
     item.addEventListener("click", () => {
@@ -482,6 +1094,27 @@ function getAutoSelectedTask(tasks) {
 
 
 async function refreshTaskList() {
+  if (state.demoMode) {
+    const tasks = getDemoTasks();
+    updateSummaryFromTasks(tasks);
+    renderTaskList(tasks);
+
+    if (!state.manualSelection) {
+      const preferredTask = getAutoSelectedTask(tasks);
+      if (preferredTask && preferredTask.taskId) {
+        selectTask(preferredTask.taskId, false);
+        return;
+      }
+    }
+
+    if (state.selectedTaskId && !tasks.some((task) => task.taskId === state.selectedTaskId)) {
+      state.selectedTaskId = "";
+      state.manualSelection = false;
+      clearTaskDetails();
+    }
+    return;
+  }
+
   const response = await fetch("/api/tasks");
   if (!response.ok) {
     return;
@@ -513,16 +1146,21 @@ function renderHistoryList(records) {
     container.innerHTML = '<p class="empty-text">暂无历史</p>';
     return;
   }
-  container.innerHTML = records.map((record) => `
-    <div class="history-item${record.status === "failed" ? " history-failed" : ""}">
-      <div class="history-item-top">
-        <span class="badge history-status ${record.status}">${record.status}</span>
-        ${record.status === "failed" ? `<button type="button" class="secondary-button history-retry-btn" data-url="${record.url}">重试</button>` : ""}
+  container.innerHTML = records.map((record) => {
+    const status = normalizeHistoryStatus(record.status);
+    const rawStatus = record.status || "-";
+    const url = record.url || "-";
+    return `
+      <div class="history-item${status === "failed" ? " history-failed" : ""}">
+        <div class="history-item-top">
+          <span class="badge history-status ${status}">${escapeHtml(rawStatus)}</span>
+          ${status === "failed" ? `<button type="button" class="secondary-button history-retry-btn" data-url="${escapeHtml(url)}">重试</button>` : ""}
+        </div>
+        <p class="history-url">${escapeHtml(url)}</p>
+        <p class="history-updated">${escapeHtml(record.updated_at || "-")}</p>
       </div>
-      <p class="history-url">${record.url || "-"}</p>
-      <p class="history-updated">${record.updated_at || "-"}</p>
-    </div>
-  `).join("");
+    `;
+  }).join("");
 
   for (const btn of container.querySelectorAll(".history-retry-btn")) {
     btn.addEventListener("click", () => {
@@ -536,6 +1174,10 @@ function renderHistoryList(records) {
 
 
 async function refreshHistoryList() {
+  if (state.demoMode) {
+    renderHistoryList(cloneDemo(demoStore.history));
+    return;
+  }
   const response = await fetch("/api/history");
   if (!response.ok) {
     return;
@@ -590,6 +1232,163 @@ function renderArtistSearchResults(results) {
 }
 
 
+function normalizeAlbumStatus(status) {
+  const normalized = String(status || "seen").toLowerCase();
+  return ["completed", "running", "queued", "failed", "seen", "missing", "failed_history", "stale_history"].includes(normalized) ? normalized : "seen";
+}
+
+
+function normalizeAlbumUserState(userState) {
+  const normalized = String(userState || "subscribed").toLowerCase();
+  return ["pending", "subscribed", "ignored", "imported"].includes(normalized) ? normalized : "subscribed";
+}
+
+
+function getAlbumDetectedStatus(album) {
+  return normalizeAlbumStatus(album?.detectedStatus || album?.status || "seen");
+}
+
+
+function getAlbumStatusLabel(status) {
+  const labels = {
+    completed: "已完成",
+    running: "下载中",
+    queued: "队列中",
+    failed: "失败",
+    failed_history: "失败历史",
+    stale_history: "历史不可用",
+    missing: "待处理",
+    seen: "已记录",
+  };
+  return labels[normalizeAlbumStatus(status)] || "已记录";
+}
+
+
+function getAlbumUserStateLabel(userState) {
+  const labels = {
+    pending: "待确认",
+    subscribed: "已确认",
+    ignored: "已忽略",
+    imported: "已导入",
+  };
+  return labels[normalizeAlbumUserState(userState)] || "已确认";
+}
+
+
+function canDownloadAlbum(album) {
+  if (album?.canDownload === true) {
+    return true;
+  }
+  const detectedStatus = getAlbumDetectedStatus(album);
+  const userState = normalizeAlbumUserState(album?.userState);
+  return ["missing", "failed_history", "stale_history"].includes(detectedStatus) && !["ignored", "imported"].includes(userState);
+}
+
+
+function canRestoreAlbum(album) {
+  return ["ignored", "imported"].includes(normalizeAlbumUserState(album?.userState));
+}
+
+
+function formatSubscriptionActionSummary(payload) {
+  const action = String(payload.action || "");
+  const updatedCount = Number(payload.updatedCount || 0);
+  if (action === "download") {
+    return formatSubscriptionScanSummary(getSingleSubscriptionScanPayload(payload));
+  }
+  const labels = {
+    ignore: "已忽略",
+    mark_imported: "已标记导入",
+    pending: "已恢复待确认",
+  };
+  return `${labels[action] || "已更新"} ${updatedCount} 个专辑`;
+}
+
+
+function compareAlbumsByReleaseDateDesc(left, right) {
+  const leftDate = String(left?.releaseDate || "");
+  const rightDate = String(right?.releaseDate || "");
+  if (leftDate && rightDate && leftDate !== rightDate) {
+    return rightDate.localeCompare(leftDate);
+  }
+  if (leftDate && !rightDate) {
+    return -1;
+  }
+  if (!leftDate && rightDate) {
+    return 1;
+  }
+  const leftUpdated = String(left?.updatedAt || "");
+  const rightUpdated = String(right?.updatedAt || "");
+  if (leftUpdated !== rightUpdated) {
+    return rightUpdated.localeCompare(leftUpdated);
+  }
+  return String(right?.albumId || "").localeCompare(String(left?.albumId || ""));
+}
+
+
+function renderSubscriptionAlbums(subscription) {
+  const albums = subscription.recentAlbums;
+  if (!Array.isArray(albums) || albums.length === 0) {
+    return '<p class="subscription-album-empty">暂无已记录专辑，扫描后显示。</p>';
+  }
+  const sortedAlbums = [...albums].sort(compareAlbumsByReleaseDateDesc);
+  const pendingAlbums = sortedAlbums.filter((album) => normalizeAlbumUserState(album.userState) === "pending" && canDownloadAlbum(album));
+  const bulkActions = pendingAlbums.length > 0 ? `
+    <div class="subscription-album-bulk">
+      <span>待确认 ${pendingAlbums.length}</span>
+      <button type="button" class="secondary-button subscription-bulk-action-btn" data-subscription-id="${subscription.id}" data-action="download">批量下载</button>
+      <button type="button" class="secondary-button subscription-bulk-action-btn" data-subscription-id="${subscription.id}" data-action="ignore">批量忽略</button>
+      <button type="button" class="secondary-button subscription-bulk-action-btn" data-subscription-id="${subscription.id}" data-action="mark_imported">批量已导入</button>
+    </div>
+  ` : "";
+  const items = sortedAlbums.map((album) => {
+    const detectedStatus = getAlbumDetectedStatus(album);
+    const userState = normalizeAlbumUserState(album.userState);
+    const albumTitle = album.albumName || formatAlbumTitleFromUrl(album.albumUrl) || album.albumId || "未知专辑";
+    const releaseDate = album.releaseDate ? `<span>${escapeHtml(album.releaseDate)}</span>` : "";
+    const albumUrl = album.albumUrl || "";
+    const selectable = userState === "pending" && canDownloadAlbum(album);
+    const downloadable = canDownloadAlbum(album);
+    const actions = [];
+    if (downloadable) {
+      actions.push(`<button type="button" class="secondary-button compact-button subscription-album-action-btn" data-subscription-id="${subscription.id}" data-album-id="${escapeHtml(album.albumId || "")}" data-action="download">下载</button>`);
+      if (album.canIgnore !== false && userState !== "ignored") {
+        actions.push(`<button type="button" class="secondary-button compact-button subscription-album-action-btn" data-subscription-id="${subscription.id}" data-album-id="${escapeHtml(album.albumId || "")}" data-action="ignore">忽略</button>`);
+      }
+      if (album.canMarkImported !== false && userState !== "imported") {
+        actions.push(`<button type="button" class="secondary-button compact-button subscription-album-action-btn" data-subscription-id="${subscription.id}" data-album-id="${escapeHtml(album.albumId || "")}" data-action="mark_imported">已导入</button>`);
+      }
+    }
+    if (canRestoreAlbum(album)) {
+      actions.push(`<button type="button" class="secondary-button compact-button subscription-album-action-btn" data-subscription-id="${subscription.id}" data-album-id="${escapeHtml(album.albumId || "")}" data-action="pending">恢复待确认</button>`);
+    }
+    return `
+      <li class="subscription-album-item">
+        <label class="subscription-album-check">
+          <input type="checkbox" class="subscription-album-select" data-subscription-id="${subscription.id}" data-album-id="${escapeHtml(album.albumId || "")}" ${selectable ? "" : "disabled"}>
+        </label>
+        <div class="subscription-album-main">
+          ${albumUrl ? `<a href="${escapeHtml(albumUrl)}" target="_blank" rel="noreferrer">${escapeHtml(albumTitle)}</a>` : `<strong>${escapeHtml(albumTitle)}</strong>`}
+          <p>${releaseDate}<span>ID ${escapeHtml(album.albumId || "-")}</span></p>
+        </div>
+        <div class="subscription-album-state">
+          <span class="badge album-status album-status-${detectedStatus}">${escapeHtml(getAlbumStatusLabel(detectedStatus))}</span>
+          <span class="badge album-user-state album-user-state-${userState}">${escapeHtml(getAlbumUserStateLabel(userState))}</span>
+        </div>
+        <div class="subscription-album-actions">${actions.join("")}</div>
+      </li>
+    `;
+  }).join("");
+  return `
+    <div class="subscription-albums">
+      <div class="subscription-albums-title">全部已记录专辑 · ${sortedAlbums.length}</div>
+      ${bulkActions}
+      <ul>${items}</ul>
+    </div>
+  `;
+}
+
+
 function renderSubscriptionList(subscriptions) {
   const container = document.getElementById("subscription-list");
   if (!Array.isArray(subscriptions) || subscriptions.length === 0) {
@@ -603,21 +1402,67 @@ function renderSubscriptionList(subscriptions) {
           <strong>${escapeHtml(subscription.artistName || "未知歌手")}</strong>
           <p>${escapeHtml((subscription.storefront || "").toUpperCase())} · ${escapeHtml(subscription.artistId || "")}</p>
         </div>
-        <span class="badge subscription-status">${subscription.enabled ? "enabled" : "disabled"}</span>
+        <div class="subscription-policy-wrap">
+          <span class="badge subscription-status">${subscription.enabled ? "enabled" : "disabled"}</span>
+          <select class="subscription-policy-select" data-subscription-id="${subscription.id}" aria-label="新专辑策略">
+            <option value="confirm" ${subscription.newAlbumPolicy === "confirm" ? "selected" : ""}>待确认</option>
+            <option value="auto" ${subscription.newAlbumPolicy === "auto" ? "selected" : ""}>自动下载</option>
+          </select>
+        </div>
       </div>
       <div class="subscription-stats">
         <span>专辑 ${Number(subscription.albumCount || 0)}</span>
+        <span>待确认 ${Number(subscription.pendingAlbumCount || 0)}</span>
         <span>进行中 ${Number(subscription.activeAlbumCount || 0)}</span>
         <span>已完成 ${Number(subscription.completedAlbumCount || 0)}</span>
+        <span>失败 ${Number(subscription.failedAlbumCount || 0)}</span>
+        <span>忽略 ${Number(subscription.ignoredAlbumCount || 0)}</span>
+        <span>已导入 ${Number(subscription.importedAlbumCount || 0)}</span>
       </div>
       <p class="history-updated">上次扫描：${escapeHtml(subscription.lastCheckedAt || "未扫描")}</p>
       ${subscription.lastError ? `<p class="subscription-error-line">${escapeHtml(subscription.lastError)}</p>` : ""}
+      ${renderSubscriptionAlbums(subscription)}
       <div class="subscription-actions">
         <button type="button" class="secondary-button subscription-scan-btn" data-subscription-id="${subscription.id}">扫描</button>
         <button type="button" class="secondary-button subscription-delete-btn" data-subscription-id="${subscription.id}">删除</button>
       </div>
     </div>
   `).join("");
+
+  for (const select of container.querySelectorAll(".subscription-policy-select")) {
+    select.addEventListener("change", () => {
+      handleUpdateSubscriptionPolicy(select.dataset.subscriptionId || "", select.value).catch((error) => {
+        setSubscriptionError(error.message || "策略更新失败");
+      });
+    });
+  }
+
+  for (const btn of container.querySelectorAll(".subscription-album-action-btn")) {
+    btn.addEventListener("click", () => {
+      handleSubscriptionAlbumAction(
+        btn.dataset.subscriptionId || "",
+        [btn.dataset.albumId || ""],
+        btn.dataset.action || "",
+      ).catch((error) => {
+        setSubscriptionError(error.message || "专辑操作失败");
+      });
+    });
+  }
+
+  for (const btn of container.querySelectorAll(".subscription-bulk-action-btn")) {
+    btn.addEventListener("click", () => {
+      const subscriptionId = btn.dataset.subscriptionId || "";
+      const item = btn.closest(".subscription-item");
+      const selectedAlbumIds = item ? [...item.querySelectorAll(".subscription-album-select:checked")].map((input) => input.dataset.albumId || "").filter(Boolean) : [];
+      if (selectedAlbumIds.length === 0) {
+        setSubscriptionError("请先选择待确认专辑");
+        return;
+      }
+      handleSubscriptionAlbumAction(subscriptionId, selectedAlbumIds, btn.dataset.action || "").catch((error) => {
+        setSubscriptionError(error.message || "批量操作失败");
+      });
+    });
+  }
 
   for (const btn of container.querySelectorAll(".subscription-scan-btn")) {
     btn.addEventListener("click", () => {
@@ -640,6 +1485,10 @@ function renderSubscriptionList(subscriptions) {
 
 
 async function refreshSubscriptionList() {
+  if (state.demoMode) {
+    renderSubscriptionList(cloneDemo(demoStore.subscriptions));
+    return;
+  }
   const subscriptions = await fetchSubscriptions();
   renderSubscriptionList(subscriptions);
 }
@@ -703,6 +1552,26 @@ async function handleScanAllSubscriptions() {
 }
 
 
+async function handleUpdateSubscriptionPolicy(subscriptionId, newAlbumPolicy) {
+  setSubscriptionError("");
+  setSubscriptionNote("");
+  await updateSubscriptionPolicy(subscriptionId, newAlbumPolicy);
+  setSubscriptionNote(newAlbumPolicy === "auto" ? "新专辑策略已切换为自动下载" : "新专辑策略已切换为待确认");
+  await refreshSubscriptionList();
+}
+
+
+async function handleSubscriptionAlbumAction(subscriptionId, albumIds, action) {
+  setSubscriptionError("");
+  setSubscriptionNote("");
+  const payload = await applySubscriptionAlbumAction(subscriptionId, albumIds, action);
+  setSubscriptionNote(formatSubscriptionActionSummary(payload));
+  await refreshSubscriptionList();
+  await refreshTaskList();
+  await refreshHistoryList();
+}
+
+
 async function handleDeleteSubscription(subscriptionId) {
   setSubscriptionError("");
   await deleteSubscription(subscriptionId);
@@ -736,6 +1605,11 @@ async function submitTask(event) {
 
   const url = document.getElementById("url-input").value.trim();
   const force = document.getElementById("force-checkbox").checked;
+
+  if (state.demoMode) {
+    submitDemoTask(url, force);
+    return;
+  }
 
   const response = await fetch("/api/downloads", {
     method: "POST",
@@ -809,6 +1683,14 @@ function startSubscriptionPolling() {
 
 
 if (typeof document !== "undefined") {
+  state.demoMode = isDemoModeEnabled();
+  if (state.demoMode) {
+    document.body.classList.add("demo-mode");
+  }
+  bindViewNavigation();
+  bindSidebarToggle();
+  showView(getInitialViewName(), false);
+
   document.getElementById("download-form").addEventListener("submit", (event) => {
     submitTask(event).catch(() => {
       document.getElementById("form-error").textContent = "提交失败";
@@ -852,20 +1734,38 @@ if (typeof document !== "undefined") {
   startTaskPolling();
   startHistoryPolling();
   startSubscriptionPolling();
+  if (state.demoMode) {
+    startDemoSimulation();
+  }
 }
 
 if (typeof module !== "undefined") {
   module.exports = {
+    bindViewNavigation,
+    bindSidebarToggle,
+    compareAlbumsByReleaseDateDesc,
     formatSubscriptionScanSummary,
+    formatSubscriptionActionSummary,
     formatHistoryRetrySummary,
+    formatAlbumTitleFromUrl,
     formatRetryFailedSummary,
+    getAlbumDetectedStatus,
+    getAlbumStatusLabel,
+    getAlbumUserStateLabel,
+    getTaskAlbumName,
+    getInitialViewName,
     getSingleSubscriptionScanPayload,
     getTaskSummaryCounts,
     isTerminalTaskStatus,
     mergeLogLines,
+    normalizeHistoryStatus,
+    renderHistoryList,
+    renderResult,
     retryFailedTasks,
     retryHistoryFailedTasks,
     retrySingleHistory,
+    setSidebarCollapsed,
+    showView,
     shouldOpenNewStream,
   };
 }

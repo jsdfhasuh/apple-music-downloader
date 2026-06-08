@@ -2,18 +2,180 @@ const test = require("node:test")
 const assert = require("node:assert/strict")
 
 const {
+  bindViewNavigation,
+  bindSidebarToggle,
+  compareAlbumsByReleaseDateDesc,
+  formatAlbumTitleFromUrl,
   formatSubscriptionScanSummary,
   formatHistoryRetrySummary,
   formatRetryFailedSummary,
+  getTaskAlbumName,
+  getInitialViewName,
   getSingleSubscriptionScanPayload,
   getTaskSummaryCounts,
   isTerminalTaskStatus,
   mergeLogLines,
+  normalizeHistoryStatus,
+  renderHistoryList,
+  renderResult,
   retryFailedTasks,
   retryHistoryFailedTasks,
   retrySingleHistory,
+  setSidebarCollapsed,
+  showView,
   shouldOpenNewStream,
 } = require("../static/app.js")
+
+function createFakePanel(view) {
+  return {
+    dataset: { view },
+    hidden: false,
+  }
+}
+
+function createFakeNavLink(viewTarget) {
+  const listeners = {}
+  return {
+    dataset: { viewTarget },
+    listeners,
+    classList: {
+      classes: new Set(),
+      toggle(className, active) {
+        if (active) {
+          this.classes.add(className)
+        } else {
+          this.classes.delete(className)
+        }
+      },
+    },
+    addEventListener(eventName, handler) {
+      listeners[eventName] = handler
+    },
+  }
+}
+
+function withFakeNavigationDom(callback) {
+  const originalDocument = global.document
+  const originalWindow = global.window
+  const panels = ["console", "queue", "subscriptions", "history"].map(createFakePanel)
+  const links = ["console", "queue", "subscriptions", "history"].map(createFakeNavLink)
+  const hashListeners = {}
+  const replaceStateCalls = []
+
+  global.document = {
+    querySelectorAll(selector) {
+      if (selector === ".view-panel") {
+        return panels
+      }
+      if (selector === ".nav-link[data-view-target]") {
+        return links
+      }
+      return []
+    },
+  }
+  global.window = {
+    location: { hash: "#console" },
+    history: {
+      replaceState(_state, _title, hash) {
+        replaceStateCalls.push(hash)
+        global.window.location.hash = hash
+      },
+    },
+    addEventListener(eventName, handler) {
+      hashListeners[eventName] = handler
+    },
+  }
+
+  try {
+    return callback({ panels, links, hashListeners, replaceStateCalls })
+  } finally {
+    global.document = originalDocument
+    global.window = originalWindow
+  }
+}
+
+function createFakeClassList() {
+  const classes = new Set()
+  return {
+    classes,
+    contains(className) {
+      return classes.has(className)
+    },
+    toggle(className, active) {
+      if (active) {
+        classes.add(className)
+      } else {
+        classes.delete(className)
+      }
+    },
+  }
+}
+
+function withFakeSidebarDom(callback) {
+  const originalDocument = global.document
+  const originalWindow = global.window
+  const storage = { "amd-sidebar-collapsed": "1" }
+  const toggleListeners = {}
+  const toggleAttributes = {}
+  const toggle = {
+    listeners: toggleListeners,
+    attributes: toggleAttributes,
+    addEventListener(eventName, handler) {
+      toggleListeners[eventName] = handler
+    },
+    setAttribute(name, value) {
+      toggleAttributes[name] = value
+    },
+  }
+
+  global.document = {
+    body: {
+      classList: createFakeClassList(),
+    },
+    getElementById(id) {
+      return id === "sidebar-toggle" ? toggle : null
+    },
+  }
+  global.window = {
+    localStorage: {
+      getItem(key) {
+        return storage[key] || null
+      },
+      setItem(key, value) {
+        storage[key] = value
+      },
+    },
+  }
+
+  try {
+    return callback({ storage, toggle })
+  } finally {
+    global.document = originalDocument
+    global.window = originalWindow
+  }
+}
+
+function withFakeElement(id, callback) {
+  const originalDocument = global.document
+  const element = {
+    innerHTML: "",
+    querySelectorAll() {
+      return []
+    },
+  }
+
+  global.document = {
+    getElementById(candidate) {
+      return candidate === id ? element : null
+    },
+  }
+
+  try {
+    return callback(element)
+  } finally {
+    global.document = originalDocument
+  }
+}
 
 test("isTerminalTaskStatus returns true for completed and failed", () => {
   assert.equal(isTerminalTaskStatus("completed"), true)
@@ -55,6 +217,141 @@ test("getTaskSummaryCounts separates queued and running", () => {
   })
 })
 
+test("formatAlbumTitleFromUrl humanizes Apple Music album slug", () => {
+  assert.equal(
+    formatAlbumTitleFromUrl("https://music.apple.com/cn/album/hit-me-hard-and-soft/1739659134?l=en"),
+    "Hit Me Hard And Soft"
+  )
+})
+
+test("getTaskAlbumName prefers explicit album name before URL fallback", () => {
+  assert.equal(
+    getTaskAlbumName({
+      albumName: "Explicit Album",
+      url: "https://music.apple.com/cn/album/url-album/1",
+    }),
+    "Explicit Album"
+  )
+  assert.equal(
+    getTaskAlbumName({
+      result: [{ album: "Result Album" }],
+      url: "https://music.apple.com/cn/album/url-album/1",
+    }),
+    "Result Album"
+  )
+  assert.equal(
+    getTaskAlbumName({
+      url: "https://music.apple.com/cn/album/url-album/1",
+    }),
+    "Url Album"
+  )
+})
+
+test("renderResult escapes downloader metadata", () => {
+  withFakeElement("result-list", (element) => {
+    renderResult([
+      {
+        song: '<img src=x onerror="alert(1)">',
+        artist: "<b>Artist</b>",
+        album: "Album & Friends",
+        path: 'C:\\tmp\\" onclick="alert(1)',
+      },
+    ])
+
+    assert.match(element.innerHTML, /&lt;img src=x onerror=&quot;alert\(1\)&quot;&gt;/)
+    assert.match(element.innerHTML, /&lt;b&gt;Artist&lt;\/b&gt;/)
+    assert.match(element.innerHTML, /Album &amp; Friends/)
+    assert.doesNotMatch(element.innerHTML, /<img/)
+    assert.doesNotMatch(element.innerHTML, /onclick="alert/)
+  })
+})
+
+test("renderHistoryList escapes status and URL fields", () => {
+  withFakeElement("history-list", (element) => {
+    renderHistoryList([{
+      status: 'failed" onclick="alert(1)',
+      url: 'https://music.apple.com/cn/album/x/1" onclick="alert(1)',
+      updated_at: "<script>alert(1)</script>",
+    }])
+
+    assert.equal(normalizeHistoryStatus('failed" onclick="alert(1)'), "unknown")
+    assert.match(element.innerHTML, /failed&quot; onclick=&quot;alert\(1\)/)
+    assert.match(element.innerHTML, /https:\/\/music\.apple\.com\/cn\/album\/x\/1&quot; onclick=&quot;alert\(1\)/)
+    assert.match(element.innerHTML, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/)
+    assert.doesNotMatch(element.innerHTML, /history-status failed"/)
+    assert.doesNotMatch(element.innerHTML, /data-url="https:\/\/music\.apple\.com\/cn\/album\/x\/1" onclick=/)
+  })
+})
+
+test("compareAlbumsByReleaseDateDesc sorts newest release first and missing dates last", () => {
+  const albums = [
+    { albumId: "missing", releaseDate: "", updatedAt: "2026-06-01" },
+    { albumId: "old", releaseDate: "2020-07-24", updatedAt: "2026-06-03" },
+    { albumId: "new", releaseDate: "2026-06-05", updatedAt: "2026-06-02" },
+    { albumId: "middle", releaseDate: "2026-05-18", updatedAt: "2026-06-04" },
+  ]
+
+  albums.sort(compareAlbumsByReleaseDateDesc)
+
+  assert.deepEqual(albums.map((album) => album.albumId), ["new", "middle", "old", "missing"])
+})
+
+test("showView displays only the requested panel", () => {
+  withFakeNavigationDom(({ panels, links, replaceStateCalls }) => {
+    showView("subscriptions")
+
+    assert.equal(panels.find((panel) => panel.dataset.view === "console").hidden, true)
+    assert.equal(panels.find((panel) => panel.dataset.view === "subscriptions").hidden, false)
+    assert.equal(links.find((link) => link.dataset.viewTarget === "subscriptions").classList.classes.has("active"), true)
+    assert.deepEqual(replaceStateCalls, ["#subscriptions"])
+  })
+})
+
+test("bindViewNavigation switches panels from sidebar clicks", () => {
+  withFakeNavigationDom(({ panels, links }) => {
+    bindViewNavigation()
+    let defaultPrevented = false
+
+    links.find((link) => link.dataset.viewTarget === "history").listeners.click({
+      preventDefault() {
+        defaultPrevented = true
+      },
+    })
+
+    assert.equal(defaultPrevented, true)
+    assert.equal(getInitialViewName(), "history")
+    assert.equal(panels.find((panel) => panel.dataset.view === "console").hidden, true)
+    assert.equal(panels.find((panel) => panel.dataset.view === "history").hidden, false)
+  })
+})
+
+test("bindSidebarToggle restores and toggles collapsed sidebar", () => {
+  withFakeSidebarDom(({ storage, toggle }) => {
+    bindSidebarToggle()
+
+    assert.equal(global.document.body.classList.contains("sidebar-collapsed"), true)
+    assert.equal(toggle.attributes["aria-expanded"], "false")
+    assert.equal(toggle.attributes["aria-label"], "展开侧栏")
+
+    toggle.listeners.click()
+
+    assert.equal(global.document.body.classList.contains("sidebar-collapsed"), false)
+    assert.equal(storage["amd-sidebar-collapsed"], "0")
+    assert.equal(toggle.attributes["aria-expanded"], "true")
+    assert.equal(toggle.attributes["aria-label"], "收起侧栏")
+  })
+})
+
+test("setSidebarCollapsed updates control state", () => {
+  withFakeSidebarDom(({ storage, toggle }) => {
+    setSidebarCollapsed(true)
+
+    assert.equal(global.document.body.classList.contains("sidebar-collapsed"), true)
+    assert.equal(storage["amd-sidebar-collapsed"], "1")
+    assert.equal(toggle.attributes.title, "展开侧栏")
+  })
+})
+
 test("formatRetryFailedSummary reports retried and skipped counts", () => {
   const message = formatRetryFailedSummary({
     retriedCount: 2,
@@ -85,7 +382,7 @@ test("formatSubscriptionScanSummary reports discovered queued skipped and errors
     errorCount: 0,
   })
 
-  assert.equal(message, "扫描 2 个订阅，发现 8 个专辑，入队 3 个，历史跳过 4 个，队列跳过 1 个，错误 0 个")
+  assert.equal(message, "扫描 2 个订阅，发现 8 个专辑，待确认 0 个，入队 3 个，历史跳过 4 个，队列跳过 1 个，忽略 0 个，已导入 0 个，错误 0 个")
 })
 
 test("formatSubscriptionScanSummary preserves zero scanned count", () => {
@@ -98,7 +395,7 @@ test("formatSubscriptionScanSummary preserves zero scanned count", () => {
     errorCount: 0,
   })
 
-  assert.equal(message, "扫描 0 个订阅，发现 0 个专辑，入队 0 个，历史跳过 0 个，队列跳过 0 个，错误 0 个")
+  assert.equal(message, "扫描 0 个订阅，发现 0 个专辑，待确认 0 个，入队 0 个，历史跳过 0 个，队列跳过 0 个，忽略 0 个，已导入 0 个，错误 0 个")
 })
 
 test("getSingleSubscriptionScanPayload normalizes one subscription scan", () => {
@@ -114,8 +411,11 @@ test("getSingleSubscriptionScanPayload normalizes one subscription scan", () => 
     scannedCount: 1,
     foundCount: 2,
     queuedCount: 1,
+    pendingCount: 0,
     skippedCompletedCount: 1,
     skippedActiveCount: 0,
+    skippedIgnoredCount: 0,
+    skippedImportedCount: 0,
     errorCount: 0,
   })
 })

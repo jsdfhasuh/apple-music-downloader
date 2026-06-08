@@ -4,150 +4,232 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Apple Music Downloader</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}?v={{ static_version }}">
   </head>
   <body>
-    <div class="page">
-      <header class="topbar card">
-        <div>
-          <p class="eyebrow">Internal Tool</p>
-          <h1>Apple Music Downloader</h1>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-dot"></span>
+          <div class="brand-copy">
+            <h1>AM Downloader</h1>
+            <p>内部运维控制台</p>
+          </div>
+          <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-label="收起侧栏" aria-expanded="true" title="收起侧栏">
+            <span aria-hidden="true">‹</span>
+          </button>
         </div>
-        <div class="badge online">Container Online</div>
-      </header>
 
-      <main class="layout">
-        <section class="main-column">
-          <section class="card form-card">
-            <h2>新建下载任务</h2>
-            <form id="download-form">
-              <label class="field">
-                <span>Apple Music 链接</span>
-                <input id="url-input" name="url" type="url" placeholder="https://music.apple.com/..." required>
-              </label>
-              <div class="form-row">
-                <div class="quality-hint">自动最高音质（Hi-Res/ALAC 优先）</div>
-                <label class="checkbox-field">
-                  <input id="force-checkbox" name="force" type="checkbox">
-                  <span>强制重新下载</span>
-                </label>
-                <button type="submit" class="primary-button">Start Download</button>
-              </div>
-            </form>
-            <p id="form-error" class="error-text"></p>
-            <p id="submission-note" class="info-text"></p>
-          </section>
+        <nav class="nav">
+          <p class="nav-label">核心操作</p>
+          <a href="#console" class="nav-link active" data-view-target="console">
+            <span class="nav-icon">▶</span>
+            <span class="nav-text">运行控制台</span>
+          </a>
+          <a href="#queue" class="nav-link" data-view-target="queue">
+            <span class="nav-icon">≡</span>
+            <span class="nav-text">队列与结果</span>
+          </a>
+          <a href="#subscriptions" class="nav-link" data-view-target="subscriptions">
+            <span class="nav-icon">◆</span>
+            <span class="nav-text">歌手订阅</span>
+          </a>
+          <p class="nav-label">审计</p>
+          <a href="#history" class="nav-link" data-view-target="history">
+            <span class="nav-icon">↺</span>
+            <span class="nav-text">历史记录</span>
+          </a>
+        </nav>
 
-          <section class="card progress-card">
-            <div class="section-header">
-              <h2>当前任务</h2>
-              <span id="stage-badge" class="badge">idle</span>
-            </div>
-            <div class="progress-meta">
-              <div>
-                <p class="meta-label">任务状态</p>
-                <p id="status-text" class="meta-value">等待开始</p>
-              </div>
-              <div>
-                <p class="meta-label">当前链接</p>
-                <p id="current-url" class="meta-value dim">-</p>
-              </div>
-            </div>
-            <div class="progress-track">
-              <div id="progress-bar" class="progress-fill"></div>
-            </div>
-            <div class="progress-footer">
-              <span id="progress-text">0%</span>
-              <span id="current-message">尚未开始</span>
-            </div>
-          </section>
+        <div class="sidebar-status">
+          <div class="status-row">
+            <span>Docker</span>
+            <strong>unraid-2375</strong>
+          </div>
+          <div class="status-row">
+            <span>Downloader</span>
+            <strong>192.168.100.93</strong>
+          </div>
+          <div class="health-line">
+            <span class="health-dot"></span>
+            <span class="health-text">applemusic_download online</span>
+          </div>
+        </div>
+      </aside>
 
-          <section class="card logs-card">
-            <div class="section-header">
-              <h2>实时日志</h2>
-            </div>
-            <pre id="logs-output" class="logs-output"></pre>
-          </section>
+      <div class="workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Local Webapp</p>
+            <h2>Apple Music Downloader</h2>
+          </div>
+          <div class="topbar-meta">
+            <span class="chip">127.0.0.1:5000</span>
+            <span class="chip success">Container Online</span>
+            <span id="demo-mode-chip" class="chip warning demo-chip">Demo Mode</span>
+          </div>
+        </header>
 
-          <section class="card result-card">
-            <div class="section-header">
-              <h2>下载结果</h2>
-            </div>
-            <div id="result-list" class="result-list">
-              <p class="empty-text">暂无结果</p>
-            </div>
-          </section>
+        <section class="kpi-row" aria-label="任务摘要">
+          <article class="kpi-card">
+            <span>运行中</span>
+            <strong id="active-count">0</strong>
+          </article>
+          <article class="kpi-card">
+            <span>排队中</span>
+            <strong id="queue-count">0</strong>
+          </article>
+          <article class="kpi-card">
+            <span>已完成</span>
+            <strong id="success-count">0</strong>
+          </article>
+          <article class="kpi-card">
+            <span>失败</span>
+            <strong id="failure-count">0</strong>
+          </article>
         </section>
 
-        <aside class="side-column">
-          <section class="card subscription-card">
-            <div class="section-header">
-              <h2>歌手订阅</h2>
-              <button id="scan-subscriptions-button" type="button" class="secondary-button">扫描全部</button>
-            </div>
-            <form id="subscription-search-form" class="stacked-form">
-              <label class="field">
-                <span>搜索歌手</span>
-                <input id="artist-search-input" name="artist-search" type="search" placeholder="Artist name">
-              </label>
-              <button type="submit" class="secondary-button">搜索</button>
-            </form>
-            <div id="artist-search-results" class="artist-search-results"></div>
-            <div class="url-subscribe-row">
-              <label class="field">
-                <span>歌手链接</span>
-                <input id="artist-url-input" name="artist-url" type="url" placeholder="https://music.apple.com/.../artist/...">
-              </label>
-              <button id="subscribe-url-button" type="button" class="primary-button">订阅</button>
-            </div>
-            <p id="subscription-error" class="error-text"></p>
-            <p id="subscription-note" class="info-text"></p>
-            <div id="subscription-list" class="subscription-list">
-              <p class="empty-text">暂无订阅</p>
-            </div>
+        <main class="dashboard">
+          <section class="view-panel console-view" id="console" data-view="console">
+            <section class="panel download-panel">
+              <div class="panel-header">
+                <div>
+                  <h3>新建下载任务</h3>
+                  <p>提交 Apple Music URL，按自动最高音质策略入队。</p>
+                </div>
+              </div>
+              <form id="download-form" class="download-form">
+                <label class="field wide-field">
+                  <span>Apple Music 链接</span>
+                  <input id="url-input" name="url" type="url" placeholder="https://music.apple.com/..." required>
+                </label>
+                <div class="action-row">
+                  <div class="quality-hint">自动最高音质 · Hi-Res / ALAC 优先</div>
+                  <label class="checkbox-field">
+                    <input id="force-checkbox" name="force" type="checkbox">
+                    <span>强制重新下载</span>
+                  </label>
+                  <button type="submit" class="primary-button">开始下载</button>
+                </div>
+              </form>
+              <p id="form-error" class="error-text"></p>
+              <p id="submission-note" class="info-text"></p>
+            </section>
+
+            <section class="panel current-panel">
+              <div class="panel-header">
+                <div>
+                  <h3>当前任务</h3>
+                  <p>实时阶段、进度和当前处理链接。</p>
+                </div>
+                <span id="stage-badge" class="badge">idle</span>
+              </div>
+              <div class="current-grid">
+                <div>
+                  <span class="meta-label">任务状态</span>
+                  <strong id="status-text" class="meta-value">等待开始</strong>
+                </div>
+                <div>
+                  <span class="meta-label">当前链接</span>
+                  <strong id="current-url" class="meta-value dim">-</strong>
+                </div>
+              </div>
+              <div class="progress-track">
+                <div id="progress-bar" class="progress-fill"></div>
+              </div>
+              <div class="progress-footer">
+                <span id="progress-text">0%</span>
+                <span id="current-message">尚未开始</span>
+              </div>
+            </section>
+
+            <section class="panel logs-panel">
+              <div class="panel-header compact">
+                <div>
+                  <h3>实时日志</h3>
+                  <p>来自下载器和后处理流水线的输出。</p>
+                </div>
+              </div>
+              <pre id="logs-output" class="logs-output"></pre>
+            </section>
           </section>
 
-          <section class="card task-list-card">
-            <div class="section-header">
-              <h2>任务列表</h2>
-              <button id="retry-failed-button" type="button" class="secondary-button">重试失败任务</button>
-            </div>
-            <div id="task-list" class="task-list">
-              <p class="empty-text">暂无任务</p>
-            </div>
+          <section class="view-panel queue-view" id="queue" data-view="queue" hidden>
+            <section class="panel task-list-panel">
+              <div class="panel-header">
+                <div>
+                  <h3>任务列表</h3>
+                  <p>运行中、排队和最近完成任务。</p>
+                </div>
+                <button id="retry-failed-button" type="button" class="secondary-button">重试失败</button>
+              </div>
+              <div id="task-list" class="task-list">
+                <p class="empty-text">暂无任务</p>
+              </div>
+            </section>
+
+            <section class="panel result-panel">
+              <div class="panel-header compact">
+                <div>
+                  <h3>下载结果</h3>
+                  <p>完成后解析出的文件路径和专辑信息。</p>
+                </div>
+              </div>
+              <div id="result-list" class="result-list">
+                <p class="empty-text">暂无结果</p>
+              </div>
+            </section>
           </section>
 
-          <section class="card history-card">
-            <div class="section-header">
-              <h2>历史记录</h2>
-              <button id="retry-history-failed-button" type="button" class="secondary-button">一键重试历史失败</button>
-            </div>
-            <div id="history-list" class="history-list">
-              <p class="empty-text">暂无历史</p>
-            </div>
+          <section class="view-panel subscriptions-view" id="subscriptions" data-view="subscriptions" hidden>
+            <section class="panel subscription-panel">
+              <div class="panel-header">
+                <div>
+                  <h3>歌手订阅</h3>
+                  <p>搜索歌手、订阅并扫描新专辑。</p>
+                </div>
+                <button id="scan-subscriptions-button" type="button" class="secondary-button">扫描全部</button>
+              </div>
+              <form id="subscription-search-form" class="stacked-form">
+                <label class="field">
+                  <span>搜索歌手</span>
+                  <input id="artist-search-input" name="artist-search" type="search" placeholder="Artist name">
+                </label>
+                <button type="submit" class="secondary-button full-width">搜索</button>
+              </form>
+              <div id="artist-search-results" class="artist-search-results"></div>
+              <div class="url-subscribe-row">
+                <label class="field">
+                  <span>歌手链接</span>
+                  <input id="artist-url-input" name="artist-url" type="url" placeholder="https://music.apple.com/.../artist/...">
+                </label>
+                <button id="subscribe-url-button" type="button" class="primary-button compact-button">订阅</button>
+              </div>
+              <p id="subscription-error" class="error-text"></p>
+              <p id="subscription-note" class="info-text"></p>
+              <div id="subscription-list" class="subscription-list">
+                <p class="empty-text">暂无订阅</p>
+              </div>
+            </section>
           </section>
 
-          <section class="summary-grid">
-            <article class="card stat-card">
-              <p class="meta-label">队列中</p>
-              <p id="queue-count" class="stat-value">0</p>
-            </article>
-            <article class="card stat-card">
-              <p class="meta-label">成功</p>
-              <p id="success-count" class="stat-value">0</p>
-            </article>
-            <article class="card stat-card">
-              <p class="meta-label">失败</p>
-              <p id="failure-count" class="stat-value">0</p>
-            </article>
-            <article class="card stat-card">
-              <p class="meta-label">运行中</p>
-              <p id="active-count" class="stat-value">0</p>
-            </article>
+          <section class="view-panel history-view" id="history" data-view="history" hidden>
+            <section class="panel history-panel">
+              <div class="panel-header">
+                <div>
+                  <h3>历史记录</h3>
+                  <p>SQLite 历史记录和失败重试入口。</p>
+                </div>
+                <button id="retry-history-failed-button" type="button" class="secondary-button">重试历史失败</button>
+              </div>
+              <div id="history-list" class="history-list">
+                <p class="empty-text">暂无历史</p>
+              </div>
+            </section>
           </section>
-        </aside>
-      </main>
+        </main>
+      </div>
     </div>
-    <script src="{{ url_for('static', filename='app.js') }}"></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v={{ static_version }}"></script>
   </body>
 </html>
