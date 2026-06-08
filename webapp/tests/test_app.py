@@ -1625,6 +1625,70 @@ class FlaskDashboardTest(unittest.TestCase):
     self.assertEqual(subscriptions[0]["artistArtworkUrl"], "")
     self.assertEqual(subscriptions[0]["recentAlbums"][0]["artworkUrl"], "")
 
+  def testSubscriptionArtworkIsNotClearedByMissingArtworkRefresh(self):
+    subscriptionStore = self.client.application.config["SUBSCRIPTION_STORE"]
+    artist = AppleMusicArtist(
+      artistId="artwork-refresh",
+      storefront="cn",
+      name="Artwork Refresh Artist",
+      url="https://music.apple.com/cn/artist/artwork-refresh/123",
+      artworkUrl="https://is1-ssl.mzstatic.com/image/thumb/artist-refresh/512x512bb.jpg",
+    )
+    subscription, _created = subscriptionStore.createOrEnable(artist)
+    subscriptionId = int(subscription["id"])
+
+    subscriptionStore.createOrEnable(AppleMusicArtist(
+      artistId="artwork-refresh",
+      storefront="cn",
+      name="Artwork Refresh Artist",
+      url="https://music.apple.com/cn/artist/artwork-refresh/123",
+      artworkUrl="",
+    ))
+    self.assertEqual(
+      subscriptionStore.get(subscriptionId)["artistArtworkUrl"],
+      "https://is1-ssl.mzstatic.com/image/thumb/artist-refresh/512x512bb.jpg",
+    )
+
+    metadataAlbum = AppleMusicAlbum(
+      albumId="metadata-artwork",
+      name="Metadata Artwork",
+      url="https://music.apple.com/cn/album/metadata-artwork/456",
+      releaseDate="2026-01-01",
+      artworkUrl="https://is1-ssl.mzstatic.com/image/thumb/metadata-album/512x512bb.jpg",
+    )
+    subscriptionStore.upsertSeenAlbumMetadata(subscriptionId, metadataAlbum)
+    subscriptionStore.upsertSeenAlbumMetadata(subscriptionId, AppleMusicAlbum(
+      albumId="metadata-artwork",
+      name="Metadata Artwork",
+      url="https://music.apple.com/cn/album/metadata-artwork/456",
+      releaseDate="2026-01-01",
+      artworkUrl="",
+    ))
+    self.assertEqual(
+      subscriptionStore.getSeenAlbum(subscriptionId, "metadata-artwork")["artworkUrl"],
+      "https://is1-ssl.mzstatic.com/image/thumb/metadata-album/512x512bb.jpg",
+    )
+
+    upsertAlbum = AppleMusicAlbum(
+      albumId="upsert-artwork",
+      name="Upsert Artwork",
+      url="https://music.apple.com/cn/album/upsert-artwork/789",
+      releaseDate="2026-02-01",
+      artworkUrl="https://is1-ssl.mzstatic.com/image/thumb/upsert-album/512x512bb.jpg",
+    )
+    subscriptionStore.upsertSeenAlbum(subscriptionId, upsertAlbum, status="seen")
+    subscriptionStore.upsertSeenAlbum(subscriptionId, AppleMusicAlbum(
+      albumId="upsert-artwork",
+      name="Upsert Artwork",
+      url="https://music.apple.com/cn/album/upsert-artwork/789",
+      releaseDate="2026-02-01",
+      artworkUrl="",
+    ), status="seen")
+    self.assertEqual(
+      subscriptionStore.getSeenAlbum(subscriptionId, "upsert-artwork")["artworkUrl"],
+      "https://is1-ssl.mzstatic.com/image/thumb/upsert-album/512x512bb.jpg",
+    )
+
   def testCreateSubscriptionScansAndPendsMissingAlbums(self):
     fakeAppleMusic = FakeAppleMusicClient()
     fakeAppleMusic.albums = [

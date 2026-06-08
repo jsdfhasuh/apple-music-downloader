@@ -536,7 +536,7 @@ class ArtistSubscriptionStore:
         ON CONFLICT(artist_id, storefront) DO UPDATE SET
           artist_name = excluded.artist_name,
           artist_url = excluded.artist_url,
-          artist_artwork_url = excluded.artist_artwork_url,
+          artist_artwork_url = COALESCE(NULLIF(excluded.artist_artwork_url, ''), artist_subscriptions.artist_artwork_url),
           enabled = 1,
           last_error = '',
           updated_at = CURRENT_TIMESTAMP
@@ -696,7 +696,7 @@ class ArtistSubscriptionStore:
         ON CONFLICT(subscription_id, album_id) DO UPDATE SET
           album_url = excluded.album_url,
           album_name = excluded.album_name,
-          artwork_url = excluded.artwork_url,
+          artwork_url = COALESCE(NULLIF(excluded.artwork_url, ''), subscription_seen_albums.artwork_url),
           release_date = excluded.release_date,
           status = excluded.status,
           task_id = excluded.task_id,
@@ -736,7 +736,7 @@ class ArtistSubscriptionStore:
         connection.execute(
           """
           UPDATE subscription_seen_albums
-          SET album_url = ?, album_name = ?, artwork_url = ?, release_date = ?, updated_at = CURRENT_TIMESTAMP
+          SET album_url = ?, album_name = ?, artwork_url = COALESCE(NULLIF(?, ''), artwork_url), release_date = ?, updated_at = CURRENT_TIMESTAMP
           WHERE subscription_id = ? AND album_id = ?
           """,
           (album.url, album.name, album.artworkUrl, album.releaseDate, subscriptionId, album.albumId),
