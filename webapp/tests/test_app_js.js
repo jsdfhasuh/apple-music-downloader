@@ -5,7 +5,9 @@ const {
   bindViewNavigation,
   bindSidebarToggle,
   compareAlbumsByReleaseDateDesc,
+  cancelTask,
   formatAlbumTitleFromUrl,
+  formatSubscriptionActionSummary,
   formatSubscriptionScanSummary,
   formatHistoryRetrySummary,
   formatRetryFailedSummary,
@@ -18,6 +20,7 @@ const {
   normalizeHistoryStatus,
   renderHistoryList,
   renderResult,
+  renderTaskList,
   retryFailedTasks,
   retryHistoryFailedTasks,
   retrySingleHistory,
@@ -180,6 +183,7 @@ function withFakeElement(id, callback) {
 test("isTerminalTaskStatus returns true for completed and failed", () => {
   assert.equal(isTerminalTaskStatus("completed"), true)
   assert.equal(isTerminalTaskStatus("failed"), true)
+  assert.equal(isTerminalTaskStatus("cancelled"), true)
   assert.equal(isTerminalTaskStatus("running"), false)
 })
 
@@ -207,6 +211,7 @@ test("getTaskSummaryCounts separates queued and running", () => {
     { status: "running" },
     { status: "completed" },
     { status: "failed" },
+    { status: "cancelled" },
   ])
 
   assert.deepEqual(result, {
@@ -280,6 +285,35 @@ test("renderHistoryList escapes status and URL fields", () => {
     assert.match(element.innerHTML, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/)
     assert.doesNotMatch(element.innerHTML, /history-status failed"/)
     assert.doesNotMatch(element.innerHTML, /data-url="https:\/\/music\.apple\.com\/cn\/album\/x\/1" onclick=/)
+  })
+})
+
+test("normalizeHistoryStatus recognizes cancelled records", () => {
+  assert.equal(normalizeHistoryStatus("cancelled"), "cancelled")
+})
+
+test("renderTaskList shows cancel action only for queued tasks", () => {
+  withFakeElement("task-list", (element) => {
+    renderTaskList([
+      {
+        taskId: "queued-task",
+        status: "queued",
+        stage: "queued",
+        source: "subscription",
+        url: "https://music.apple.com/cn/album/queued-album/123",
+      },
+      {
+        taskId: "running-task",
+        status: "running",
+        stage: "downloading",
+        source: "web",
+        url: "https://music.apple.com/cn/album/running-album/456",
+      },
+    ])
+
+    assert.match(element.innerHTML, /task-cancel-btn/)
+    assert.match(element.innerHTML, /data-task-id="queued-task"/)
+    assert.doesNotMatch(element.innerHTML, /<button type="button" class="task-item/)
   })
 })
 
@@ -398,6 +432,15 @@ test("formatSubscriptionScanSummary preserves zero scanned count", () => {
   assert.equal(message, "扫描 0 个订阅，发现 0 个专辑，待确认 0 个，入队 0 个，历史跳过 0 个，队列跳过 0 个，忽略 0 个，已导入 0 个，错误 0 个")
 })
 
+test("formatSubscriptionActionSummary reports manually completed albums", () => {
+  const message = formatSubscriptionActionSummary({
+    action: "mark_completed",
+    updatedCount: 2,
+  })
+
+  assert.equal(message, "已确认完成 2 个专辑")
+})
+
 test("getSingleSubscriptionScanPayload normalizes one subscription scan", () => {
   const payload = getSingleSubscriptionScanPayload({
     foundCount: 2,
@@ -450,6 +493,30 @@ test("retryFailedTasks posts to retry-failed endpoint", async () => {
     skippedCompletedUrls: [],
     skippedRunningUrls: [],
   })
+
+  global.fetch = originalFetch
+})
+
+test("cancelTask posts to queued task cancel endpoint", async () => {
+  const originalFetch = global.fetch
+  let capturedUrl = null
+  let capturedOptions = null
+  global.fetch = async (url, options) => {
+    capturedUrl = url
+    capturedOptions = options
+    return {
+      ok: true,
+      async json() {
+        return { cancelled: true, task: { taskId: "task-1", status: "cancelled" } }
+      },
+    }
+  }
+
+  const payload = await cancelTask("task-1")
+
+  assert.equal(capturedUrl, "/api/tasks/task-1/cancel")
+  assert.equal(capturedOptions.method, "POST")
+  assert.deepEqual(payload, { cancelled: true, task: { taskId: "task-1", status: "cancelled" } })
 
   global.fetch = originalFetch
 })

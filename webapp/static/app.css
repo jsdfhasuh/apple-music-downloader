@@ -611,12 +611,18 @@ select:focus {
 
 .task-item {
   text-align: left;
+  cursor: pointer;
 }
 
 .task-item:hover,
 .task-item.selected {
   border-color: var(--blue);
   background: var(--blue-soft);
+}
+
+.task-item:focus-visible {
+  outline: 3px solid rgba(0, 113, 227, 0.18);
+  outline-offset: 2px;
 }
 
 .task-item.selected {
@@ -649,6 +655,19 @@ select:focus {
   margin-top: 8px;
   text-transform: uppercase;
   font-family: "SFMono-Regular", Consolas, monospace;
+}
+
+.task-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 9px;
+}
+
+.task-cancel-btn {
+  min-height: 28px;
+  padding: 5px 9px;
+  font-size: 11px;
 }
 
 .task-album-title {
@@ -710,6 +729,12 @@ select:focus {
   background: var(--blue-soft);
   border-color: #bfdbfe;
   color: #1d4ed8;
+}
+
+.history-status.cancelled {
+  background: var(--panel-soft);
+  border-color: var(--border);
+  color: #475467;
 }
 
 .history-retry-btn {

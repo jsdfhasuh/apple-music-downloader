@@ -659,6 +659,76 @@ class FlaskDashboardTest(unittest.TestCase):
     self.assertEqual(len(startedUrls), 2)
     self.assertEqual(completedSecondTask["result"][0]["path"], "/downloads/2.flac")
 
+  def testQueuedTaskCanBeCancelledBeforeItStarts(self):
+    startedUrls: list[str] = []
+    firstTaskStarted = threading.Event()
+    releaseFirstTask = threading.Event()
+
+    def waitForStatus(client, taskId, expectedStatus, timeout=2.0):
+      deadline = time.time() + timeout
+      while time.time() < deadline:
+        payload = client.get(f"/api/tasks/{taskId}").get_json()
+        if payload["status"] == expectedStatus:
+          return payload
+        time.sleep(0.01)
+      self.fail(f"task {taskId} did not reach status {expectedStatus}")
+
+    def fakeRunner(task, url, codec):
+      startedUrls.append(url)
+      task.setStage("downloading")
+      task.setStatus("running")
+      if len(startedUrls) == 1:
+        firstTaskStarted.set()
+        releaseFirstTask.wait(timeout=2.0)
+      task.setResult([{
+        "path": f"/downloads/{len(startedUrls)}.flac",
+        "artist": "Example Artist",
+        "album": "Example Album",
+        "song": "Example Song",
+      }])
+      task.setStage("completed")
+      task.setStatus("completed")
+      task.setProgress(100)
+
+    app = createApp(
+      runnerFactory=lambda: fakeRunner,
+      dbPath=f"{self.tempDir.name}/cancel-downloads.db"
+    )
+    app.config["TESTING"] = False
+    client = app.test_client()
+    historyStore = app.config["HISTORY_STORE"]
+
+    first = client.post(
+      "/api/downloads",
+      data=json.dumps({"url": "https://music.apple.com/cn/album/first/111"}),
+      content_type="application/json",
+    )
+    firstPayload = first.get_json()
+    self.assertTrue(firstTaskStarted.wait(timeout=2.0))
+
+    second = client.post(
+      "/api/downloads",
+      data=json.dumps({"url": "https://music.apple.com/cn/album/second/222"}),
+      content_type="application/json",
+    )
+    secondPayload = second.get_json()
+    self.assertEqual(secondPayload["status"], "queued")
+
+    cancelResponse = client.post(f"/api/tasks/{secondPayload['taskId']}/cancel")
+    cancelPayload = cancelResponse.get_json()
+
+    self.assertEqual(cancelResponse.status_code, 200)
+    self.assertTrue(cancelPayload["cancelled"])
+    self.assertEqual(cancelPayload["task"]["status"], "cancelled")
+    self.assertEqual(waitForStatus(client, secondPayload["taskId"], "cancelled")["stage"], "cancelled")
+    self.assertEqual(historyStore.getByUrl("https://music.apple.com/cn/album/second/222")["status"], "cancelled")
+
+    releaseFirstTask.set()
+    waitForStatus(client, firstPayload["taskId"], "completed")
+    time.sleep(0.05)
+
+    self.assertEqual(startedUrls, ["https://music.apple.com/cn/album/first/111"])
+
   def testRecoverPendingHistoryRestoresRunningAndQueuedTasks(self):
     dbPath = f"{self.tempDir.name}/recover-downloads.db"
     historyStore = DownloadHistoryStore(dbPath)
@@ -1682,6 +1752,40 @@ class FlaskDashboardTest(unittest.TestCase):
     recentAlbums = {album["albumId"]: album for album in subscriptions[0]["recentAlbums"]}
     self.assertEqual(recentAlbums["777"]["userState"], "ignored")
     self.assertEqual(recentAlbums["888"]["userState"], "imported")
+
+  def testSubscriptionAlbumCanBeMarkedCompletedManually(self):
+    fakeAppleMusic = FakeAppleMusicClient()
+    fakeAppleMusic.albums = [
+      AppleMusicAlbum(
+        albumId="999",
+        name="Already Local Album",
+        url="https://music.apple.com/cn/album/already-local/999",
+      )
+    ]
+    app = self.client.application
+    app.config["APPLE_MUSIC_CLIENT_FACTORY"] = lambda: fakeAppleMusic
+
+    createResponse = self.client.post(
+      "/api/subscriptions",
+      data=json.dumps({"artistUrl": "https://music.apple.com/cn/artist/example-artist/12345"}),
+      content_type="application/json",
+    )
+    subscriptionId = createResponse.get_json()["subscription"]["id"]
+    actionResponse = self.client.post(
+      f"/api/subscriptions/{subscriptionId}/albums/actions",
+      data=json.dumps({"albumIds": ["999"], "action": "mark_completed"}),
+      content_type="application/json",
+    )
+    subscriptions = self.client.get("/api/subscriptions").get_json()
+    recentAlbums = {album["albumId"]: album for album in subscriptions[0]["recentAlbums"]}
+
+    self.assertEqual(createResponse.status_code, 201)
+    self.assertEqual(actionResponse.status_code, 200)
+    self.assertEqual(actionResponse.get_json()["updatedCount"], 1)
+    self.assertEqual(recentAlbums["999"]["status"], "completed")
+    self.assertEqual(recentAlbums["999"]["detectedStatus"], "completed")
+    self.assertEqual(recentAlbums["999"]["userState"], "subscribed")
+    self.assertIsNone(app.config["HISTORY_STORE"].getByUrl("https://music.apple.com/cn/album/already-local/999"))
 
   def testSubscriptionScanSkipsActiveAlbumByAlbumId(self):
     fakeAppleMusic = FakeAppleMusicClient()

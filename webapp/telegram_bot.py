@@ -33,6 +33,7 @@ SUBSCRIPTION_ALBUM_CALLBACK_ACTIONS = {
   "d": "download",
   "i": "ignore",
   "m": "mark_imported",
+  "c": "mark_completed",
   "p": "pending",
 }
 SUBSCRIPTION_ALBUM_ACTION_CALLBACK_CODES = {
@@ -395,7 +396,7 @@ def formatHelpMessage() -> str:
     "直接发送 Apple Music 链接即可下载，支持一条消息多个链接。\n"
     "强制下载请使用 /force <Apple Music URL>，也支持一条消息多个链接。\n"
     "歌手订阅：/artist_search <关键词> 搜索，/subscribe <artist_url> 订阅，/subscriptions 查看，/unsubscribe <artist_id> 取消，/scan_subscriptions 手动扫描。\n"
-    "订阅专辑：/subscription_policy <artist_id> confirm|auto 切换策略，/subscription_album <artist_id> <album_id> download|ignore|imported|pending 处理专辑。\n"
+    "订阅专辑：/subscription_policy <artist_id> confirm|auto 切换策略，/subscription_album <artist_id> <album_id> download|ignore|imported|completed|pending 处理专辑。\n"
     "快捷菜单不会长期展示，发送 /menu 打开，发送 /hide_menu 收起。\n"
     "可用菜单：下载说明、强制下载说明、重试失败任务、查看队列、查看失败任务、查看运行中任务、订阅说明、查看订阅、扫描订阅、最近结果、帮助、收起菜单\n"
     "可用命令：/start /menu /hide_menu /help /force /retry_failed /queue /failed /running /recent /artist_search /subscribe /subscriptions /unsubscribe /scan_subscriptions /subscription_policy /subscription_album"
@@ -419,7 +420,7 @@ def formatSubscriptionHelpMessage() -> str:
     "/unsubscribe <artist_id> 取消订阅\n"
     "/scan_subscriptions 手动扫描订阅\n"
     "/subscription_policy <artist_id> confirm|auto 切换新专辑策略\n"
-    "/subscription_album <artist_id> <album_id> download|ignore|imported|pending 处理专辑"
+    "/subscription_album <artist_id> <album_id> download|ignore|imported|completed|pending 处理专辑"
   )
 
 
@@ -728,7 +729,7 @@ def buildSubscriptionReviewKeyboard(subscription: dict[str, object], limit: int 
     if not albumId:
       continue
     row: list[dict[str, str]] = []
-    for label, action in (("下载", "download"), ("忽略", "ignore"), ("已导入", "mark_imported")):
+    for label, action in (("下载", "download"), ("完成", "mark_completed"), ("忽略", "ignore"), ("已导入", "mark_imported")):
       callbackData = buildSubscriptionAlbumCallbackData(subscriptionId, albumId, action)
       if len(callbackData.encode("utf-8")) <= 64:
         row.append({"text": f"{index} {label}", "callback_data": callbackData})
@@ -802,6 +803,7 @@ def formatSubscriptionCallbackResultMessage(
   labels = {
     "ignore": "已忽略",
     "mark_imported": "已标记已导入",
+    "mark_completed": "已确认完成",
     "pending": "已恢复待确认",
   }
   return f"{labels.get(action, '已更新')}：{title}"
@@ -847,7 +849,9 @@ def parseSubscriptionAlbumCommand(text: str) -> tuple[str, str, str] | None:
   normalizedAction = action.strip().lower().replace("-", "_")
   if normalizedAction == "imported":
     normalizedAction = "mark_imported"
-  if normalizedAction not in {"download", "ignore", "mark_imported", "pending"}:
+  if normalizedAction in {"completed", "complete"}:
+    normalizedAction = "mark_completed"
+  if normalizedAction not in {"download", "ignore", "mark_imported", "mark_completed", "pending"}:
     return None
   return artistId.strip(), albumId.strip(), normalizedAction
 
@@ -869,6 +873,7 @@ def formatSubscriptionAlbumActionMessage(payload: dict[str, object]) -> str:
   labels = {
     "ignore": "已忽略",
     "mark_imported": "已标记导入",
+    "mark_completed": "已确认完成",
     "pending": "已恢复待确认",
   }
   return f"{labels.get(action, '已更新')} {updatedCount} 个专辑"
@@ -1214,7 +1219,7 @@ def handleUpdate(
   if command == "subscription_album":
     parsedAlbumCommand = parseSubscriptionAlbumCommand(text)
     if parsedAlbumCommand is None:
-      sendMessage(chatId, "用法：/subscription_album <artist_id> <album_id> download|ignore|imported|pending", messageId)
+      sendMessage(chatId, "用法：/subscription_album <artist_id> <album_id> download|ignore|imported|completed|pending", messageId)
       return
     artistId, albumId, action = parsedAlbumCommand
     try:

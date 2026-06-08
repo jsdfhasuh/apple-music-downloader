@@ -377,6 +377,27 @@ class DownloadHistoryStore:
       )
       connection.commit()
 
+  def saveCancelled(self, url: str, taskId: str, codec: str, source: str = "web", albumId: str | None = None) -> None:
+    normalizedAlbumId = albumId if albumId is not None else extractAlbumIdFromUrl(url)
+    with closing(self._connect()) as connection:
+      connection.execute(
+        """
+        INSERT INTO downloads (url, album_id, task_id, status, codec, source, result_json, error, created_at, updated_at)
+        VALUES (?, ?, ?, 'cancelled', ?, ?, '[]', 'cancelled before start', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT(url) DO UPDATE SET
+          album_id = excluded.album_id,
+          task_id = excluded.task_id,
+          status = 'cancelled',
+          codec = excluded.codec,
+          source = excluded.source,
+          result_json = '[]',
+          error = excluded.error,
+          updated_at = CURRENT_TIMESTAMP
+        """,
+        (url, normalizedAlbumId, taskId, codec, source)
+      )
+      connection.commit()
+
   def listAll(self) -> list[dict[str, str]]:
     with closing(self._connect()) as connection:
       rows = connection.execute(
@@ -798,6 +819,31 @@ class ArtistSubscriptionStore:
       connection.commit()
       return cursor.rowcount
 
+  def resetSeenAlbumAfterTaskCancellation(self, albumId: str, taskId: str) -> int:
+    if not albumId or not taskId:
+      return 0
+    with closing(self._connect()) as connection:
+      cursor = connection.execute(
+        """
+        UPDATE subscription_seen_albums
+        SET
+          status = 'seen',
+          task_id = '',
+          detected_status = 'missing',
+          user_state = CASE
+            WHEN user_state = 'subscribed' THEN 'pending'
+            ELSE user_state
+          END,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE album_id = ?
+          AND task_id = ?
+          AND (detected_status IN ('queued', 'running') OR status IN ('queued', 'running'))
+        """,
+        (albumId, taskId),
+      )
+      connection.commit()
+      return cursor.rowcount
+
   def markChecked(self, subscriptionId: int, error: str = "") -> None:
     with closing(self._connect()) as connection:
       connection.execute(
@@ -905,6 +951,15 @@ class SerialTaskQueue:
         self._activeTaskId = nextTaskId
     if nextLaunch is not None:
       nextLaunch()
+
+  def cancelPending(self, taskId: str) -> bool:
+    with self._lock:
+      for index, (pendingTaskId, _launchTask) in enumerate(self._pending):
+        if pendingTaskId != taskId:
+          continue
+        del self._pending[index]
+        return True
+    return False
 
 
 class DownloaderRunner:
@@ -1365,6 +1420,35 @@ def startTask(
   return responsePayload
 
 
+def cancelQueuedTask(
+  app: Flask,
+  taskStore: TaskStore,
+  taskQueue: SerialTaskQueue,
+  historyStore: DownloadHistoryStore,
+  taskId: str,
+) -> tuple[dict[str, object], int]:
+  task = taskStore.getTask(taskId)
+  if task is None:
+    return {"error": "task not found"}, 404
+  if task.status != "queued":
+    return {"error": "only queued tasks can be cancelled"}, 409
+  if not taskQueue.cancelPending(taskId):
+    return {"error": "task is no longer queued"}, 409
+
+  albumId = extractAlbumIdFromUrl(task.url)
+  task.setStage("cancelled")
+  task.setStatus("cancelled")
+  task.setError("cancelled before start")
+  task.appendLog("queued task cancelled before start")
+  historyStore.saveCancelled(task.url, task.id, task.codec, task.source, albumId)
+
+  subscriptionStore = app.config.get("SUBSCRIPTION_STORE")
+  if isinstance(subscriptionStore, ArtistSubscriptionStore):
+    subscriptionStore.resetSeenAlbumAfterTaskCancellation(albumId, task.id)
+
+  return {"cancelled": True, "task": task.toDict()}, 200
+
+
 def createTaskResponse(
   app: Flask,
   taskStore: TaskStore,
@@ -1800,6 +1884,8 @@ def aggregateSubscriptionSummaries(summaries: list[SubscriptionScanSummary]) -> 
 def normalizeAlbumAction(value: object) -> str:
   normalized = str(value or "").strip().lower().replace("-", "_")
   aliases = {
+    "completed": "mark_completed",
+    "complete": "mark_completed",
     "imported": "mark_imported",
     "import": "mark_imported",
     "restore": "pending",
@@ -1826,7 +1912,7 @@ def applySubscriptionAlbumAction(
   )
   updatedAlbumIds: list[str] = []
 
-  if normalizedAction not in {"download", "ignore", "mark_imported", "pending"}:
+  if normalizedAction not in {"download", "ignore", "mark_imported", "mark_completed", "pending"}:
     return {"error": "unsupported album action"}
 
   for albumId in albumIds:
@@ -1837,6 +1923,18 @@ def applySubscriptionAlbumAction(
     if seenAlbum is None:
       summary.errorCount += 1
       summary.errors.append(f"专辑不存在: {normalizedAlbumId}")
+      continue
+
+    if normalizedAction == "mark_completed":
+      subscriptionStore.updateSeenAlbumDetection(
+        subscriptionId,
+        normalizedAlbumId,
+        "completed",
+        "",
+        ALBUM_USER_STATE_SUBSCRIBED,
+      )
+      updatedAlbumIds.append(normalizedAlbumId)
+      summary.skippedCompletedCount += 1
       continue
 
     if normalizedAction != "download":
@@ -2192,6 +2290,11 @@ def createApp(
       return jsonify({"error": "task not found"}), 404
     return jsonify(task.toDict())
 
+  @app.post("/api/tasks/<taskId>/cancel")
+  def cancelTaskRoute(taskId: str):
+    payload, statusCode = cancelQueuedTask(app, taskStore, taskQueue, historyStore, taskId)
+    return jsonify(payload), statusCode
+
   @app.get("/api/tasks/<taskId>/stream")
   def streamTaskRoute(taskId: str):
     task = taskStore.getTask(taskId)
@@ -2203,14 +2306,14 @@ def createApp(
       eventIndex = 0
       while True:
         with task.condition:
-          while eventIndex >= len(task.events) and task.status not in {"completed", "failed"}:
+          while eventIndex >= len(task.events) and task.status not in {"completed", "failed", "cancelled"}:
             task.condition.wait(timeout=1.0)
             yield formatSse("snapshot", task.toDict())
           events = task.events[eventIndex:]
           eventIndex = len(task.events)
         for event in events:
           yield formatSse(event.eventType, event.payload)
-        if task.status in {"completed", "failed"} and eventIndex >= len(task.events):
+        if task.status in {"completed", "failed", "cancelled"} and eventIndex >= len(task.events):
           yield formatSse("snapshot", task.toDict())
           break
 

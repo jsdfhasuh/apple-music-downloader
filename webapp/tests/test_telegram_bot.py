@@ -1115,7 +1115,7 @@ class TelegramBotTest(unittest.TestCase):
           "message": {
             "message_id": 11,
             "chat": {"id": 12345, "type": "private"},
-            "text": "/subscription_album 12345 67890 imported",
+            "text": "/subscription_album 12345 67890 completed",
           },
         },
         allowedChatId=12345,
@@ -1130,10 +1130,10 @@ class TelegramBotTest(unittest.TestCase):
 
     self.assertEqual(calls, [
       ("policy", "12345", "auto"),
-      ("album", "12345", "67890", "mark_imported"),
+      ("album", "12345", "67890", "mark_completed"),
     ])
     self.assertIn("策略已更新为 auto", messages[0][1])
-    self.assertIn("已标记导入 1 个专辑", messages[1][1])
+    self.assertIn("已确认完成 1 个专辑", messages[1][1])
 
   def testHandleUpdateSupportsSubscriptionKeyboardShortcuts(self):
     messages = []
@@ -1765,6 +1765,7 @@ class TelegramBotTest(unittest.TestCase):
       buildSubscriptionReviewKeyboard(reviewSubscription),
       {"inline_keyboard": [[
         {"text": "1 下载", "callback_data": "sa:7:111:d"},
+        {"text": "1 完成", "callback_data": "sa:7:111:c"},
         {"text": "1 忽略", "callback_data": "sa:7:111:i"},
         {"text": "1 已导入", "callback_data": "sa:7:111:m"},
       ]]},

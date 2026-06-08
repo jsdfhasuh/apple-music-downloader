@@ -272,7 +272,7 @@ function bindSidebarToggle() {
 
 
 function isTerminalTaskStatus(status) {
-  return status === "completed" || status === "failed";
+  return status === "completed" || status === "failed" || status === "cancelled";
 }
 
 
@@ -436,6 +436,71 @@ async function retrySingleHistory(url) {
 }
 
 
+function taskUrlContainsAlbumId(task, albumId) {
+  return Boolean(task?.url && albumId && String(task.url).includes(`/${albumId}`));
+}
+
+
+function recalculateDemoSubscriptionStats(subscription) {
+  const albums = Array.isArray(subscription.recentAlbums) ? subscription.recentAlbums : [];
+  subscription.albumCount = albums.length;
+  subscription.pendingAlbumCount = albums.filter((album) => normalizeAlbumUserState(album.userState) === "pending").length;
+  subscription.activeAlbumCount = albums.filter((album) => ["queued", "running"].includes(getAlbumDetectedStatus(album)) || ["queued", "running"].includes(normalizeAlbumStatus(album.status))).length;
+  subscription.completedAlbumCount = albums.filter((album) => getAlbumDetectedStatus(album) === "completed" || normalizeAlbumStatus(album.status) === "completed").length;
+  subscription.failedAlbumCount = albums.filter((album) => ["failed_history", "stale_history"].includes(getAlbumDetectedStatus(album)) || normalizeAlbumStatus(album.status) === "failed").length;
+  subscription.ignoredAlbumCount = albums.filter((album) => normalizeAlbumUserState(album.userState) === "ignored").length;
+  subscription.importedAlbumCount = albums.filter((album) => normalizeAlbumUserState(album.userState) === "imported").length;
+}
+
+
+function updateDemoSubscriptionAfterTaskCancellation(task) {
+  for (const subscription of demoStore.subscriptions) {
+    let changed = false;
+    for (const album of subscription.recentAlbums || []) {
+      if (album.albumUrl !== task.url && !taskUrlContainsAlbumId(task, album.albumId)) {
+        continue;
+      }
+      album.status = "seen";
+      album.detectedStatus = "missing";
+      if (normalizeAlbumUserState(album.userState) === "subscribed") {
+        album.userState = "pending";
+      }
+      changed = true;
+    }
+    if (changed) {
+      recalculateDemoSubscriptionStats(subscription);
+    }
+  }
+}
+
+
+async function cancelTask(taskId) {
+  if (state.demoMode) {
+    const task = getDemoTask(taskId);
+    if (!task) {
+      throw new Error("任务不存在");
+    }
+    if (task.status !== "queued") {
+      throw new Error("只能取消排队任务");
+    }
+    task.status = "cancelled";
+    task.stage = "cancelled";
+    task.error = "cancelled before start";
+    task.progress = 0;
+    updateDemoSubscriptionAfterTaskCancellation(task);
+    return { cancelled: true, task };
+  }
+  const response = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/cancel`, {
+    method: "POST"
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.error || "取消失败")
+  }
+  return payload;
+}
+
+
 function formatSubscriptionScanSummary(payload) {
   const scannedCount = Number(payload.scannedCount ?? 1);
   const foundCount = Number(payload.foundCount ?? 0);
@@ -478,7 +543,7 @@ function escapeHtml(value) {
 
 function normalizeHistoryStatus(status) {
   const normalized = String(status || "").trim().toLowerCase();
-  return ["completed", "failed", "running", "queued"].includes(normalized) ? normalized : "unknown";
+  return ["completed", "failed", "running", "queued", "cancelled"].includes(normalized) ? normalized : "unknown";
 }
 
 
@@ -703,11 +768,19 @@ async function applySubscriptionAlbumAction(subscriptionId, albumIds, action) {
           album.userState = "ignored";
         } else if (action === "mark_imported") {
           album.userState = "imported";
+        } else if (action === "mark_completed") {
+          album.userState = "subscribed";
+          album.detectedStatus = "completed";
+          album.status = "completed";
+          album.taskId = "";
         } else if (action === "pending") {
           album.userState = "pending";
         }
         updatedAlbumIds.push(String(album.albumId));
       }
+    }
+    if (subscription) {
+      recalculateDemoSubscriptionStats(subscription);
     }
     return {
       action,
@@ -1064,8 +1137,9 @@ function renderTaskList(tasks) {
   container.innerHTML = tasks.map((task) => {
     const source = task.source === "telegram" ? "telegram" : task.source === "subscription" ? "subscription" : "web";
     const albumName = getTaskAlbumName(task) || "未知专辑";
+    const canCancel = task.status === "queued";
     return `
-      <button type="button" class="task-item${task.taskId === state.selectedTaskId ? " selected" : ""}" data-task-id="${escapeHtml(task.taskId || "")}">
+      <article class="task-item${task.taskId === state.selectedTaskId ? " selected" : ""}" data-task-id="${escapeHtml(task.taskId || "")}" role="button" tabindex="0">
         <div class="task-item-top">
           <span class="badge task-source ${source}">${escapeHtml(task.source || source)}</span>
           <span class="task-progress">${Number(task.progress || 0)}%</span>
@@ -1076,13 +1150,32 @@ function renderTaskList(tasks) {
           <span>${escapeHtml(task.status || "pending")}</span>
           <span>${escapeHtml(task.stage || "idle")}</span>
         </div>
-      </button>
+        ${canCancel ? `<div class="task-actions"><button type="button" class="secondary-button compact-button task-cancel-btn" data-task-id="${escapeHtml(task.taskId || "")}">取消</button></div>` : ""}
+      </article>
     `;
   }).join("");
 
   for (const item of container.querySelectorAll(".task-item")) {
-    item.addEventListener("click", () => {
+    item.addEventListener("click", (event) => {
+      if (event.target.closest("button")) {
+        return;
+      }
       selectTask(item.dataset.taskId || "", true);
+    });
+    item.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") {
+        return;
+      }
+      event.preventDefault();
+      selectTask(item.dataset.taskId || "", true);
+    });
+  }
+
+  for (const btn of container.querySelectorAll(".task-cancel-btn")) {
+    btn.addEventListener("click", () => {
+      handleCancelTask(btn.dataset.taskId || "").catch((error) => {
+        document.getElementById("form-error").textContent = error.message || "取消失败";
+      });
     });
   }
 }
@@ -1299,6 +1392,7 @@ function formatSubscriptionActionSummary(payload) {
   const labels = {
     ignore: "已忽略",
     mark_imported: "已标记导入",
+    mark_completed: "已确认完成",
     pending: "已恢复待确认",
   };
   return `${labels[action] || "已更新"} ${updatedCount} 个专辑`;
@@ -1352,12 +1446,15 @@ function renderSubscriptionAlbums(subscription) {
     const actions = [];
     if (downloadable) {
       actions.push(`<button type="button" class="secondary-button compact-button subscription-album-action-btn" data-subscription-id="${subscription.id}" data-album-id="${escapeHtml(album.albumId || "")}" data-action="download">下载</button>`);
+      actions.push(`<button type="button" class="secondary-button compact-button subscription-album-action-btn" data-subscription-id="${subscription.id}" data-album-id="${escapeHtml(album.albumId || "")}" data-action="mark_completed">确认完成</button>`);
       if (album.canIgnore !== false && userState !== "ignored") {
         actions.push(`<button type="button" class="secondary-button compact-button subscription-album-action-btn" data-subscription-id="${subscription.id}" data-album-id="${escapeHtml(album.albumId || "")}" data-action="ignore">忽略</button>`);
       }
       if (album.canMarkImported !== false && userState !== "imported") {
         actions.push(`<button type="button" class="secondary-button compact-button subscription-album-action-btn" data-subscription-id="${subscription.id}" data-album-id="${escapeHtml(album.albumId || "")}" data-action="mark_imported">已导入</button>`);
       }
+    } else if (!["completed", "queued", "running"].includes(detectedStatus) && !["ignored", "imported"].includes(userState)) {
+      actions.push(`<button type="button" class="secondary-button compact-button subscription-album-action-btn" data-subscription-id="${subscription.id}" data-album-id="${escapeHtml(album.albumId || "")}" data-action="mark_completed">确认完成</button>`);
     }
     if (canRestoreAlbum(album)) {
       actions.push(`<button type="button" class="secondary-button compact-button subscription-album-action-btn" data-subscription-id="${subscription.id}" data-album-id="${escapeHtml(album.albumId || "")}" data-action="pending">恢复待确认</button>`);
@@ -1580,6 +1677,20 @@ async function handleDeleteSubscription(subscriptionId) {
 }
 
 
+async function handleCancelTask(taskId) {
+  document.getElementById("form-error").textContent = "";
+  setSubmissionNote("");
+  const payload = await cancelTask(taskId);
+  setSubmissionNote("已取消排队任务");
+  if (payload.task && payload.task.taskId === state.selectedTaskId) {
+    applySnapshot(payload.task);
+  }
+  await refreshTaskList();
+  await refreshHistoryList();
+  await refreshSubscriptionList();
+}
+
+
 async function handleRetryHistoryFailed() {
   document.getElementById("form-error").textContent = "";
   const payload = await retryHistoryFailedTasks();
@@ -1744,6 +1855,7 @@ if (typeof module !== "undefined") {
     bindViewNavigation,
     bindSidebarToggle,
     compareAlbumsByReleaseDateDesc,
+    cancelTask,
     formatSubscriptionScanSummary,
     formatSubscriptionActionSummary,
     formatHistoryRetrySummary,
@@ -1761,6 +1873,7 @@ if (typeof module !== "undefined") {
     normalizeHistoryStatus,
     renderHistoryList,
     renderResult,
+    renderTaskList,
     retryFailedTasks,
     retryHistoryFailedTasks,
     retrySingleHistory,
