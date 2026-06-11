@@ -1,6 +1,7 @@
 const state = {
   selectedTaskId: "",
   manualSelection: false,
+  activeSubscriptionId: "",
   eventSource: null,
   streamTaskId: "",
   taskPoller: null,
@@ -562,6 +563,8 @@ function getSafeImageUrl(value) {
 }
 
 
+
+
 function renderArtworkImage(url, alt, className) {
   const safeUrl = getSafeImageUrl(url);
   const escapedAlt = escapeHtml(alt || "artwork");
@@ -569,6 +572,29 @@ function renderArtworkImage(url, alt, className) {
     return `<div class="${className} artwork-placeholder" aria-hidden="true">封面</div>`;
   }
   return `<img class="${className}" src="${escapeHtml(safeUrl)}" alt="${escapedAlt}" loading="lazy">`;
+}
+
+
+function attachArtworkFallbackHandlers(root) {
+  if (!root || typeof root.querySelectorAll !== "function" || typeof document === "undefined" || typeof document.createElement !== "function") {
+    return;
+  }
+  for (const image of root.querySelectorAll("img.artist-result-artwork, img.subscription-card-artwork, img.subscription-detail-artwork, img.subscription-album-artwork")) {
+    const replaceWithPlaceholder = () => {
+      if (!image.parentNode) {
+        return;
+      }
+      const placeholder = document.createElement("div");
+      placeholder.className = `${image.className} artwork-placeholder`;
+      placeholder.setAttribute("aria-hidden", "true");
+      placeholder.textContent = "封面";
+      image.replaceWith(placeholder);
+    };
+    image.addEventListener("error", replaceWithPlaceholder, { once: true });
+    if (image.complete && image.naturalWidth === 0) {
+      replaceWithPlaceholder();
+    }
+  }
 }
 
 
@@ -1321,24 +1347,79 @@ function setSubscriptionError(message) {
 }
 
 
+function setSubscriptionFormExpanded(expanded) {
+  const panel = document.getElementById("subscription-form-panel");
+  const button = document.getElementById("toggle-subscription-form-button");
+  if (!panel || !button) {
+    return;
+  }
+  panel.hidden = !expanded;
+  button.setAttribute("aria-expanded", expanded ? "true" : "false");
+  button.textContent = "新增订阅";
+  document.body.classList.toggle("subscription-modal-open", expanded);
+  if (expanded) {
+    window.setTimeout(() => {
+      document.getElementById("artist-search-input")?.focus();
+    }, 0);
+  } else if (document.activeElement && panel.contains(document.activeElement)) {
+    button.focus();
+  }
+}
+
+
+function toggleSubscriptionFormPanel() {
+  const panel = document.getElementById("subscription-form-panel");
+  if (!panel) {
+    return;
+  }
+  setSubscriptionFormExpanded(panel.hidden);
+}
+
+
+function bindSubscriptionFormModal() {
+  const panel = document.getElementById("subscription-form-panel");
+  const closeButton = document.getElementById("close-subscription-form-button");
+  if (!panel || !closeButton) {
+    return;
+  }
+  closeButton.addEventListener("click", () => {
+    setSubscriptionFormExpanded(false);
+  });
+  panel.addEventListener("click", (event) => {
+    if (event.target === panel) {
+      setSubscriptionFormExpanded(false);
+    }
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !panel.hidden) {
+      setSubscriptionFormExpanded(false);
+    }
+  });
+}
+
+
 function renderArtistSearchResults(results) {
   const container = document.getElementById("artist-search-results");
   if (!Array.isArray(results) || results.length === 0) {
     container.innerHTML = '<p class="empty-text">暂无搜索结果</p>';
     return;
   }
-  container.innerHTML = results.map((artist) => `
-    <div class="artist-result">
-      <div class="artist-result-main">
-        ${renderArtworkImage(artist.artistArtworkUrl, artist.artistName || "未知歌手", "artist-result-artwork")}
-        <div>
-          <strong>${escapeHtml(artist.artistName || "未知歌手")}</strong>
-          <p>${escapeHtml((artist.storefront || "").toUpperCase())}</p>
+  container.innerHTML = `
+    <div class="artist-search-results-title">搜索结果 · 点击添加订阅</div>
+    ${results.map((artist) => `
+      <div class="artist-result">
+        <div class="artist-result-main">
+          ${renderArtworkImage(artist.artistArtworkUrl, artist.artistName || "未知歌手", "artist-result-artwork")}
+          <div>
+            <strong>${escapeHtml(artist.artistName || "未知歌手")}</strong>
+            <p>${escapeHtml((artist.storefront || "").toUpperCase())} ${artist.artistId ? `· ${escapeHtml(artist.artistId)}` : ""}</p>
+          </div>
         </div>
+        <button type="button" class="primary-button compact-button artist-subscribe-btn" data-artist-id="${escapeHtml(artist.artistId)}">添加订阅</button>
       </div>
-      <button type="button" class="secondary-button artist-subscribe-btn" data-artist-id="${escapeHtml(artist.artistId)}">订阅</button>
-    </div>
-  `).join("");
+    `).join("")}
+  `;
+  attachArtworkFallbackHandlers(container);
 
   for (const btn of container.querySelectorAll(".artist-subscribe-btn")) {
     btn.addEventListener("click", () => {
@@ -1346,13 +1427,19 @@ function renderArtistSearchResults(results) {
       if (!artist) {
         return;
       }
+      btn.disabled = true;
+      btn.textContent = "添加中";
       handleCreateSubscription({
         artistId: artist.artistId,
         storefront: artist.storefront,
         artistName: artist.artistName,
         artistUrl: artist.artistUrl,
         artistArtworkUrl: artist.artistArtworkUrl,
+      }).then(() => {
+        setSubscriptionFormExpanded(false);
       }).catch((error) => {
+        btn.disabled = false;
+        btn.textContent = "添加订阅";
         setSubscriptionError(error.message || "订阅失败");
       });
     });
@@ -1431,6 +1518,21 @@ function formatSubscriptionActionSummary(payload) {
     pending: "已恢复待确认",
   };
   return `${labels[action] || "已更新"} ${updatedCount} 个专辑`;
+}
+
+
+function getSubscriptionId(subscription) {
+  return String(subscription?.id || "");
+}
+
+
+function getPreferredSubscriptionId(subscriptions) {
+  const list = Array.isArray(subscriptions) ? subscriptions : [];
+  const currentId = String(state.activeSubscriptionId || "");
+  if (currentId && list.some((subscription) => getSubscriptionId(subscription) === currentId)) {
+    return currentId;
+  }
+  return getSubscriptionId(list[0]);
 }
 
 
@@ -1524,46 +1626,101 @@ function renderSubscriptionAlbums(subscription) {
 
 function renderSubscriptionList(subscriptions) {
   const container = document.getElementById("subscription-list");
-  if (!Array.isArray(subscriptions) || subscriptions.length === 0) {
+  const list = Array.isArray(subscriptions) ? subscriptions : [];
+  if (!container) {
+    return;
+  }
+  if (list.length === 0) {
+    state.activeSubscriptionId = "";
     container.innerHTML = '<p class="empty-text">暂无订阅</p>';
     return;
   }
-  container.innerHTML = subscriptions.map((subscription) => `
-    <div class="subscription-item">
-      <div class="subscription-item-top">
-        <div class="subscription-artist-main">
-          ${renderArtworkImage(subscription.artistArtworkUrl, subscription.artistName || "未知歌手", "subscription-artist-artwork")}
-          <div>
-            <strong>${escapeHtml(subscription.artistName || "未知歌手")}</strong>
-            <p>${escapeHtml((subscription.storefront || "").toUpperCase())} · ${escapeHtml(subscription.artistId || "")}</p>
+
+  const activeSubscriptionId = getPreferredSubscriptionId(list);
+  state.activeSubscriptionId = activeSubscriptionId;
+  const activeSubscription = list.find((subscription) => getSubscriptionId(subscription) === activeSubscriptionId) || list[0];
+
+  const cards = list.map((subscription) => {
+    const subscriptionId = getSubscriptionId(subscription);
+    const isActive = subscriptionId === activeSubscriptionId;
+    const statusLabel = subscription.enabled ? "已启用" : "已停用";
+    return `
+      <button type="button" class="subscription-card ${isActive ? "selected" : ""}" data-subscription-id="${escapeHtml(subscriptionId)}" aria-pressed="${isActive ? "true" : "false"}">
+        <div class="subscription-card-artwork-wrap">
+          ${renderArtworkImage(subscription.artistArtworkUrl, subscription.artistName || "未知歌手", "subscription-card-artwork")}
+          <span class="badge subscription-status subscription-card-status">${statusLabel}</span>
+        </div>
+        <div class="subscription-card-copy">
+          <strong>${escapeHtml(subscription.artistName || "未知歌手")}</strong>
+          <p>${escapeHtml((subscription.storefront || "").toUpperCase())} · ${escapeHtml(subscription.artistId || "")}</p>
+        </div>
+        <div class="subscription-card-stats">
+          <span>专辑 ${Number(subscription.albumCount || 0)}</span>
+          <span>待确认 ${Number(subscription.pendingAlbumCount || 0)}</span>
+          <span>进行中 ${Number(subscription.activeAlbumCount || 0)}</span>
+        </div>
+      </button>
+    `;
+  }).join("");
+
+  const detailStats = [
+    ["专辑", activeSubscription.albumCount || 0],
+    ["待确认", activeSubscription.pendingAlbumCount || 0],
+    ["进行中", activeSubscription.activeAlbumCount || 0],
+    ["已完成", activeSubscription.completedAlbumCount || 0],
+    ["失败", activeSubscription.failedAlbumCount || 0],
+    ["忽略", activeSubscription.ignoredAlbumCount || 0],
+    ["已导入", activeSubscription.importedAlbumCount || 0],
+  ];
+
+  const detailPanel = `
+    <section class="subscription-detail-panel" data-subscription-id="${escapeHtml(activeSubscriptionId)}">
+      <div class="subscription-detail-top">
+        <div class="subscription-detail-artist">
+          ${renderArtworkImage(activeSubscription.artistArtworkUrl, activeSubscription.artistName || "未知歌手", "subscription-detail-artwork")}
+          <div class="subscription-detail-copy">
+            <p class="subscription-detail-eyebrow">当前订阅</p>
+            <strong>${escapeHtml(activeSubscription.artistName || "未知歌手")}</strong>
+            <p>${escapeHtml((activeSubscription.storefront || "").toUpperCase())} · ${escapeHtml(activeSubscription.artistId || "")}</p>
           </div>
         </div>
-        <div class="subscription-policy-wrap">
-          <span class="badge subscription-status">${subscription.enabled ? "enabled" : "disabled"}</span>
-          <select class="subscription-policy-select" data-subscription-id="${subscription.id}" aria-label="新专辑策略">
-            <option value="confirm" ${subscription.newAlbumPolicy === "confirm" ? "selected" : ""}>待确认</option>
-            <option value="auto" ${subscription.newAlbumPolicy === "auto" ? "selected" : ""}>自动下载</option>
+        <div class="subscription-detail-controls">
+          <span class="badge subscription-status">${activeSubscription.enabled ? "已启用" : "已停用"}</span>
+          <select class="subscription-policy-select" data-subscription-id="${escapeHtml(activeSubscription.id)}" aria-label="新专辑策略">
+            <option value="confirm" ${activeSubscription.newAlbumPolicy === "confirm" ? "selected" : ""}>待确认</option>
+            <option value="auto" ${activeSubscription.newAlbumPolicy === "auto" ? "selected" : ""}>自动下载</option>
           </select>
+          <button type="button" class="secondary-button compact-button subscription-scan-btn" data-subscription-id="${escapeHtml(activeSubscription.id)}">扫描</button>
+          <button type="button" class="secondary-button compact-button subscription-delete-btn" data-subscription-id="${escapeHtml(activeSubscription.id)}">删除</button>
         </div>
       </div>
-      <div class="subscription-stats">
-        <span>专辑 ${Number(subscription.albumCount || 0)}</span>
-        <span>待确认 ${Number(subscription.pendingAlbumCount || 0)}</span>
-        <span>进行中 ${Number(subscription.activeAlbumCount || 0)}</span>
-        <span>已完成 ${Number(subscription.completedAlbumCount || 0)}</span>
-        <span>失败 ${Number(subscription.failedAlbumCount || 0)}</span>
-        <span>忽略 ${Number(subscription.ignoredAlbumCount || 0)}</span>
-        <span>已导入 ${Number(subscription.importedAlbumCount || 0)}</span>
+      <div class="subscription-stats subscription-detail-stats">
+        ${detailStats.map(([label, value]) => `<span>${escapeHtml(label)} ${Number(value || 0)}</span>`).join("")}
       </div>
-      <p class="history-updated">上次扫描：${escapeHtml(subscription.lastCheckedAt || "未扫描")}</p>
-      ${subscription.lastError ? `<p class="subscription-error-line">${escapeHtml(subscription.lastError)}</p>` : ""}
-      ${renderSubscriptionAlbums(subscription)}
-      <div class="subscription-actions">
-        <button type="button" class="secondary-button subscription-scan-btn" data-subscription-id="${subscription.id}">扫描</button>
-        <button type="button" class="secondary-button subscription-delete-btn" data-subscription-id="${subscription.id}">删除</button>
-      </div>
+      <p class="history-updated">上次扫描：${escapeHtml(activeSubscription.lastCheckedAt || "未扫描")}</p>
+      ${activeSubscription.lastError ? `<p class="subscription-error-line">${escapeHtml(activeSubscription.lastError)}</p>` : ""}
+      ${renderSubscriptionAlbums(activeSubscription)}
+    </section>
+  `;
+
+  container.innerHTML = `
+    <div class="subscription-card-grid" role="list" aria-label="订阅歌手列表">
+      ${cards}
     </div>
-  `).join("");
+    ${detailPanel}
+  `;
+  attachArtworkFallbackHandlers(container);
+
+  for (const card of container.querySelectorAll(".subscription-card")) {
+    card.addEventListener("click", () => {
+      const nextId = card.dataset.subscriptionId || "";
+      if (!nextId || nextId === state.activeSubscriptionId) {
+        return;
+      }
+      state.activeSubscriptionId = nextId;
+      renderSubscriptionList(list);
+    });
+  }
 
   for (const select of container.querySelectorAll(".subscription-policy-select")) {
     select.addEventListener("change", () => {
@@ -1588,8 +1745,8 @@ function renderSubscriptionList(subscriptions) {
   for (const btn of container.querySelectorAll(".subscription-bulk-action-btn")) {
     btn.addEventListener("click", () => {
       const subscriptionId = btn.dataset.subscriptionId || "";
-      const item = btn.closest(".subscription-item");
-      const selectedAlbumIds = item ? [...item.querySelectorAll(".subscription-album-select:checked")].map((input) => input.dataset.albumId || "").filter(Boolean) : [];
+      const detailPanel = btn.closest(".subscription-detail-panel");
+      const selectedAlbumIds = detailPanel ? [...detailPanel.querySelectorAll(".subscription-album-select:checked")].map((input) => input.dataset.albumId || "").filter(Boolean) : [];
       if (selectedAlbumIds.length === 0) {
         setSubscriptionError("请先选择待确认专辑");
         return;
@@ -1626,6 +1783,10 @@ async function refreshSubscriptionList() {
     return;
   }
   const subscriptions = await fetchSubscriptions();
+  if (Array.isArray(subscriptions) && subscriptions.length > 0) {
+    const preferredSubscriptionId = getPreferredSubscriptionId(subscriptions);
+    state.activeSubscriptionId = preferredSubscriptionId || state.activeSubscriptionId;
+  }
   renderSubscriptionList(subscriptions);
 }
 
@@ -1647,6 +1808,9 @@ async function handleCreateSubscription(payload) {
   setSubscriptionError("");
   setSubscriptionNote("");
   const responsePayload = await createSubscription(payload);
+  if (responsePayload?.subscription?.id !== undefined && responsePayload?.subscription?.id !== null) {
+    state.activeSubscriptionId = String(responsePayload.subscription.id);
+  }
   if (responsePayload.scan) {
     setSubscriptionNote(formatSubscriptionScanSummary(getSingleSubscriptionScanPayload(responsePayload.scan)));
   } else {
@@ -1665,6 +1829,7 @@ async function handleCreateSubscriptionFromUrl() {
     return;
   }
   await handleCreateSubscription({ artistUrl });
+  setSubscriptionFormExpanded(false);
 }
 
 
@@ -1859,6 +2024,11 @@ if (typeof document !== "undefined") {
     });
   });
 
+  document.getElementById("toggle-subscription-form-button").addEventListener("click", () => {
+    setSubscriptionFormExpanded(true);
+  });
+  bindSubscriptionFormModal();
+
   document.getElementById("subscription-search-form").addEventListener("submit", (event) => {
     handleArtistSearch(event).catch((error) => {
       setSubscriptionError(error.message || "搜索失败");
@@ -1878,6 +2048,7 @@ if (typeof document !== "undefined") {
   });
 
   clearTaskDetails();
+  setSubscriptionFormExpanded(false);
   refreshTaskList().catch(() => {});
   refreshHistoryList().catch(() => {});
   refreshSubscriptionList().catch(() => {});
@@ -1912,6 +2083,7 @@ if (typeof module !== "undefined") {
     mergeLogLines,
     normalizeHistoryStatus,
     renderArtworkImage,
+    renderArtistSearchResults,
     renderSubscriptionAlbums,
     renderSubscriptionList,
     renderHistoryList,
@@ -1925,3 +2097,4 @@ if (typeof module !== "undefined") {
     shouldOpenNewStream,
   };
 }
+

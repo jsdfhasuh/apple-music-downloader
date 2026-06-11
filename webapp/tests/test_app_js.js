@@ -20,6 +20,7 @@ const {
   mergeLogLines,
   normalizeHistoryStatus,
   renderArtworkImage,
+  renderArtistSearchResults,
   renderHistoryList,
   renderResult,
   renderSubscriptionAlbums,
@@ -343,6 +344,7 @@ test("getSafeImageUrl only allows http image URLs", () => {
   assert.equal(getSafeImageUrl("https://[bad"), "")
 })
 
+
 test("renderArtworkImage renders safe images and placeholders", () => {
   const safe = renderArtworkImage(
     "https://is1-ssl.mzstatic.com/image/thumb/example/512x512bb.jpg",
@@ -378,7 +380,24 @@ test("renderSubscriptionAlbums includes album artwork", () => {
   assert.match(html, /New Album/)
 })
 
-test("renderSubscriptionList includes artist artwork", () => {
+test("renderArtistSearchResults shows direct add subscription actions", () => {
+  withFakeElement("artist-search-results", (element) => {
+    renderArtistSearchResults([{
+      artistId: "12345",
+      artistName: "Example Artist",
+      storefront: "cn",
+      artistUrl: "https://music.apple.com/cn/artist/example/12345",
+      artistArtworkUrl: "https://is1-ssl.mzstatic.com/image/thumb/artist-example/512x512bb.jpg",
+    }])
+
+    assert.match(element.innerHTML, /搜索结果 · 点击添加订阅/)
+    assert.match(element.innerHTML, /class="primary-button compact-button artist-subscribe-btn"/)
+    assert.match(element.innerHTML, /添加订阅/)
+    assert.match(element.innerHTML, /Example Artist/)
+  })
+})
+
+test("renderSubscriptionList renders card grid and active detail panel", () => {
   withFakeElement("subscription-list", (element) => {
     renderSubscriptionList([{
       id: 7,
@@ -388,12 +407,50 @@ test("renderSubscriptionList includes artist artwork", () => {
       artistArtworkUrl: "https://is1-ssl.mzstatic.com/image/thumb/artist-example/512x512bb.jpg",
       enabled: true,
       newAlbumPolicy: "confirm",
+      albumCount: 1,
+      pendingAlbumCount: 0,
+      activeAlbumCount: 0,
+      completedAlbumCount: 1,
+      failedAlbumCount: 0,
+      ignoredAlbumCount: 0,
+      importedAlbumCount: 0,
+      lastCheckedAt: "2026-06-11 10:00:00",
+      recentAlbums: [{
+        albumId: "111",
+        albumName: "New Album",
+        albumUrl: "https://music.apple.com/cn/album/new-album/111",
+        artworkUrl: "https://is1-ssl.mzstatic.com/image/thumb/album-111/512x512bb.jpg",
+        releaseDate: "2026-06-01",
+        userState: "pending",
+        detectedStatus: "missing",
+        canDownload: true,
+      }],
+    }, {
+      id: 8,
+      artistName: "Second Artist",
+      artistId: "67890",
+      storefront: "us",
+      artistArtworkUrl: "https://is1-ssl.mzstatic.com/image/thumb/artist-second/512x512bb.jpg",
+      enabled: true,
+      newAlbumPolicy: "auto",
+      albumCount: 0,
+      pendingAlbumCount: 0,
+      activeAlbumCount: 0,
+      completedAlbumCount: 0,
+      failedAlbumCount: 0,
+      ignoredAlbumCount: 0,
+      importedAlbumCount: 0,
+      lastCheckedAt: "",
       recentAlbums: [],
     }])
 
-    assert.match(element.innerHTML, /class="subscription-artist-artwork"/)
-    assert.match(element.innerHTML, /artist-example\/512x512bb\.jpg/)
+    assert.match(element.innerHTML, /class="subscription-card-grid"/)
+    assert.match(element.innerHTML, /class="subscription-card selected"/)
+    assert.match(element.innerHTML, /class="subscription-card-artwork"/)
+    assert.match(element.innerHTML, /class="subscription-detail-panel"/)
+    assert.match(element.innerHTML, /class="subscription-detail-artwork"/)
     assert.match(element.innerHTML, /Example Artist/)
+    assert.match(element.innerHTML, /New Album/)
   })
 })
 
@@ -671,3 +728,4 @@ test("retrySingleHistory posts url to history retry endpoint", async () => {
 
   global.fetch = originalFetch
 })
+

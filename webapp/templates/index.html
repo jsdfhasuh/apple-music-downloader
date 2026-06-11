@@ -183,27 +183,41 @@
 
           <section class="view-panel subscriptions-view" id="subscriptions" data-view="subscriptions" hidden>
             <section class="panel subscription-panel">
-              <div class="panel-header">
+              <div class="subscription-panel-header">
                 <div>
                   <h3>歌手订阅</h3>
                   <p>搜索歌手、订阅并扫描新专辑。</p>
                 </div>
-                <button id="scan-subscriptions-button" type="button" class="secondary-button">扫描全部</button>
+                <div class="subscription-toolbar">
+                  <button id="toggle-subscription-form-button" type="button" class="secondary-button" aria-expanded="false" aria-controls="subscription-form-panel" onclick="document.getElementById('subscription-form-panel').hidden=false;document.body.classList.add('subscription-modal-open');this.setAttribute('aria-expanded','true');setTimeout(() => document.getElementById('artist-search-input')?.focus(), 0)">新增订阅</button>
+                  <button id="scan-subscriptions-button" type="button" class="secondary-button">扫描全部</button>
+                </div>
               </div>
-              <form id="subscription-search-form" class="stacked-form">
-                <label class="field">
-                  <span>搜索歌手</span>
-                  <input id="artist-search-input" name="artist-search" type="search" placeholder="Artist name">
-                </label>
-                <button type="submit" class="secondary-button full-width">搜索</button>
-              </form>
-              <div id="artist-search-results" class="artist-search-results"></div>
-              <div class="url-subscribe-row">
-                <label class="field">
-                  <span>歌手链接</span>
-                  <input id="artist-url-input" name="artist-url" type="url" placeholder="https://music.apple.com/.../artist/...">
-                </label>
-                <button id="subscribe-url-button" type="button" class="primary-button compact-button">订阅</button>
+              <div id="subscription-form-panel" class="subscription-form-panel" role="dialog" aria-modal="true" aria-labelledby="subscription-form-title" onclick="if (event.target === this) { this.hidden=true; document.body.classList.remove('subscription-modal-open'); document.getElementById('toggle-subscription-form-button')?.setAttribute('aria-expanded','false'); }" hidden>
+                <div class="subscription-modal-card">
+                  <div class="subscription-modal-header">
+                    <div>
+                      <h4 id="subscription-form-title">新增订阅</h4>
+                      <p>搜索歌手或粘贴 Apple Music 歌手链接。</p>
+                    </div>
+                    <button id="close-subscription-form-button" type="button" class="secondary-button compact-button" aria-label="关闭新增订阅" onclick="document.getElementById('subscription-form-panel').hidden=true;document.body.classList.remove('subscription-modal-open');document.getElementById('toggle-subscription-form-button')?.setAttribute('aria-expanded','false')">关闭</button>
+                  </div>
+                  <form id="subscription-search-form" class="stacked-form">
+                    <label class="field">
+                      <span>搜索歌手</span>
+                      <input id="artist-search-input" name="artist-search" type="search" placeholder="Artist name">
+                    </label>
+                    <button type="submit" class="secondary-button full-width">搜索</button>
+                  </form>
+                  <div id="artist-search-results" class="artist-search-results"></div>
+                  <div class="url-subscribe-row">
+                    <label class="field">
+                      <span>歌手链接</span>
+                      <input id="artist-url-input" name="artist-url" type="url" placeholder="https://music.apple.com/.../artist/...">
+                    </label>
+                    <button id="subscribe-url-button" type="button" class="primary-button compact-button">订阅</button>
+                  </div>
+                </div>
               </div>
               <p id="subscription-error" class="error-text"></p>
               <p id="subscription-note" class="info-text"></p>

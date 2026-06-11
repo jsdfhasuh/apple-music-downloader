@@ -751,9 +751,316 @@ select:focus {
   margin-top: 11px;
 }
 
+.subscription-panel-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 14px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.subscription-panel-header h3 {
+  margin-bottom: 4px;
+  font-size: 16px;
+  line-height: 1.25;
+}
+
+.subscription-panel-header p {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.subscription-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.subscription-form-panel {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(15, 23, 42, 0.46);
+  backdrop-filter: blur(3px);
+}
+
+.subscription-form-panel[hidden] {
+  display: none;
+}
+
+body.subscription-modal-open {
+  overflow: hidden;
+}
+
+.subscription-modal-card {
+  display: grid;
+  gap: 12px;
+  width: min(620px, 100%);
+  max-height: min(86vh, 680px);
+  overflow: auto;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  box-shadow: 0 24px 80px rgba(15, 23, 42, 0.24);
+}
+
+.subscription-modal-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.subscription-modal-header h4 {
+  margin: 0 0 4px;
+  color: var(--text);
+  font-size: 16px;
+  line-height: 1.25;
+}
+
+.subscription-modal-header p {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.subscription-panel .error-text:empty,
+.subscription-panel .info-text:empty {
+  display: none;
+}
+
+.subscription-list {
+  display: grid;
+  gap: 14px;
+  margin-top: 11px;
+  max-height: none;
+  overflow: visible;
+}
+
+.subscription-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 180px));
+  gap: 10px;
+  justify-content: start;
+}
+
+.subscription-card {
+  display: grid;
+  gap: 10px;
+  align-content: start;
+  justify-items: center;
+  min-height: 180px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+  color: var(--text);
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease, transform 120ms ease, box-shadow 120ms ease;
+}
+
+.subscription-card:hover {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+  transform: translateY(-1px);
+}
+
+.subscription-card.selected {
+  border-color: var(--blue);
+  background: #edf5ff;
+  box-shadow: inset 3px 0 0 var(--blue);
+}
+
+.subscription-card:focus-visible {
+  outline: 3px solid rgba(0, 113, 227, 0.18);
+  outline-offset: 2px;
+}
+
+.subscription-card-artwork-wrap {
+  position: relative;
+  display: grid;
+  justify-items: center;
+  padding-top: 2px;
+}
+
+.subscription-card-artwork,
+.subscription-detail-artwork {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border: 1px solid var(--border-soft);
+  background: #eef2f7;
+  color: var(--muted);
+  object-fit: cover;
+  border-radius: 999px;
+}
+
+.subscription-card-artwork {
+  width: 82px;
+  height: 82px;
+}
+
+.subscription-detail-artwork {
+  width: 56px;
+  height: 56px;
+}
+
+.subscription-card-status {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  transform: translate(8px, 4px);
+}
+
+.subscription-card-copy {
+  width: 100%;
+  min-width: 0;
+}
+
+.subscription-card-copy strong {
+  display: block;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 850;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subscription-card-copy p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+  text-align: center;
+  word-break: break-all;
+}
+
+.subscription-card-stats {
+  display: flex;
+  justify-content: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.subscription-card-stats span,
+.subscription-detail-stats span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 4px 7px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: #ffffff;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.subscription-detail-panel {
+  grid-column: 1 / -1;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+
+.subscription-detail-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.subscription-detail-artist {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.subscription-detail-copy {
+  min-width: 0;
+}
+
+.subscription-detail-copy strong {
+  display: block;
+  margin-top: 2px;
+  color: var(--text);
+  font-size: 16px;
+  line-height: 1.25;
+}
+
+.subscription-detail-copy p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  word-break: break-all;
+}
+
+.subscription-detail-eyebrow {
+  color: var(--blue);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.subscription-detail-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.subscription-detail-controls .subscription-policy-select {
+  min-width: 120px;
+}
+
+.subscription-detail-stats {
+  justify-content: flex-start;
+  margin-top: 10px;
+}
+
+.subscription-detail-panel .history-updated {
+  margin-top: 8px;
+}
+
 .artist-search-results,
 .subscription-list {
   margin-top: 11px;
+}
+
+.artist-search-results {
+  display: grid;
+  gap: 8px;
+}
+
+.artist-search-results-title {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 850;
+  text-transform: uppercase;
 }
 
 .artist-result-main,
@@ -790,6 +1097,10 @@ select:focus {
 .artist-result-artwork {
   width: 44px;
   height: 44px;
+}
+
+.artist-result .artist-subscribe-btn {
+  flex: 0 0 auto;
 }
 
 .subscription-artist-artwork {
@@ -843,13 +1154,14 @@ select:focus {
 }
 
 .subscription-albums {
+  display: grid;
+  gap: 8px;
   margin-top: 12px;
   padding-top: 10px;
   border-top: 1px solid var(--border-soft);
 }
 
 .subscription-albums-title {
-  margin-bottom: 8px;
   color: var(--muted);
   font-size: 11px;
   font-weight: 850;
@@ -862,7 +1174,6 @@ select:focus {
   justify-content: flex-end;
   gap: 8px;
   flex-wrap: wrap;
-  margin-bottom: 8px;
 }
 
 .subscription-album-bulk span {
@@ -875,10 +1186,14 @@ select:focus {
 .subscription-albums ul {
   display: grid;
   gap: 7px;
-  max-height: 360px;
-  overflow: auto;
+  max-height: min(44vh, 420px);
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   margin: 0;
-  padding: 0;
+  padding: 0 4px 0 0;
   list-style: none;
 }
 
@@ -1114,11 +1429,58 @@ select:focus {
   .topbar,
   .panel-header,
   .action-row,
+  .subscription-panel-header,
+  .subscription-detail-top,
+  .subscription-detail-artist,
+  .subscription-detail-controls,
+  .subscription-toolbar,
   .history-item-top,
   .subscription-item-top,
   .subscription-album-item {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .subscription-card-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .subscription-card {
+    padding: 10px;
+  }
+
+  .subscription-card-artwork {
+    width: 72px;
+    height: 72px;
+  }
+
+  .subscription-detail-artwork {
+    width: 52px;
+    height: 52px;
+  }
+
+  .subscription-card-status {
+    position: static;
+    transform: none;
+    justify-self: center;
+  }
+
+  .subscription-form-panel {
+    align-items: start;
+    padding: 12px;
+  }
+
+  .subscription-modal-card {
+    max-height: calc(100vh - 24px);
+  }
+
+  .subscription-modal-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .subscription-albums ul {
+    max-height: min(52vh, 460px);
   }
 
   .topbar-meta {
