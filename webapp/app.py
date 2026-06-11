@@ -1,4 +1,6 @@
+import hashlib
 import json
+import mimetypes
 import re
 import sqlite3
 import subprocess
@@ -11,8 +13,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Generator
+from urllib import error as urllib_error
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
 
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request, send_file
 
 from webapp.apple_music import AppleMusicAlbum, AppleMusicArtist, AppleMusicClient, parseAlbumIdFromUrl, parseArtistUrl
 from webapp.config_loader import getConfigValue, resolveConfigPath
@@ -44,6 +49,25 @@ ALBUM_USER_STATES = {
 ALBUM_DETECTED_ACTIVE = {"queued", "running"}
 ALBUM_DETECTED_NEEDS_CONFIRM = {"missing", "failed_history", "stale_history"}
 ALBUM_DETECTED_STATUSES = ALBUM_DETECTED_ACTIVE | ALBUM_DETECTED_NEEDS_CONFIRM | {"completed", "seen"}
+ARTWORK_CACHE_TIMEOUT_SECONDS = 15
+ARTWORK_CACHE_MAX_BYTES = 5 * 1024 * 1024
+ARTWORK_HOST_SUFFIX = "mzstatic.com"
+ARTWORK_CONTENT_TYPE_EXTENSIONS = {
+  "image/jpeg": ".jpg",
+  "image/jpg": ".jpg",
+  "image/png": ".png",
+  "image/webp": ".webp",
+  "image/gif": ".gif",
+  "image/avif": ".avif",
+}
+ARTWORK_EXTENSION_CONTENT_TYPES = {
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".png": "image/png",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
+  ".avif": "image/avif",
+}
 
 
 @dataclass
@@ -1686,6 +1710,110 @@ def getStaticVersion(app: Flask) -> str:
   return str(max(mtimes)) if mtimes else "1"
 
 
+def normalizeArtworkUrl(value: str) -> str:
+  rawUrl = str(value or "").strip()
+  if not rawUrl:
+    return ""
+  try:
+    parsed = urllib_parse.urlparse(rawUrl)
+    hostname = (parsed.hostname or "").lower()
+  except ValueError:
+    return ""
+  if parsed.scheme.lower() not in {"http", "https"}:
+    return ""
+  if not hostname or (hostname != ARTWORK_HOST_SUFFIX and not hostname.endswith(f".{ARTWORK_HOST_SUFFIX}")):
+    return ""
+  if not parsed.path:
+    return ""
+  return rawUrl
+
+
+def getArtworkCacheDir(app: Flask) -> Path:
+  configuredPath = app.config.get("ARTWORK_CACHE_DIR")
+  cacheDir = Path(configuredPath) if configuredPath else Path("data/artwork_cache")
+  return cacheDir if cacheDir.is_absolute() else cacheDir.resolve()
+
+
+def getArtworkCacheKey(url: str) -> str:
+  return hashlib.sha256(url.encode("utf-8")).hexdigest()
+
+
+def getCachedArtworkPath(cacheDir: Path, cacheKey: str) -> Path | None:
+  for path in cacheDir.glob(f"{cacheKey}.*"):
+    if path.is_file():
+      return path
+  return None
+
+
+def normalizeArtworkContentType(value: str) -> str:
+  return str(value or "").split(";", 1)[0].strip().lower()
+
+
+def guessArtworkContentType(path: Path) -> str:
+  suffix = path.suffix.lower()
+  if suffix in ARTWORK_EXTENSION_CONTENT_TYPES:
+    return ARTWORK_EXTENSION_CONTENT_TYPES[suffix]
+  return mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+
+
+def fetchRemoteArtwork(url: str) -> tuple[bytes, str]:
+  requestHeaders = {
+    "Accept": "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8,*/*;q=0.5",
+    "User-Agent": "apple-music-webapp/1.0",
+  }
+  upstreamRequest = urllib_request.Request(url, headers=requestHeaders)
+  with urllib_request.urlopen(upstreamRequest, timeout=ARTWORK_CACHE_TIMEOUT_SECONDS) as response:
+    contentType = normalizeArtworkContentType(response.headers.get("Content-Type", ""))
+    contentLength = response.headers.get("Content-Length")
+    if contentLength:
+      try:
+        contentLengthBytes = int(contentLength)
+      except ValueError:
+        contentLengthBytes = 0
+      if contentLengthBytes > ARTWORK_CACHE_MAX_BYTES:
+        raise ValueError("artwork image is too large")
+
+    chunks: list[bytes] = []
+    totalBytes = 0
+    while True:
+      chunk = response.read(64 * 1024)
+      if not chunk:
+        break
+      totalBytes += len(chunk)
+      if totalBytes > ARTWORK_CACHE_MAX_BYTES:
+        raise ValueError("artwork image is too large")
+      chunks.append(chunk)
+  return b"".join(chunks), contentType
+
+
+def getOrFetchArtwork(app: Flask, url: str) -> tuple[Path, str]:
+  cacheDir = getArtworkCacheDir(app)
+  cacheKey = getArtworkCacheKey(url)
+  cachedPath = getCachedArtworkPath(cacheDir, cacheKey)
+  if cachedPath is not None:
+    return cachedPath, guessArtworkContentType(cachedPath)
+
+  fetcher = app.config.get("ARTWORK_FETCHER", fetchRemoteArtwork)
+  imageBytes, rawContentType = fetcher(url)
+  contentType = normalizeArtworkContentType(rawContentType)
+  extension = ARTWORK_CONTENT_TYPE_EXTENSIONS.get(contentType)
+  if extension is None:
+    raise ValueError("upstream did not return a supported image")
+  if not imageBytes:
+    raise ValueError("upstream returned an empty image")
+
+  cacheDir.mkdir(parents=True, exist_ok=True)
+  cachePath = cacheDir / f"{cacheKey}{extension}"
+  temporaryPath = cacheDir / f"{cacheKey}.{uuid.uuid4().hex}.tmp"
+  try:
+    temporaryPath.write_bytes(imageBytes)
+    temporaryPath.replace(cachePath)
+  finally:
+    if temporaryPath.exists():
+      temporaryPath.unlink()
+  return cachePath, contentType
+
+
 def detectSubscriptionAlbumStatus(
   historyStore: DownloadHistoryStore,
   taskStore: TaskStore,
@@ -2078,10 +2206,26 @@ def createApp(
   app.config["SUBSCRIPTION_SCAN_LOCK"] = threading.Lock()
   app.config["RUNNER_FACTORY"] = runnerFactory or (lambda: PipelineRunner(DownloaderRunner()))
   app.config["APPLE_MUSIC_CLIENT_FACTORY"] = appleMusicClientFactory or (lambda: AppleMusicClient())
+  app.config["ARTWORK_CACHE_DIR"] = Path(historyDbPath).parent / "artwork_cache"
 
   @app.get("/")
   def index() -> str:
     return render_template("index.html", static_version=getStaticVersion(app))
+
+  @app.get("/api/artwork")
+  def artworkRoute():
+    artworkUrl = normalizeArtworkUrl(str(request.args.get("url", "")))
+    if not artworkUrl:
+      return jsonify({"error": "invalid artwork URL"}), 400
+    try:
+      cachePath, contentType = getOrFetchArtwork(app, artworkUrl)
+    except ValueError as exc:
+      return jsonify({"error": str(exc)}), 502
+    except urllib_error.URLError as exc:
+      return jsonify({"error": str(exc)}), 502
+    except TimeoutError:
+      return jsonify({"error": "artwork request timed out"}), 502
+    return send_file(cachePath, mimetype=contentType, conditional=True, max_age=7 * 24 * 60 * 60)
 
   @app.post("/api/tasks")
   def createTaskRoute():

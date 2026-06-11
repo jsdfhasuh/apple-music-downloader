@@ -11,6 +11,7 @@ const {
   formatSubscriptionScanSummary,
   formatHistoryRetrySummary,
   formatRetryFailedSummary,
+  getCachedArtworkUrl,
   getSafeImageUrl,
   getTaskAlbumName,
   getInitialViewName,
@@ -344,6 +345,13 @@ test("getSafeImageUrl only allows http image URLs", () => {
   assert.equal(getSafeImageUrl("https://[bad"), "")
 })
 
+test("getCachedArtworkUrl builds local artwork cache URLs", () => {
+  assert.equal(
+    getCachedArtworkUrl("https://is1-ssl.mzstatic.com/image/thumb/example/512x512bb.jpg"),
+    "/api/artwork?url=https%3A%2F%2Fis1-ssl.mzstatic.com%2Fimage%2Fthumb%2Fexample%2F512x512bb.jpg"
+  )
+  assert.equal(getCachedArtworkUrl("javascript:alert(1)"), "")
+})
 
 test("renderArtworkImage renders safe images and placeholders", () => {
   const safe = renderArtworkImage(
@@ -354,7 +362,7 @@ test("renderArtworkImage renders safe images and placeholders", () => {
   const unsafe = renderArtworkImage("javascript:alert(1)", "Bad", "subscription-album-artwork")
 
   assert.match(safe, /<img class="subscription-album-artwork"/)
-  assert.match(safe, /src="https:\/\/is1-ssl\.mzstatic\.com\/image\/thumb\/example\/512x512bb\.jpg"/)
+  assert.match(safe, /src="\/api\/artwork\?url=https%3A%2F%2Fis1-ssl\.mzstatic\.com%2Fimage%2Fthumb%2Fexample%2F512x512bb\.jpg"/)
   assert.match(safe, /alt="Album &amp; Artist"/)
   assert.match(unsafe, /artwork-placeholder/)
   assert.doesNotMatch(unsafe, /src=/)
@@ -376,7 +384,7 @@ test("renderSubscriptionAlbums includes album artwork", () => {
   })
 
   assert.match(html, /class="subscription-album-artwork"/)
-  assert.match(html, /album-111\/512x512bb\.jpg/)
+  assert.match(html, /album-111%2F512x512bb\.jpg/)
   assert.match(html, /New Album/)
 })
 
@@ -728,4 +736,3 @@ test("retrySingleHistory posts url to history retry endpoint", async () => {
 
   global.fetch = originalFetch
 })
-

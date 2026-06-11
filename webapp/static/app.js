@@ -563,6 +563,10 @@ function getSafeImageUrl(value) {
 }
 
 
+function getCachedArtworkUrl(value) {
+  const safeUrl = getSafeImageUrl(value);
+  return safeUrl ? `/api/artwork?url=${encodeURIComponent(safeUrl)}` : "";
+}
 
 
 function renderArtworkImage(url, alt, className) {
@@ -571,7 +575,7 @@ function renderArtworkImage(url, alt, className) {
   if (!safeUrl) {
     return `<div class="${className} artwork-placeholder" aria-hidden="true">封面</div>`;
   }
-  return `<img class="${className}" src="${escapeHtml(safeUrl)}" alt="${escapedAlt}" loading="lazy">`;
+  return `<img class="${className}" src="${escapeHtml(getCachedArtworkUrl(safeUrl))}" alt="${escapedAlt}" loading="lazy" decoding="async">`;
 }
 
 
@@ -2072,6 +2076,7 @@ if (typeof module !== "undefined") {
     formatAlbumTitleFromUrl,
     formatRetryFailedSummary,
     getSafeImageUrl,
+    getCachedArtworkUrl,
     getAlbumDetectedStatus,
     getAlbumStatusLabel,
     getAlbumUserStateLabel,
@@ -2097,4 +2102,3 @@ if (typeof module !== "undefined") {
     shouldOpenNewStream,
   };
 }
-

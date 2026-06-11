@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 
 from webapp.apple_music import AppleMusicAlbum, AppleMusicArtist, formatArtworkUrl
-from webapp.app import ArtistSubscriptionStore, DownloadHistoryStore, DownloadTask, DownloaderRunner, PipelineRunner, createApp, updateTaskFromLine
+from webapp.app import ArtistSubscriptionStore, DownloadHistoryStore, DownloadTask, DownloaderRunner, PipelineRunner, createApp, getArtworkCacheDir, updateTaskFromLine
 
 
 class FakeRunner:
@@ -1563,6 +1563,54 @@ class FlaskDashboardTest(unittest.TestCase):
     self.assertEqual(formatArtworkUrl({"url": "javascript:alert(1)"}), "")
     self.assertEqual(formatArtworkUrl({"url": "https://[bad"}), "")
     self.assertEqual(formatArtworkUrl(None), "")
+
+  def testArtworkRouteRejectsUnsafeUrls(self):
+    for url in [
+      "javascript:alert(1)",
+      "https://example.com/image/thumb/example/512x512bb.jpg",
+      "https://bad-mzstatic.com/image/thumb/example/512x512bb.jpg",
+      "https://[bad",
+    ]:
+      response = self.client.get("/api/artwork", query_string={"url": url})
+      self.assertEqual(response.status_code, 400, url)
+
+  def testArtworkRouteCachesAppleArtwork(self):
+    calls = []
+
+    def fakeFetcher(url):
+      calls.append(url)
+      return b"fake image bytes", "image/jpeg"
+
+    artworkUrl = "https://is1-ssl.mzstatic.com/image/thumb/example/512x512bb.jpg"
+    cacheDir = Path(self.tempDir.name) / "artwork-cache"
+    self.client.application.config["ARTWORK_CACHE_DIR"] = cacheDir
+    self.client.application.config["ARTWORK_FETCHER"] = fakeFetcher
+
+    firstResponse = self.client.get("/api/artwork", query_string={"url": artworkUrl})
+    secondResponse = self.client.get("/api/artwork", query_string={"url": artworkUrl})
+
+    self.assertEqual(firstResponse.status_code, 200)
+    self.assertEqual(firstResponse.data, b"fake image bytes")
+    self.assertEqual(firstResponse.content_type.split(";", 1)[0], "image/jpeg")
+    self.assertEqual(secondResponse.status_code, 200)
+    self.assertEqual(secondResponse.data, b"fake image bytes")
+    self.assertEqual(calls, [artworkUrl])
+    self.assertEqual(len(list(cacheDir.glob("*.jpg"))), 1)
+
+  def testArtworkCacheDirResolvesRelativePaths(self):
+    self.client.application.config["ARTWORK_CACHE_DIR"] = Path("data/artwork_cache")
+
+    self.assertTrue(getArtworkCacheDir(self.client.application).is_absolute())
+
+  def testArtworkRouteRejectsUnsupportedUpstreamContentType(self):
+    self.client.application.config["ARTWORK_FETCHER"] = lambda _url: (b"<svg></svg>", "image/svg+xml")
+
+    response = self.client.get(
+      "/api/artwork",
+      query_string={"url": "https://is1-ssl.mzstatic.com/image/thumb/example/512x512bb.jpg"},
+    )
+
+    self.assertEqual(response.status_code, 502)
 
   def testLegacySubscriptionMigrationDefaultsPolicyToConfirm(self):
     dbPath = Path(self.tempDir.name) / "legacy-subscriptions.db"

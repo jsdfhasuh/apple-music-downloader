@@ -20,6 +20,8 @@ tools/**/__pycache__/
 tools/**/*.pyc
 webapp/**/__pycache__/
 webapp/**/*.pyc
+data/artwork_cache/
+webapp/data/artwork_cache/
 webapp/data/*.db
 webapp/config.yaml
 !utils/*
