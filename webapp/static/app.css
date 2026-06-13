@@ -487,6 +487,22 @@ select:focus {
   border-color: #b8c4d0;
 }
 
+.primary-button:disabled,
+.secondary-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.46;
+}
+
+.primary-button:disabled:hover {
+  border-color: var(--blue);
+  background: var(--blue);
+}
+
+.secondary-button:disabled:hover {
+  border-color: var(--border);
+  background: #ffffff;
+}
+
 .compact-button {
   min-width: 64px;
 }
@@ -1171,16 +1187,30 @@ body.subscription-modal-open {
 .subscription-album-bulk {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: space-between;
   gap: 8px;
   flex-wrap: wrap;
+  min-width: 0;
 }
 
-.subscription-album-bulk span {
+.subscription-album-selection-summary {
   margin-right: auto;
   color: var(--muted);
   font-size: 11px;
   font-weight: 850;
+  white-space: nowrap;
+}
+
+.subscription-album-selection-actions,
+.subscription-album-bulk-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.subscription-album-bulk-actions {
+  margin-left: auto;
 }
 
 .subscription-albums ul {
@@ -1481,6 +1511,17 @@ body.subscription-modal-open {
 
   .subscription-albums ul {
     max-height: min(52vh, 460px);
+  }
+
+  .subscription-album-bulk,
+  .subscription-album-selection-actions,
+  .subscription-album-bulk-actions {
+    align-items: stretch;
+    width: 100%;
+  }
+
+  .subscription-album-selection-summary {
+    width: 100%;
   }
 
   .topbar-meta {

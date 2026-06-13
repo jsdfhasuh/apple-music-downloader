@@ -4,6 +4,7 @@ const assert = require("node:assert/strict")
 const {
   bindViewNavigation,
   bindSidebarToggle,
+  clearAllSubscriptionAlbumSelections,
   compareAlbumsByReleaseDateDesc,
   cancelTask,
   formatAlbumTitleFromUrl,
@@ -13,6 +14,7 @@ const {
   formatRetryFailedSummary,
   getCachedArtworkUrl,
   getSafeImageUrl,
+  getSelectedSubscriptionAlbumIds,
   getTaskAlbumName,
   getInitialViewName,
   getSingleSubscriptionScanPayload,
@@ -30,7 +32,9 @@ const {
   retryFailedTasks,
   retryHistoryFailedTasks,
   retrySingleHistory,
+  selectAllSelectableSubscriptionAlbums,
   setSidebarCollapsed,
+  setSubscriptionAlbumSelected,
   showView,
   shouldOpenNewStream,
 } = require("../static/app.js")
@@ -369,6 +373,7 @@ test("renderArtworkImage renders safe images and placeholders", () => {
 })
 
 test("renderSubscriptionAlbums includes album artwork", () => {
+  clearAllSubscriptionAlbumSelections()
   const html = renderSubscriptionAlbums({
     id: 7,
     recentAlbums: [{
@@ -386,6 +391,139 @@ test("renderSubscriptionAlbums includes album artwork", () => {
   assert.match(html, /class="subscription-album-artwork"/)
   assert.match(html, /album-111%2F512x512bb\.jpg/)
   assert.match(html, /New Album/)
+})
+
+test("renderSubscriptionAlbums shows bulk selection controls and selected count", () => {
+  clearAllSubscriptionAlbumSelections()
+  setSubscriptionAlbumSelected(7, "111", true)
+
+  const html = renderSubscriptionAlbums({
+    id: 7,
+    recentAlbums: [{
+      albumId: "111",
+      albumName: "First Pending",
+      albumUrl: "https://music.apple.com/cn/album/first/111",
+      releaseDate: "2026-06-02",
+      userState: "pending",
+      detectedStatus: "missing",
+    }, {
+      albumId: "222",
+      albumName: "Second Pending",
+      albumUrl: "https://music.apple.com/cn/album/second/222",
+      releaseDate: "2026-06-01",
+      userState: "pending",
+      detectedStatus: "failed_history",
+    }, {
+      albumId: "333",
+      albumName: "Done",
+      albumUrl: "https://music.apple.com/cn/album/done/333",
+      releaseDate: "2026-05-01",
+      userState: "subscribed",
+      detectedStatus: "completed",
+    }],
+  })
+
+  assert.match(html, /待确认 2 · 已选 1/)
+  assert.match(html, /全选待确认/)
+  assert.match(html, /清空选择/)
+  assert.match(html, /下载已选/)
+  assert.match(html, /忽略已选/)
+  assert.match(html, /标记已导入/)
+})
+
+test("renderSubscriptionAlbums restores checked album selections after rerender", () => {
+  clearAllSubscriptionAlbumSelections()
+  setSubscriptionAlbumSelected(7, "111", true)
+  const subscription = {
+    id: 7,
+    recentAlbums: [{
+      albumId: "111",
+      albumName: "Selected Album",
+      albumUrl: "https://music.apple.com/cn/album/selected/111",
+      releaseDate: "2026-06-01",
+      userState: "pending",
+      detectedStatus: "missing",
+    }],
+  }
+
+  const firstRender = renderSubscriptionAlbums(subscription)
+  const secondRender = renderSubscriptionAlbums(subscription)
+
+  assert.match(firstRender, /<input[^>]+data-album-id="111"[^>]+checked/)
+  assert.match(secondRender, /<input[^>]+data-album-id="111"[^>]+checked/)
+  assert.match(secondRender, /待确认 1 · 已选 1/)
+})
+
+test("selectAllSelectableSubscriptionAlbums only selects downloadable pending albums", () => {
+  clearAllSubscriptionAlbumSelections()
+  const subscription = {
+    id: 7,
+    recentAlbums: [{
+      albumId: "111",
+      userState: "pending",
+      detectedStatus: "missing",
+    }, {
+      albumId: "222",
+      userState: "pending",
+      detectedStatus: "failed_history",
+    }, {
+      albumId: "333",
+      userState: "pending",
+      detectedStatus: "completed",
+    }, {
+      albumId: "444",
+      userState: "subscribed",
+      detectedStatus: "missing",
+    }, {
+      albumId: "555",
+      userState: "ignored",
+      detectedStatus: "missing",
+      canDownload: true,
+    }, {
+      albumId: "666",
+      userState: "imported",
+      detectedStatus: "failed_history",
+      canDownload: true,
+    }, {
+      albumId: "777",
+      userState: "pending",
+      detectedStatus: "running",
+    }, {
+      albumId: "888",
+      userState: "pending",
+      detectedStatus: "seen",
+    }],
+  }
+
+  assert.deepEqual(selectAllSelectableSubscriptionAlbums(subscription), ["111", "222"])
+  assert.deepEqual(getSelectedSubscriptionAlbumIds(7), ["111", "222"])
+})
+
+test("renderSubscriptionAlbums prunes selections that are no longer selectable", () => {
+  clearAllSubscriptionAlbumSelections()
+  setSubscriptionAlbumSelected(7, "111", true)
+  setSubscriptionAlbumSelected(7, "333", true)
+
+  const html = renderSubscriptionAlbums({
+    id: 7,
+    recentAlbums: [{
+      albumId: "111",
+      albumName: "Still Pending",
+      albumUrl: "https://music.apple.com/cn/album/still-pending/111",
+      userState: "pending",
+      detectedStatus: "missing",
+    }, {
+      albumId: "333",
+      albumName: "Now Running",
+      albumUrl: "https://music.apple.com/cn/album/now-running/333",
+      userState: "pending",
+      detectedStatus: "running",
+    }],
+  })
+
+  assert.deepEqual(getSelectedSubscriptionAlbumIds(7), ["111"])
+  assert.match(html, /待确认 1 · 已选 1/)
+  assert.doesNotMatch(html, /data-album-id="333"[^>]+checked/)
 })
 
 test("renderArtistSearchResults shows direct add subscription actions", () => {
@@ -406,6 +544,7 @@ test("renderArtistSearchResults shows direct add subscription actions", () => {
 })
 
 test("renderSubscriptionList renders card grid and active detail panel", () => {
+  clearAllSubscriptionAlbumSelections()
   withFakeElement("subscription-list", (element) => {
     renderSubscriptionList([{
       id: 7,

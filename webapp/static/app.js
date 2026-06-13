@@ -13,6 +13,7 @@ const state = {
   logLines: [],
   pendingLogLines: [],
   logFlushScheduled: false,
+  subscriptionAlbumSelections: {},
 };
 
 const MAX_LOG_LINES = 300;
@@ -1509,6 +1510,126 @@ function canRestoreAlbum(album) {
 }
 
 
+function isSelectableSubscriptionAlbum(album) {
+  return normalizeAlbumUserState(album?.userState) === "pending" && canDownloadAlbum(album);
+}
+
+
+function normalizeSelectionKey(value) {
+  return String(value ?? "").trim();
+}
+
+
+function getSubscriptionAlbumSelection(subscriptionId) {
+  const subscriptionKey = normalizeSelectionKey(subscriptionId);
+  if (!subscriptionKey) {
+    return new Set();
+  }
+  const existing = state.subscriptionAlbumSelections[subscriptionKey];
+  if (existing instanceof Set) {
+    return existing;
+  }
+  const normalized = new Set(Array.isArray(existing) ? existing.map(normalizeSelectionKey).filter(Boolean) : []);
+  state.subscriptionAlbumSelections[subscriptionKey] = normalized;
+  return normalized;
+}
+
+
+function setSubscriptionAlbumSelection(subscriptionId, albumIds) {
+  const subscriptionKey = normalizeSelectionKey(subscriptionId);
+  if (!subscriptionKey) {
+    return [];
+  }
+  const normalizedAlbumIds = [...new Set((Array.isArray(albumIds) ? albumIds : [albumIds]).map(normalizeSelectionKey).filter(Boolean))];
+  if (normalizedAlbumIds.length === 0) {
+    delete state.subscriptionAlbumSelections[subscriptionKey];
+    return [];
+  }
+  state.subscriptionAlbumSelections[subscriptionKey] = new Set(normalizedAlbumIds);
+  return normalizedAlbumIds;
+}
+
+
+function setSubscriptionAlbumSelected(subscriptionId, albumId, selected) {
+  const subscriptionKey = normalizeSelectionKey(subscriptionId);
+  const albumKey = normalizeSelectionKey(albumId);
+  if (!subscriptionKey || !albumKey) {
+    return [];
+  }
+  const selection = getSubscriptionAlbumSelection(subscriptionKey);
+  if (selected) {
+    selection.add(albumKey);
+  } else {
+    selection.delete(albumKey);
+  }
+  if (selection.size === 0) {
+    delete state.subscriptionAlbumSelections[subscriptionKey];
+    return [];
+  }
+  return [...selection];
+}
+
+
+function clearSubscriptionAlbumSelection(subscriptionId) {
+  const subscriptionKey = normalizeSelectionKey(subscriptionId);
+  if (subscriptionKey) {
+    delete state.subscriptionAlbumSelections[subscriptionKey];
+  }
+}
+
+
+function clearSubscriptionAlbumSelectionIds(subscriptionId, albumIds) {
+  const subscriptionKey = normalizeSelectionKey(subscriptionId);
+  if (!subscriptionKey) {
+    return [];
+  }
+  const selection = getSubscriptionAlbumSelection(subscriptionKey);
+  for (const albumId of Array.isArray(albumIds) ? albumIds : [albumIds]) {
+    selection.delete(normalizeSelectionKey(albumId));
+  }
+  if (selection.size === 0) {
+    delete state.subscriptionAlbumSelections[subscriptionKey];
+    return [];
+  }
+  return [...selection];
+}
+
+
+function clearAllSubscriptionAlbumSelections() {
+  state.subscriptionAlbumSelections = {};
+}
+
+
+function getSelectedSubscriptionAlbumIds(subscriptionId) {
+  return [...getSubscriptionAlbumSelection(subscriptionId)];
+}
+
+
+function getSelectableSubscriptionAlbumIds(subscription) {
+  const albums = Array.isArray(subscription?.recentAlbums) ? subscription.recentAlbums : [];
+  return albums
+    .filter(isSelectableSubscriptionAlbum)
+    .map((album) => normalizeSelectionKey(album.albumId))
+    .filter(Boolean);
+}
+
+
+function pruneSubscriptionAlbumSelection(subscription, selectableAlbumIds = null) {
+  const subscriptionId = getSubscriptionId(subscription);
+  const selectableIds = new Set(Array.isArray(selectableAlbumIds) ? selectableAlbumIds.map(normalizeSelectionKey).filter(Boolean) : getSelectableSubscriptionAlbumIds(subscription));
+  const selectedIds = getSelectedSubscriptionAlbumIds(subscriptionId).filter((albumId) => selectableIds.has(albumId));
+  setSubscriptionAlbumSelection(subscriptionId, selectedIds);
+  return selectedIds;
+}
+
+
+function selectAllSelectableSubscriptionAlbums(subscription) {
+  const albumIds = getSelectableSubscriptionAlbumIds(subscription);
+  setSubscriptionAlbumSelection(getSubscriptionId(subscription), albumIds);
+  return albumIds;
+}
+
+
 function formatSubscriptionActionSummary(payload) {
   const action = String(payload.action || "");
   const updatedCount = Number(payload.updatedCount || 0);
@@ -1566,14 +1687,25 @@ function renderSubscriptionAlbums(subscription) {
   if (!Array.isArray(albums) || albums.length === 0) {
     return '<p class="subscription-album-empty">暂无已记录专辑，扫描后显示。</p>';
   }
+  const subscriptionId = getSubscriptionId(subscription);
   const sortedAlbums = [...albums].sort(compareAlbumsByReleaseDateDesc);
-  const pendingAlbums = sortedAlbums.filter((album) => normalizeAlbumUserState(album.userState) === "pending" && canDownloadAlbum(album));
+  const pendingAlbums = sortedAlbums.filter(isSelectableSubscriptionAlbum);
+  const pendingAlbumIds = pendingAlbums.map((album) => normalizeSelectionKey(album.albumId)).filter(Boolean);
+  const selectedAlbumIds = pruneSubscriptionAlbumSelection(subscription, pendingAlbumIds);
+  const selectedAlbumIdSet = new Set(selectedAlbumIds);
+  const bulkActionDisabled = selectedAlbumIds.length === 0 ? " disabled" : "";
   const bulkActions = pendingAlbums.length > 0 ? `
-    <div class="subscription-album-bulk">
-      <span>待确认 ${pendingAlbums.length}</span>
-      <button type="button" class="secondary-button subscription-bulk-action-btn" data-subscription-id="${subscription.id}" data-action="download">批量下载</button>
-      <button type="button" class="secondary-button subscription-bulk-action-btn" data-subscription-id="${subscription.id}" data-action="ignore">批量忽略</button>
-      <button type="button" class="secondary-button subscription-bulk-action-btn" data-subscription-id="${subscription.id}" data-action="mark_imported">批量已导入</button>
+    <div class="subscription-album-bulk" data-subscription-id="${escapeHtml(subscriptionId)}">
+      <span class="subscription-album-selection-summary">待确认 ${pendingAlbums.length} · 已选 ${selectedAlbumIds.length}</span>
+      <div class="subscription-album-selection-actions">
+        <button type="button" class="secondary-button compact-button subscription-selection-action-btn" data-subscription-id="${escapeHtml(subscriptionId)}" data-selection-action="select_all">全选待确认</button>
+        <button type="button" class="secondary-button compact-button subscription-selection-action-btn" data-subscription-id="${escapeHtml(subscriptionId)}" data-selection-action="clear"${bulkActionDisabled}>清空选择</button>
+      </div>
+      <div class="subscription-album-bulk-actions">
+        <button type="button" class="secondary-button compact-button subscription-bulk-action-btn" data-subscription-id="${escapeHtml(subscriptionId)}" data-action="download"${bulkActionDisabled}>下载已选</button>
+        <button type="button" class="secondary-button compact-button subscription-bulk-action-btn" data-subscription-id="${escapeHtml(subscriptionId)}" data-action="ignore"${bulkActionDisabled}>忽略已选</button>
+        <button type="button" class="secondary-button compact-button subscription-bulk-action-btn" data-subscription-id="${escapeHtml(subscriptionId)}" data-action="mark_imported"${bulkActionDisabled}>标记已导入</button>
+      </div>
     </div>
   ` : "";
   const items = sortedAlbums.map((album) => {
@@ -1582,28 +1714,30 @@ function renderSubscriptionAlbums(subscription) {
     const albumTitle = album.albumName || formatAlbumTitleFromUrl(album.albumUrl) || album.albumId || "未知专辑";
     const releaseDate = album.releaseDate ? `<span>${escapeHtml(album.releaseDate)}</span>` : "";
     const albumUrl = album.albumUrl || "";
+    const albumId = normalizeSelectionKey(album.albumId);
     const selectable = userState === "pending" && canDownloadAlbum(album);
+    const checked = selectable && selectedAlbumIdSet.has(albumId);
     const downloadable = canDownloadAlbum(album);
     const actions = [];
     if (downloadable) {
-      actions.push(`<button type="button" class="secondary-button compact-button subscription-album-action-btn" data-subscription-id="${subscription.id}" data-album-id="${escapeHtml(album.albumId || "")}" data-action="download">下载</button>`);
-      actions.push(`<button type="button" class="secondary-button compact-button subscription-album-action-btn" data-subscription-id="${subscription.id}" data-album-id="${escapeHtml(album.albumId || "")}" data-action="mark_completed">确认完成</button>`);
+      actions.push(`<button type="button" class="secondary-button compact-button subscription-album-action-btn" data-subscription-id="${escapeHtml(subscriptionId)}" data-album-id="${escapeHtml(albumId)}" data-action="download">下载</button>`);
+      actions.push(`<button type="button" class="secondary-button compact-button subscription-album-action-btn" data-subscription-id="${escapeHtml(subscriptionId)}" data-album-id="${escapeHtml(albumId)}" data-action="mark_completed">确认完成</button>`);
       if (album.canIgnore !== false && userState !== "ignored") {
-        actions.push(`<button type="button" class="secondary-button compact-button subscription-album-action-btn" data-subscription-id="${subscription.id}" data-album-id="${escapeHtml(album.albumId || "")}" data-action="ignore">忽略</button>`);
+        actions.push(`<button type="button" class="secondary-button compact-button subscription-album-action-btn" data-subscription-id="${escapeHtml(subscriptionId)}" data-album-id="${escapeHtml(albumId)}" data-action="ignore">忽略</button>`);
       }
       if (album.canMarkImported !== false && userState !== "imported") {
-        actions.push(`<button type="button" class="secondary-button compact-button subscription-album-action-btn" data-subscription-id="${subscription.id}" data-album-id="${escapeHtml(album.albumId || "")}" data-action="mark_imported">已导入</button>`);
+        actions.push(`<button type="button" class="secondary-button compact-button subscription-album-action-btn" data-subscription-id="${escapeHtml(subscriptionId)}" data-album-id="${escapeHtml(albumId)}" data-action="mark_imported">已导入</button>`);
       }
     } else if (!["completed", "queued", "running"].includes(detectedStatus) && !["ignored", "imported"].includes(userState)) {
-      actions.push(`<button type="button" class="secondary-button compact-button subscription-album-action-btn" data-subscription-id="${subscription.id}" data-album-id="${escapeHtml(album.albumId || "")}" data-action="mark_completed">确认完成</button>`);
+      actions.push(`<button type="button" class="secondary-button compact-button subscription-album-action-btn" data-subscription-id="${escapeHtml(subscriptionId)}" data-album-id="${escapeHtml(albumId)}" data-action="mark_completed">确认完成</button>`);
     }
     if (canRestoreAlbum(album)) {
-      actions.push(`<button type="button" class="secondary-button compact-button subscription-album-action-btn" data-subscription-id="${subscription.id}" data-album-id="${escapeHtml(album.albumId || "")}" data-action="pending">恢复待确认</button>`);
+      actions.push(`<button type="button" class="secondary-button compact-button subscription-album-action-btn" data-subscription-id="${escapeHtml(subscriptionId)}" data-album-id="${escapeHtml(albumId)}" data-action="pending">恢复待确认</button>`);
     }
     return `
       <li class="subscription-album-item">
         <label class="subscription-album-check">
-          <input type="checkbox" class="subscription-album-select" data-subscription-id="${subscription.id}" data-album-id="${escapeHtml(album.albumId || "")}" ${selectable ? "" : "disabled"}>
+          <input type="checkbox" class="subscription-album-select" data-subscription-id="${escapeHtml(subscriptionId)}" data-album-id="${escapeHtml(albumId)}" aria-label="选择 ${escapeHtml(albumTitle)}" ${selectable ? "" : "disabled"}${checked ? " checked" : ""}>
         </label>
         ${renderArtworkImage(album.artworkUrl, albumTitle, "subscription-album-artwork")}
         <div class="subscription-album-main">
@@ -1628,6 +1762,51 @@ function renderSubscriptionAlbums(subscription) {
 }
 
 
+function getSelectableAlbumIdsFromDetailPanel(detailPanel) {
+  if (!detailPanel) {
+    return [];
+  }
+  return [...detailPanel.querySelectorAll(".subscription-album-select:not(:disabled)")]
+    .map((input) => normalizeSelectionKey(input.dataset.albumId))
+    .filter(Boolean);
+}
+
+
+function syncSubscriptionAlbumCheckboxes(detailPanel, subscriptionId) {
+  if (!detailPanel) {
+    return;
+  }
+  const selectedAlbumIds = new Set(getSelectedSubscriptionAlbumIds(subscriptionId));
+  for (const input of detailPanel.querySelectorAll(".subscription-album-select")) {
+    input.checked = !input.disabled && selectedAlbumIds.has(normalizeSelectionKey(input.dataset.albumId));
+  }
+}
+
+
+function updateSubscriptionBulkControls(detailPanel, subscriptionId) {
+  if (!detailPanel) {
+    return;
+  }
+  const selectableCount = getSelectableAlbumIdsFromDetailPanel(detailPanel).length;
+  const selectedCount = getSelectedSubscriptionAlbumIds(subscriptionId).length;
+  const summary = detailPanel.querySelector(".subscription-album-selection-summary");
+  if (summary) {
+    summary.textContent = `待确认 ${selectableCount} · 已选 ${selectedCount}`;
+  }
+  for (const btn of detailPanel.querySelectorAll(".subscription-bulk-action-btn")) {
+    btn.disabled = selectedCount === 0;
+  }
+  const clearButton = detailPanel.querySelector(".subscription-selection-action-btn[data-selection-action='clear']");
+  if (clearButton) {
+    clearButton.disabled = selectedCount === 0;
+  }
+  const selectAllButton = detailPanel.querySelector(".subscription-selection-action-btn[data-selection-action='select_all']");
+  if (selectAllButton) {
+    selectAllButton.disabled = selectableCount === 0;
+  }
+}
+
+
 function renderSubscriptionList(subscriptions) {
   const container = document.getElementById("subscription-list");
   const list = Array.isArray(subscriptions) ? subscriptions : [];
@@ -1636,6 +1815,7 @@ function renderSubscriptionList(subscriptions) {
   }
   if (list.length === 0) {
     state.activeSubscriptionId = "";
+    clearAllSubscriptionAlbumSelections();
     container.innerHTML = '<p class="empty-text">暂无订阅</p>';
     return;
   }
@@ -1746,11 +1926,39 @@ function renderSubscriptionList(subscriptions) {
     });
   }
 
+  for (const input of container.querySelectorAll(".subscription-album-select")) {
+    input.addEventListener("change", () => {
+      const subscriptionId = input.dataset.subscriptionId || "";
+      setSubscriptionAlbumSelected(subscriptionId, input.dataset.albumId || "", input.checked);
+      updateSubscriptionBulkControls(input.closest(".subscription-detail-panel"), subscriptionId);
+    });
+  }
+
+  for (const btn of container.querySelectorAll(".subscription-selection-action-btn")) {
+    btn.addEventListener("click", () => {
+      const subscriptionId = btn.dataset.subscriptionId || "";
+      const detailPanel = btn.closest(".subscription-detail-panel");
+      const selectionAction = btn.dataset.selectionAction || "";
+      if (selectionAction === "select_all") {
+        const albumIds = getSelectableAlbumIdsFromDetailPanel(detailPanel);
+        setSubscriptionAlbumSelection(subscriptionId, albumIds);
+      } else if (selectionAction === "clear") {
+        clearSubscriptionAlbumSelection(subscriptionId);
+      }
+      syncSubscriptionAlbumCheckboxes(detailPanel, subscriptionId);
+      updateSubscriptionBulkControls(detailPanel, subscriptionId);
+    });
+  }
+
   for (const btn of container.querySelectorAll(".subscription-bulk-action-btn")) {
     btn.addEventListener("click", () => {
       const subscriptionId = btn.dataset.subscriptionId || "";
       const detailPanel = btn.closest(".subscription-detail-panel");
-      const selectedAlbumIds = detailPanel ? [...detailPanel.querySelectorAll(".subscription-album-select:checked")].map((input) => input.dataset.albumId || "").filter(Boolean) : [];
+      const selectableAlbumIds = new Set(getSelectableAlbumIdsFromDetailPanel(detailPanel));
+      const selectedAlbumIds = getSelectedSubscriptionAlbumIds(subscriptionId).filter((albumId) => selectableAlbumIds.has(albumId));
+      setSubscriptionAlbumSelection(subscriptionId, selectedAlbumIds);
+      syncSubscriptionAlbumCheckboxes(detailPanel, subscriptionId);
+      updateSubscriptionBulkControls(detailPanel, subscriptionId);
       if (selectedAlbumIds.length === 0) {
         setSubscriptionError("请先选择待确认专辑");
         return;
@@ -1870,6 +2078,7 @@ async function handleSubscriptionAlbumAction(subscriptionId, albumIds, action) {
   setSubscriptionError("");
   setSubscriptionNote("");
   const payload = await applySubscriptionAlbumAction(subscriptionId, albumIds, action);
+  clearSubscriptionAlbumSelectionIds(subscriptionId, Array.isArray(payload.updatedAlbumIds) ? payload.updatedAlbumIds : albumIds);
   setSubscriptionNote(formatSubscriptionActionSummary(payload));
   await refreshSubscriptionList();
   await refreshTaskList();
@@ -1880,6 +2089,7 @@ async function handleSubscriptionAlbumAction(subscriptionId, albumIds, action) {
 async function handleDeleteSubscription(subscriptionId) {
   setSubscriptionError("");
   await deleteSubscription(subscriptionId);
+  clearSubscriptionAlbumSelection(subscriptionId);
   setSubscriptionNote("已删除订阅");
   await refreshSubscriptionList();
 }
@@ -2068,6 +2278,8 @@ if (typeof module !== "undefined") {
   module.exports = {
     bindViewNavigation,
     bindSidebarToggle,
+    clearAllSubscriptionAlbumSelections,
+    clearSubscriptionAlbumSelection,
     compareAlbumsByReleaseDateDesc,
     cancelTask,
     formatSubscriptionScanSummary,
@@ -2083,6 +2295,7 @@ if (typeof module !== "undefined") {
     getTaskAlbumName,
     getInitialViewName,
     getSingleSubscriptionScanPayload,
+    getSelectedSubscriptionAlbumIds,
     getTaskSummaryCounts,
     isTerminalTaskStatus,
     mergeLogLines,
@@ -2097,7 +2310,10 @@ if (typeof module !== "undefined") {
     retryFailedTasks,
     retryHistoryFailedTasks,
     retrySingleHistory,
+    selectAllSelectableSubscriptionAlbums,
     setSidebarCollapsed,
+    setSubscriptionAlbumSelected,
+    setSubscriptionAlbumSelection,
     showView,
     shouldOpenNewStream,
   };
