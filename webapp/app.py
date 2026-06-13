@@ -25,6 +25,7 @@ from webapp.config_loader import getConfigValue, resolveConfigPath
 
 APPLE_MUSIC_URL_RE = re.compile(r"^https://music\.apple\.com/[a-z]{2}/")
 DECRYPT_PROGRESS_RE = re.compile(r"Decrypting\.\.\.\s+(\d+)%")
+DOWNLOAD_SUMMARY_RE = re.compile(r"Completed:\s+(\d+)/(\d+)")
 TRAILING_URL_PUNCTUATION = ".,;:!)]}>，。；：！）】》、"
 DEFAULT_COMPLETED_ROOT = Path("/downloads/completed")
 DOWNLOAD_FORMAT_DIRS = {"ALAC", "AAC", "ATMOS", "Atmos"}
@@ -1038,6 +1039,11 @@ class PipelineRunner:
     self.downloadRunner(task, url, codec)
     if task.status == "failed":
       return
+    if not task.result:
+      task.setStage("failed")
+      task.setStatus("failed")
+      task.setError("download finished without any result")
+      return
     if task.result:
       if task.status == "completed":
         task.setStatus("running")
@@ -1200,6 +1206,15 @@ def updateTaskFromLine(task: DownloadTask, line: str) -> None:
     task.setProgress(max(task.progress, 98))
     return
   if line.startswith("=======  [✔ ] Completed:"):
+    summaryMatch = DOWNLOAD_SUMMARY_RE.search(line)
+    if summaryMatch:
+      completedCount = int(summaryMatch.group(1))
+      if completedCount <= 0 and not task.result:
+        if task.status != "failed":
+          task.setStage("failed")
+          task.setStatus("failed")
+          task.setError("download summary reported zero completed tracks")
+        return
     task.setStage("completed")
     task.setStatus("completed")
     task.setProgress(100)
@@ -1420,7 +1435,16 @@ def startTask(
       if task.status == "completed" and task.result:
         historyStore.saveCompleted(url, task.id, codec, task.result, albumId)
         syncSubscriptionAlbumStatus(app, albumId, "completed", task.id)
+      elif task.status == "completed" and not task.result:
+        task.setStage("failed")
+        task.setStatus("failed")
+        task.setError("download finished without any result")
+        historyStore.saveFailed(url, task.id, codec, task.error or "download failed", source, albumId)
+        syncSubscriptionAlbumStatus(app, albumId, "failed", task.id)
       elif task.status == "failed":
+        if not task.error:
+          task.setStage("failed")
+          task.setError("download finished without any result")
         historyStore.saveFailed(url, task.id, codec, task.error or "download failed", source, albumId)
         syncSubscriptionAlbumStatus(app, albumId, "failed", task.id)
     except Exception as exc:  # noqa: BLE001

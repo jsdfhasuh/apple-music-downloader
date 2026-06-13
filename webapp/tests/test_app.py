@@ -146,6 +146,38 @@ class FlaskDashboardTest(unittest.TestCase):
     self.assertEqual(taskPayload["progress"], 100)
     self.assertEqual(taskPayload["result"][0]["path"], str(self.resultPath))
 
+  def testCreateTaskStoresFailureWhenRunnerProducesNoResult(self):
+    def emptyResultRunner(task, _url, _codec):
+      task.appendLog("=======  [✔ ] Completed: 0/0  |  [⚠ ] Warnings: 0  |  [✖ ] Errors: 0  =======")
+      task.setStage("completed")
+      task.setStatus("completed")
+      task.setProgress(100)
+
+    app = createApp(
+      runnerFactory=lambda: emptyResultRunner,
+      dbPath=f"{self.tempDir.name}/empty-result-downloads.db",
+    )
+    app.config["TESTING"] = True
+    client = app.test_client()
+
+    response = client.post(
+      "/api/tasks",
+      data=json.dumps({
+        "url": "https://music.apple.com/cn/album/empty-result/111",
+        "codec": "alac",
+      }),
+      content_type="application/json",
+    )
+    payload = response.get_json()
+    taskPayload = client.get(f"/api/tasks/{payload['taskId']}").get_json()
+    historyPayload = client.get("/api/history").get_json()
+
+    self.assertEqual(response.status_code, 202)
+    self.assertEqual(taskPayload["status"], "failed")
+    self.assertEqual(taskPayload["stage"], "failed")
+    self.assertEqual(taskPayload["error"], "download finished without any result")
+    self.assertEqual(historyPayload[0]["status"], "failed")
+
   def testCreateDownloadShortcutUsesDefaultCodec(self):
     response = self.client.post(
       "/api/downloads",
@@ -2090,6 +2122,20 @@ class DownloaderRunnerTest(unittest.TestCase):
     self.assertEqual(task.status, "completed")
     self.assertEqual(task.stage, "completed")
     self.assertEqual(task.progress, 100)
+
+  def testZeroTrackCompletedSummaryDoesNotOverrideFailure(self):
+    task = DownloadTask(
+      id="task-id",
+      url="https://music.apple.com/cn/album/example/123",
+      codec="alac"
+    )
+
+    updateTaskFromLine(task, "Failed to rip album: error getting album response")
+    updateTaskFromLine(task, "=======  [✔ ] Completed: 0/0  |  [⚠ ] Warnings: 0  |  [✖ ] Errors: 0  =======")
+
+    self.assertEqual(task.status, "failed")
+    self.assertEqual(task.stage, "failed")
+    self.assertEqual(task.error, "Failed to rip album: error getting album response")
 
   def testMarksTaskFailedWhenProcessExitsNonZeroAfterNetworkError(self):
     task = DownloadTask(
