@@ -14,6 +14,7 @@ const state = {
   pendingLogLines: [],
   logFlushScheduled: false,
   subscriptionAlbumSelections: {},
+  subscriptionAlbumScrollPositions: {},
 };
 
 const MAX_LOG_LINES = 300;
@@ -1600,6 +1601,72 @@ function clearAllSubscriptionAlbumSelections() {
 }
 
 
+function findSubscriptionDetailPanel(root, subscriptionId = "") {
+  if (!root || typeof root.querySelector !== "function") {
+    return null;
+  }
+  const targetId = normalizeSelectionKey(subscriptionId);
+  if (targetId && typeof root.querySelectorAll === "function") {
+    for (const panel of root.querySelectorAll(".subscription-detail-panel")) {
+      if (normalizeSelectionKey(panel?.dataset?.subscriptionId) === targetId) {
+        return panel;
+      }
+    }
+  }
+  return root.querySelector(".subscription-detail-panel");
+}
+
+
+function getSubscriptionAlbumScrollElement(root, subscriptionId = "") {
+  const detailPanel = findSubscriptionDetailPanel(root, subscriptionId);
+  if (!detailPanel || typeof detailPanel.querySelector !== "function") {
+    return null;
+  }
+  return detailPanel.querySelector(".subscription-albums ul");
+}
+
+
+function saveSubscriptionAlbumScrollPosition(root, subscriptionId = "") {
+  const detailPanel = findSubscriptionDetailPanel(root, subscriptionId);
+  const albumList = detailPanel?.querySelector?.(".subscription-albums ul") || null;
+  const resolvedSubscriptionId = normalizeSelectionKey(subscriptionId || detailPanel?.dataset?.subscriptionId);
+  if (!resolvedSubscriptionId || !albumList) {
+    return 0;
+  }
+  const scrollTop = Math.max(0, Number(albumList.scrollTop || 0));
+  state.subscriptionAlbumScrollPositions[resolvedSubscriptionId] = scrollTop;
+  return scrollTop;
+}
+
+
+function restoreSubscriptionAlbumScrollPosition(root, subscriptionId) {
+  const subscriptionKey = normalizeSelectionKey(subscriptionId);
+  if (!subscriptionKey) {
+    return 0;
+  }
+  const albumList = getSubscriptionAlbumScrollElement(root, subscriptionKey);
+  if (!albumList) {
+    return 0;
+  }
+  const scrollTop = Math.max(0, Number(state.subscriptionAlbumScrollPositions[subscriptionKey] || 0));
+  albumList.scrollTop = scrollTop;
+  return scrollTop;
+}
+
+
+function clearSubscriptionAlbumScrollPosition(subscriptionId) {
+  const subscriptionKey = normalizeSelectionKey(subscriptionId);
+  if (subscriptionKey) {
+    delete state.subscriptionAlbumScrollPositions[subscriptionKey];
+  }
+}
+
+
+function clearAllSubscriptionAlbumScrollPositions() {
+  state.subscriptionAlbumScrollPositions = {};
+}
+
+
 function getSelectedSubscriptionAlbumIds(subscriptionId) {
   return [...getSubscriptionAlbumSelection(subscriptionId)];
 }
@@ -1813,9 +1880,11 @@ function renderSubscriptionList(subscriptions) {
   if (!container) {
     return;
   }
+  saveSubscriptionAlbumScrollPosition(container);
   if (list.length === 0) {
     state.activeSubscriptionId = "";
     clearAllSubscriptionAlbumSelections();
+    clearAllSubscriptionAlbumScrollPositions();
     container.innerHTML = '<p class="empty-text">暂无订阅</p>';
     return;
   }
@@ -1894,6 +1963,7 @@ function renderSubscriptionList(subscriptions) {
     ${detailPanel}
   `;
   attachArtworkFallbackHandlers(container);
+  restoreSubscriptionAlbumScrollPosition(container, activeSubscriptionId);
 
   for (const card of container.querySelectorAll(".subscription-card")) {
     card.addEventListener("click", () => {
@@ -2090,6 +2160,7 @@ async function handleDeleteSubscription(subscriptionId) {
   setSubscriptionError("");
   await deleteSubscription(subscriptionId);
   clearSubscriptionAlbumSelection(subscriptionId);
+  clearSubscriptionAlbumScrollPosition(subscriptionId);
   setSubscriptionNote("已删除订阅");
   await refreshSubscriptionList();
 }
@@ -2279,6 +2350,7 @@ if (typeof module !== "undefined") {
     bindViewNavigation,
     bindSidebarToggle,
     clearAllSubscriptionAlbumSelections,
+    clearAllSubscriptionAlbumScrollPositions,
     clearSubscriptionAlbumSelection,
     compareAlbumsByReleaseDateDesc,
     cancelTask,
@@ -2310,6 +2382,8 @@ if (typeof module !== "undefined") {
     retryFailedTasks,
     retryHistoryFailedTasks,
     retrySingleHistory,
+    restoreSubscriptionAlbumScrollPosition,
+    saveSubscriptionAlbumScrollPosition,
     selectAllSelectableSubscriptionAlbums,
     setSidebarCollapsed,
     setSubscriptionAlbumSelected,

@@ -5,6 +5,7 @@ const {
   bindViewNavigation,
   bindSidebarToggle,
   clearAllSubscriptionAlbumSelections,
+  clearAllSubscriptionAlbumScrollPositions,
   compareAlbumsByReleaseDateDesc,
   cancelTask,
   formatAlbumTitleFromUrl,
@@ -32,6 +33,8 @@ const {
   retryFailedTasks,
   retryHistoryFailedTasks,
   retrySingleHistory,
+  restoreSubscriptionAlbumScrollPosition,
+  saveSubscriptionAlbumScrollPosition,
   selectAllSelectableSubscriptionAlbums,
   setSidebarCollapsed,
   setSubscriptionAlbumSelected,
@@ -188,6 +191,27 @@ function withFakeElement(id, callback) {
   } finally {
     global.document = originalDocument
   }
+}
+
+function createFakeSubscriptionScrollRoot(subscriptionId, scrollTop) {
+  const albumList = { scrollTop }
+  const detailPanel = {
+    dataset: { subscriptionId: String(subscriptionId) },
+    querySelector(selector) {
+      return selector === ".subscription-albums ul" ? albumList : null
+    },
+  }
+  const root = {
+    albumList,
+    detailPanel,
+    querySelector(selector) {
+      return selector === ".subscription-detail-panel" ? detailPanel : null
+    },
+    querySelectorAll(selector) {
+      return selector === ".subscription-detail-panel" ? [detailPanel] : []
+    },
+  }
+  return root
 }
 
 test("isTerminalTaskStatus returns true for completed and failed", () => {
@@ -524,6 +548,23 @@ test("renderSubscriptionAlbums prunes selections that are no longer selectable",
   assert.deepEqual(getSelectedSubscriptionAlbumIds(7), ["111"])
   assert.match(html, /待确认 1 · 已选 1/)
   assert.doesNotMatch(html, /data-album-id="333"[^>]+checked/)
+})
+
+test("subscription album list scroll positions restore per subscription", () => {
+  clearAllSubscriptionAlbumScrollPositions()
+  const firstRoot = createFakeSubscriptionScrollRoot(7, 238)
+  const secondRoot = createFakeSubscriptionScrollRoot(8, 64)
+
+  assert.equal(saveSubscriptionAlbumScrollPosition(firstRoot), 238)
+  assert.equal(saveSubscriptionAlbumScrollPosition(secondRoot), 64)
+
+  const rerenderedFirstRoot = createFakeSubscriptionScrollRoot(7, 0)
+  const rerenderedSecondRoot = createFakeSubscriptionScrollRoot(8, 0)
+
+  assert.equal(restoreSubscriptionAlbumScrollPosition(rerenderedFirstRoot, 7), 238)
+  assert.equal(rerenderedFirstRoot.albumList.scrollTop, 238)
+  assert.equal(restoreSubscriptionAlbumScrollPosition(rerenderedSecondRoot, 8), 64)
+  assert.equal(rerenderedSecondRoot.albumList.scrollTop, 64)
 })
 
 test("renderArtistSearchResults shows direct add subscription actions", () => {
