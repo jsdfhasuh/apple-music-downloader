@@ -5,9 +5,11 @@ const {
   bindViewNavigation,
   bindSidebarToggle,
   clearAllSubscriptionAlbumSelections,
+  clearAllSubscriptionAlbumFilters,
   clearAllSubscriptionAlbumScrollPositions,
   compareAlbumsByReleaseDateDesc,
   cancelTask,
+  filterSubscriptionAlbums,
   formatAlbumTitleFromUrl,
   formatSubscriptionActionSummary,
   formatSubscriptionScanSummary,
@@ -37,6 +39,7 @@ const {
   saveSubscriptionAlbumScrollPosition,
   selectAllSelectableSubscriptionAlbums,
   setSidebarCollapsed,
+  setSubscriptionAlbumFilter,
   setSubscriptionAlbumSelected,
   showView,
   shouldOpenNewStream,
@@ -396,8 +399,77 @@ test("renderArtworkImage renders safe images and placeholders", () => {
   assert.doesNotMatch(unsafe, /src=/)
 })
 
+test("filterSubscriptionAlbums filters by status and search text", () => {
+  const albums = [{
+    albumId: "111",
+    albumName: "Midnight Rain",
+    releaseDate: "2026-06-01",
+    userState: "pending",
+    detectedStatus: "missing",
+  }, {
+    albumId: "222",
+    albumName: "Live Session",
+    releaseDate: "2026-05-01",
+    userState: "subscribed",
+    detectedStatus: "running",
+  }, {
+    albumId: "333",
+    albumName: "Done Album",
+    releaseDate: "2026-04-01",
+    userState: "subscribed",
+    detectedStatus: "completed",
+  }, {
+    albumId: "444",
+    albumName: "Broken Import",
+    releaseDate: "2026-03-01",
+    userState: "imported",
+    detectedStatus: "failed_history",
+  }]
+
+  assert.deepEqual(filterSubscriptionAlbums(albums, { status: "pending" }).map((album) => album.albumId), ["111"])
+  assert.deepEqual(filterSubscriptionAlbums(albums, { status: "active" }).map((album) => album.albumId), ["222"])
+  assert.deepEqual(filterSubscriptionAlbums(albums, { status: "completed" }).map((album) => album.albumId), ["333"])
+  assert.deepEqual(filterSubscriptionAlbums(albums, { status: "failed" }).map((album) => album.albumId), ["444"])
+  assert.deepEqual(filterSubscriptionAlbums(albums, { status: "all", query: "midnight" }).map((album) => album.albumId), ["111"])
+  assert.deepEqual(filterSubscriptionAlbums(albums, { status: "imported", query: "broken" }).map((album) => album.albumId), ["444"])
+})
+
+test("renderSubscriptionAlbums includes album search and applies saved filters", () => {
+  clearAllSubscriptionAlbumSelections()
+  clearAllSubscriptionAlbumFilters()
+  setSubscriptionAlbumFilter(7, { query: "second" })
+
+  const html = renderSubscriptionAlbums({
+    id: 7,
+    recentAlbums: [{
+      albumId: "111",
+      albumName: "First Album",
+      albumUrl: "https://music.apple.com/cn/album/first/111",
+      releaseDate: "2026-06-02",
+      userState: "pending",
+      detectedStatus: "missing",
+    }, {
+      albumId: "222",
+      albumName: "Second Album",
+      albumUrl: "https://music.apple.com/cn/album/second/222",
+      releaseDate: "2026-06-01",
+      userState: "pending",
+      detectedStatus: "missing",
+    }],
+  })
+
+  assert.match(html, /class="subscription-album-search-input"/)
+  assert.match(html, /value="second"/)
+  assert.match(html, /筛选专辑 · 1\/2/)
+  assert.match(html, /Second Album/)
+  assert.doesNotMatch(html, /First Album/)
+
+  clearAllSubscriptionAlbumFilters()
+})
+
 test("renderSubscriptionAlbums includes album artwork", () => {
   clearAllSubscriptionAlbumSelections()
+  clearAllSubscriptionAlbumFilters()
   const html = renderSubscriptionAlbums({
     id: 7,
     recentAlbums: [{
@@ -419,6 +491,7 @@ test("renderSubscriptionAlbums includes album artwork", () => {
 
 test("renderSubscriptionAlbums shows bulk selection controls and selected count", () => {
   clearAllSubscriptionAlbumSelections()
+  clearAllSubscriptionAlbumFilters()
   setSubscriptionAlbumSelected(7, "111", true)
 
   const html = renderSubscriptionAlbums({
@@ -457,6 +530,7 @@ test("renderSubscriptionAlbums shows bulk selection controls and selected count"
 
 test("renderSubscriptionAlbums restores checked album selections after rerender", () => {
   clearAllSubscriptionAlbumSelections()
+  clearAllSubscriptionAlbumFilters()
   setSubscriptionAlbumSelected(7, "111", true)
   const subscription = {
     id: 7,
@@ -480,6 +554,7 @@ test("renderSubscriptionAlbums restores checked album selections after rerender"
 
 test("selectAllSelectableSubscriptionAlbums only selects downloadable pending albums", () => {
   clearAllSubscriptionAlbumSelections()
+  clearAllSubscriptionAlbumFilters()
   const subscription = {
     id: 7,
     recentAlbums: [{
@@ -525,6 +600,7 @@ test("selectAllSelectableSubscriptionAlbums only selects downloadable pending al
 
 test("renderSubscriptionAlbums prunes selections that are no longer selectable", () => {
   clearAllSubscriptionAlbumSelections()
+  clearAllSubscriptionAlbumFilters()
   setSubscriptionAlbumSelected(7, "111", true)
   setSubscriptionAlbumSelected(7, "333", true)
 
@@ -586,6 +662,7 @@ test("renderArtistSearchResults shows direct add subscription actions", () => {
 
 test("renderSubscriptionList renders card grid and active detail panel", () => {
   clearAllSubscriptionAlbumSelections()
+  clearAllSubscriptionAlbumFilters()
   withFakeElement("subscription-list", (element) => {
     renderSubscriptionList([{
       id: 7,
@@ -637,6 +714,9 @@ test("renderSubscriptionList renders card grid and active detail panel", () => {
     assert.match(element.innerHTML, /class="subscription-card-artwork"/)
     assert.match(element.innerHTML, /class="subscription-detail-panel"/)
     assert.match(element.innerHTML, /class="subscription-detail-artwork"/)
+    assert.match(element.innerHTML, /class="subscription-stat-filter selected"/)
+    assert.match(element.innerHTML, /data-album-filter="active"/)
+    assert.match(element.innerHTML, /class="subscription-album-search-input"/)
     assert.match(element.innerHTML, /Example Artist/)
     assert.match(element.innerHTML, /New Album/)
   })
