@@ -974,7 +974,8 @@ body.subscription-modal-open {
 }
 
 .subscription-card-stats span,
-.subscription-detail-stats span {
+.subscription-detail-stats span,
+.subscription-stat-filter {
   display: inline-flex;
   align-items: center;
   min-height: 22px;
@@ -986,6 +987,26 @@ body.subscription-modal-open {
   font-size: 11px;
   font-weight: 800;
   white-space: nowrap;
+}
+
+.subscription-stat-filter {
+  appearance: none;
+  font-family: inherit;
+  line-height: 1;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease, color 120ms ease;
+}
+
+.subscription-stat-filter:hover,
+.subscription-stat-filter.selected {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+  color: var(--blue);
+}
+
+.subscription-stat-filter:focus-visible {
+  outline: 3px solid rgba(0, 113, 227, 0.18);
+  outline-offset: 2px;
 }
 
 .subscription-detail-panel {
@@ -1182,6 +1203,37 @@ body.subscription-modal-open {
   font-size: 11px;
   font-weight: 850;
   text-transform: uppercase;
+}
+
+.subscription-albums-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.subscription-album-search {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: min(280px, 100%);
+}
+
+.subscription-album-search span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 850;
+  white-space: nowrap;
+}
+
+.subscription-album-search-input {
+  width: min(260px, 100%);
+  min-height: 32px;
+  padding: 6px 9px;
+  font-size: 12px;
 }
 
 .subscription-album-bulk {
@@ -1514,9 +1566,19 @@ body.subscription-modal-open {
   }
 
   .subscription-album-bulk,
+  .subscription-albums-header,
+  .subscription-album-search,
   .subscription-album-selection-actions,
   .subscription-album-bulk-actions {
     align-items: stretch;
+    width: 100%;
+  }
+
+  .subscription-album-search {
+    justify-content: flex-start;
+  }
+
+  .subscription-album-search-input {
     width: 100%;
   }
 

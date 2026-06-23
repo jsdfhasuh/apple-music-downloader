@@ -15,6 +15,7 @@ const state = {
   logFlushScheduled: false,
   subscriptionAlbumSelections: {},
   subscriptionAlbumScrollPositions: {},
+  subscriptionAlbumFilters: {},
 };
 
 const MAX_LOG_LINES = 300;
@@ -1667,6 +1668,48 @@ function clearAllSubscriptionAlbumScrollPositions() {
 }
 
 
+function getSubscriptionAlbumFilter(subscriptionId) {
+  const subscriptionKey = normalizeSelectionKey(subscriptionId);
+  const existing = subscriptionKey ? state.subscriptionAlbumFilters[subscriptionKey] : null;
+  return {
+    status: normalizeSubscriptionAlbumFilterStatus(existing?.status || "all"),
+    query: String(existing?.query || ""),
+  };
+}
+
+
+function setSubscriptionAlbumFilter(subscriptionId, patch) {
+  const subscriptionKey = normalizeSelectionKey(subscriptionId);
+  if (!subscriptionKey) {
+    return getSubscriptionAlbumFilter("");
+  }
+  const current = getSubscriptionAlbumFilter(subscriptionKey);
+  const next = {
+    status: normalizeSubscriptionAlbumFilterStatus(patch?.status || current.status),
+    query: patch?.query === undefined ? current.query : String(patch.query || ""),
+  };
+  if (next.status === "all" && !next.query.trim()) {
+    delete state.subscriptionAlbumFilters[subscriptionKey];
+  } else {
+    state.subscriptionAlbumFilters[subscriptionKey] = next;
+  }
+  return next;
+}
+
+
+function clearSubscriptionAlbumFilter(subscriptionId) {
+  const subscriptionKey = normalizeSelectionKey(subscriptionId);
+  if (subscriptionKey) {
+    delete state.subscriptionAlbumFilters[subscriptionKey];
+  }
+}
+
+
+function clearAllSubscriptionAlbumFilters() {
+  state.subscriptionAlbumFilters = {};
+}
+
+
 function getSelectedSubscriptionAlbumIds(subscriptionId) {
   return [...getSubscriptionAlbumSelection(subscriptionId)];
 }
@@ -1749,6 +1792,72 @@ function compareAlbumsByReleaseDateDesc(left, right) {
 }
 
 
+function normalizeSubscriptionAlbumFilterStatus(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return ["all", "pending", "active", "completed", "failed", "ignored", "imported"].includes(normalized) ? normalized : "all";
+}
+
+
+function albumMatchesSubscriptionStatusFilter(album, statusFilter) {
+  const normalizedFilter = normalizeSubscriptionAlbumFilterStatus(statusFilter);
+  if (normalizedFilter === "all") {
+    return true;
+  }
+  const detectedStatus = getAlbumDetectedStatus(album);
+  const rowStatus = normalizeAlbumStatus(album?.status);
+  const userState = normalizeAlbumUserState(album?.userState);
+  if (normalizedFilter === "pending") {
+    return userState === "pending";
+  }
+  if (normalizedFilter === "active") {
+    return ["queued", "running"].includes(detectedStatus) || ["queued", "running"].includes(rowStatus);
+  }
+  if (normalizedFilter === "completed") {
+    return detectedStatus === "completed" || rowStatus === "completed";
+  }
+  if (normalizedFilter === "failed") {
+    return ["failed_history", "stale_history"].includes(detectedStatus) || rowStatus === "failed";
+  }
+  if (normalizedFilter === "ignored") {
+    return userState === "ignored";
+  }
+  if (normalizedFilter === "imported") {
+    return userState === "imported";
+  }
+  return true;
+}
+
+
+function albumMatchesSubscriptionSearch(album, query) {
+  const normalizedQuery = String(query || "").trim().toLowerCase();
+  if (!normalizedQuery) {
+    return true;
+  }
+  const searchable = [
+    album?.albumName || "",
+    formatAlbumTitleFromUrl(album?.albumUrl || ""),
+    album?.albumId || "",
+    album?.releaseDate || "",
+    getAlbumStatusLabel(getAlbumDetectedStatus(album)),
+    getAlbumUserStateLabel(album?.userState),
+  ].join(" ").toLowerCase();
+  return searchable.includes(normalizedQuery);
+}
+
+
+function filterSubscriptionAlbums(albums, filter) {
+  const list = Array.isArray(albums) ? albums : [];
+  const normalizedFilter = {
+    status: normalizeSubscriptionAlbumFilterStatus(filter?.status || "all"),
+    query: String(filter?.query || ""),
+  };
+  return list.filter((album) => (
+    albumMatchesSubscriptionStatusFilter(album, normalizedFilter.status)
+    && albumMatchesSubscriptionSearch(album, normalizedFilter.query)
+  ));
+}
+
+
 function renderSubscriptionAlbums(subscription) {
   const albums = subscription.recentAlbums;
   if (!Array.isArray(albums) || albums.length === 0) {
@@ -1756,14 +1865,21 @@ function renderSubscriptionAlbums(subscription) {
   }
   const subscriptionId = getSubscriptionId(subscription);
   const sortedAlbums = [...albums].sort(compareAlbumsByReleaseDateDesc);
-  const pendingAlbums = sortedAlbums.filter(isSelectableSubscriptionAlbum);
-  const pendingAlbumIds = pendingAlbums.map((album) => normalizeSelectionKey(album.albumId)).filter(Boolean);
-  const selectedAlbumIds = pruneSubscriptionAlbumSelection(subscription, pendingAlbumIds);
-  const selectedAlbumIdSet = new Set(selectedAlbumIds);
-  const bulkActionDisabled = selectedAlbumIds.length === 0 ? " disabled" : "";
+  const albumFilter = getSubscriptionAlbumFilter(subscriptionId);
+  const filteredAlbums = filterSubscriptionAlbums(sortedAlbums, albumFilter);
+  const allPendingAlbumIds = sortedAlbums.filter(isSelectableSubscriptionAlbum).map((album) => normalizeSelectionKey(album.albumId)).filter(Boolean);
+  const pendingAlbums = filteredAlbums.filter(isSelectableSubscriptionAlbum);
+  const visiblePendingAlbumIds = pendingAlbums.map((album) => normalizeSelectionKey(album.albumId)).filter(Boolean);
+  const selectedAlbumIds = pruneSubscriptionAlbumSelection(subscription, allPendingAlbumIds);
+  const visibleSelectedAlbumIds = selectedAlbumIds.filter((albumId) => visiblePendingAlbumIds.includes(albumId));
+  const selectedAlbumIdSet = new Set(visibleSelectedAlbumIds);
+  const bulkActionDisabled = visibleSelectedAlbumIds.length === 0 ? " disabled" : "";
+  const filterActive = albumFilter.status !== "all" || albumFilter.query.trim();
+  const titleText = filterActive ? `筛选专辑 · ${filteredAlbums.length}/${sortedAlbums.length}` : `全部已记录专辑 · ${sortedAlbums.length}`;
+  const emptyText = filterActive ? '<p class="subscription-album-empty">没有匹配的专辑</p>' : "";
   const bulkActions = pendingAlbums.length > 0 ? `
     <div class="subscription-album-bulk" data-subscription-id="${escapeHtml(subscriptionId)}">
-      <span class="subscription-album-selection-summary">待确认 ${pendingAlbums.length} · 已选 ${selectedAlbumIds.length}</span>
+      <span class="subscription-album-selection-summary">待确认 ${pendingAlbums.length} · 已选 ${visibleSelectedAlbumIds.length}</span>
       <div class="subscription-album-selection-actions">
         <button type="button" class="secondary-button compact-button subscription-selection-action-btn" data-subscription-id="${escapeHtml(subscriptionId)}" data-selection-action="select_all">全选待确认</button>
         <button type="button" class="secondary-button compact-button subscription-selection-action-btn" data-subscription-id="${escapeHtml(subscriptionId)}" data-selection-action="clear"${bulkActionDisabled}>清空选择</button>
@@ -1775,7 +1891,7 @@ function renderSubscriptionAlbums(subscription) {
       </div>
     </div>
   ` : "";
-  const items = sortedAlbums.map((album) => {
+  const items = filteredAlbums.map((album) => {
     const detectedStatus = getAlbumDetectedStatus(album);
     const userState = normalizeAlbumUserState(album.userState);
     const albumTitle = album.albumName || formatAlbumTitleFromUrl(album.albumUrl) || album.albumId || "未知专辑";
@@ -1821,9 +1937,16 @@ function renderSubscriptionAlbums(subscription) {
   }).join("");
   return `
     <div class="subscription-albums">
-      <div class="subscription-albums-title">全部已记录专辑 · ${sortedAlbums.length}</div>
+      <div class="subscription-albums-header">
+        <div class="subscription-albums-title">${escapeHtml(titleText)}</div>
+        <label class="subscription-album-search">
+          <span>搜索专辑</span>
+          <input class="subscription-album-search-input" type="search" data-subscription-id="${escapeHtml(subscriptionId)}" value="${escapeHtml(albumFilter.query)}" placeholder="名称、ID、日期">
+        </label>
+      </div>
       ${bulkActions}
-      <ul>${items}</ul>
+      ${emptyText}
+      ${filteredAlbums.length > 0 ? `<ul>${items}</ul>` : ""}
     </div>
   `;
 }
@@ -1885,6 +2008,7 @@ function renderSubscriptionList(subscriptions) {
     state.activeSubscriptionId = "";
     clearAllSubscriptionAlbumSelections();
     clearAllSubscriptionAlbumScrollPositions();
+    clearAllSubscriptionAlbumFilters();
     container.innerHTML = '<p class="empty-text">暂无订阅</p>';
     return;
   }
@@ -1892,6 +2016,7 @@ function renderSubscriptionList(subscriptions) {
   const activeSubscriptionId = getPreferredSubscriptionId(list);
   state.activeSubscriptionId = activeSubscriptionId;
   const activeSubscription = list.find((subscription) => getSubscriptionId(subscription) === activeSubscriptionId) || list[0];
+  const activeAlbumFilter = getSubscriptionAlbumFilter(activeSubscriptionId);
 
   const cards = list.map((subscription) => {
     const subscriptionId = getSubscriptionId(subscription);
@@ -1917,13 +2042,13 @@ function renderSubscriptionList(subscriptions) {
   }).join("");
 
   const detailStats = [
-    ["专辑", activeSubscription.albumCount || 0],
-    ["待确认", activeSubscription.pendingAlbumCount || 0],
-    ["进行中", activeSubscription.activeAlbumCount || 0],
-    ["已完成", activeSubscription.completedAlbumCount || 0],
-    ["失败", activeSubscription.failedAlbumCount || 0],
-    ["忽略", activeSubscription.ignoredAlbumCount || 0],
-    ["已导入", activeSubscription.importedAlbumCount || 0],
+    { filter: "all", label: "专辑", value: activeSubscription.albumCount || 0 },
+    { filter: "pending", label: "待确认", value: activeSubscription.pendingAlbumCount || 0 },
+    { filter: "active", label: "进行中", value: activeSubscription.activeAlbumCount || 0 },
+    { filter: "completed", label: "已完成", value: activeSubscription.completedAlbumCount || 0 },
+    { filter: "failed", label: "失败", value: activeSubscription.failedAlbumCount || 0 },
+    { filter: "ignored", label: "忽略", value: activeSubscription.ignoredAlbumCount || 0 },
+    { filter: "imported", label: "已导入", value: activeSubscription.importedAlbumCount || 0 },
   ];
 
   const detailPanel = `
@@ -1948,7 +2073,11 @@ function renderSubscriptionList(subscriptions) {
         </div>
       </div>
       <div class="subscription-stats subscription-detail-stats">
-        ${detailStats.map(([label, value]) => `<span>${escapeHtml(label)} ${Number(value || 0)}</span>`).join("")}
+        ${detailStats.map(({ filter, label, value }) => `
+          <button type="button" class="subscription-stat-filter ${activeAlbumFilter.status === filter ? "selected" : ""}" data-subscription-id="${escapeHtml(activeSubscriptionId)}" data-album-filter="${escapeHtml(filter)}" aria-pressed="${activeAlbumFilter.status === filter ? "true" : "false"}">
+            ${escapeHtml(label)} ${Number(value || 0)}
+          </button>
+        `).join("")}
       </div>
       <p class="history-updated">上次扫描：${escapeHtml(activeSubscription.lastCheckedAt || "未扫描")}</p>
       ${activeSubscription.lastError ? `<p class="subscription-error-line">${escapeHtml(activeSubscription.lastError)}</p>` : ""}
@@ -1965,6 +2094,26 @@ function renderSubscriptionList(subscriptions) {
   attachArtworkFallbackHandlers(container);
   restoreSubscriptionAlbumScrollPosition(container, activeSubscriptionId);
 
+  const renderWithAlbumFilter = (subscriptionId, patch, focusSearch = false, cursorPosition = null) => {
+    const normalizedSubscriptionId = normalizeSelectionKey(subscriptionId);
+    const albumList = getSubscriptionAlbumScrollElement(container, normalizedSubscriptionId);
+    if (albumList) {
+      albumList.scrollTop = 0;
+    }
+    clearSubscriptionAlbumScrollPosition(normalizedSubscriptionId);
+    setSubscriptionAlbumFilter(normalizedSubscriptionId, patch);
+    renderSubscriptionList(list);
+    if (focusSearch) {
+      const nextInput = container.querySelector(".subscription-album-search-input");
+      if (nextInput && normalizeSelectionKey(nextInput.dataset.subscriptionId) === normalizedSubscriptionId) {
+        nextInput.focus();
+        if (typeof nextInput.setSelectionRange === "function" && Number.isInteger(cursorPosition)) {
+          nextInput.setSelectionRange(cursorPosition, cursorPosition);
+        }
+      }
+    }
+  };
+
   for (const card of container.querySelectorAll(".subscription-card")) {
     card.addEventListener("click", () => {
       const nextId = card.dataset.subscriptionId || "";
@@ -1973,6 +2122,19 @@ function renderSubscriptionList(subscriptions) {
       }
       state.activeSubscriptionId = nextId;
       renderSubscriptionList(list);
+    });
+  }
+
+  for (const btn of container.querySelectorAll(".subscription-stat-filter")) {
+    btn.addEventListener("click", () => {
+      renderWithAlbumFilter(btn.dataset.subscriptionId || "", { status: btn.dataset.albumFilter || "all" });
+    });
+  }
+
+  for (const input of container.querySelectorAll(".subscription-album-search-input")) {
+    input.addEventListener("input", () => {
+      const cursorPosition = typeof input.selectionStart === "number" ? input.selectionStart : input.value.length;
+      renderWithAlbumFilter(input.dataset.subscriptionId || "", { query: input.value || "" }, true, cursorPosition);
     });
   }
 
@@ -2161,6 +2323,7 @@ async function handleDeleteSubscription(subscriptionId) {
   await deleteSubscription(subscriptionId);
   clearSubscriptionAlbumSelection(subscriptionId);
   clearSubscriptionAlbumScrollPosition(subscriptionId);
+  clearSubscriptionAlbumFilter(subscriptionId);
   setSubscriptionNote("已删除订阅");
   await refreshSubscriptionList();
 }
@@ -2349,11 +2512,16 @@ if (typeof module !== "undefined") {
   module.exports = {
     bindViewNavigation,
     bindSidebarToggle,
+    albumMatchesSubscriptionSearch,
+    albumMatchesSubscriptionStatusFilter,
     clearAllSubscriptionAlbumSelections,
+    clearAllSubscriptionAlbumFilters,
     clearAllSubscriptionAlbumScrollPositions,
+    clearSubscriptionAlbumFilter,
     clearSubscriptionAlbumSelection,
     compareAlbumsByReleaseDateDesc,
     cancelTask,
+    filterSubscriptionAlbums,
     formatSubscriptionScanSummary,
     formatSubscriptionActionSummary,
     formatHistoryRetrySummary,
@@ -2364,6 +2532,7 @@ if (typeof module !== "undefined") {
     getAlbumDetectedStatus,
     getAlbumStatusLabel,
     getAlbumUserStateLabel,
+    getSubscriptionAlbumFilter,
     getTaskAlbumName,
     getInitialViewName,
     getSingleSubscriptionScanPayload,
@@ -2386,6 +2555,7 @@ if (typeof module !== "undefined") {
     saveSubscriptionAlbumScrollPosition,
     selectAllSelectableSubscriptionAlbums,
     setSidebarCollapsed,
+    setSubscriptionAlbumFilter,
     setSubscriptionAlbumSelected,
     setSubscriptionAlbumSelection,
     showView,
