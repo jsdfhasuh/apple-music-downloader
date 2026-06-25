@@ -25,6 +25,45 @@
 
 原脚本由 Sorrow 编写。本人已修改，包含一些修复和改进。
 
+## GitHub 容器镜像
+
+本 fork 通过 `.github/workflows/docker.yml` 发布两个 GitHub Container Registry 镜像：
+
+- 下载器：`ghcr.io/jsdfhasuh/apple-music-downloader`
+- Flask 网页端和 Telegram 机器人：`ghcr.io/jsdfhasuh/apple-music-downloader-webapp`
+
+该 workflow 会为两个镜像构建 `linux/amd64` 版本。推送到 `main`、推送 `v*` 标签、以及手动触发 workflow 时会推送镜像；Pull Request 只构建验证，不推送镜像。
+
+发布的标签包括默认分支的 `latest`、分支或 tag 名，以及 `sha-<commit>`。
+
+## Docker 运行下载器
+
+1. 确保解密程序 [wrapper](https://github.com/WorldObservationLog/wrapper) 正在运行
+2. 使用 GHCR 镜像运行下载器：
+
+```bash
+# 查看帮助
+docker run --network host -v ./downloads:/downloads ghcr.io/jsdfhasuh/apple-music-downloader --help
+
+# 下载专辑
+docker run --network host -v ./downloads:/downloads ghcr.io/jsdfhasuh/apple-music-downloader https://music.apple.com/us/album/1989-taylors-version-deluxe/1713845538
+
+# 下载单曲
+docker run --network host -v ./downloads:/downloads ghcr.io/jsdfhasuh/apple-music-downloader --song https://music.apple.com/us/album/1989-taylors-version-deluxe/1713845538?i=1713845545
+
+# Dolby Atmos
+docker run --network host -v ./downloads:/downloads ghcr.io/jsdfhasuh/apple-music-downloader --atmos https://music.apple.com/us/album/1989-taylors-version-deluxe/1713845538
+
+# AAC
+docker run --network host -v ./downloads:/downloads ghcr.io/jsdfhasuh/apple-music-downloader --aac https://music.apple.com/us/album/1989-taylors-version-deluxe/1713845538
+```
+
+如需使用自定义配置，可挂载 `config.yaml`：
+
+```bash
+docker run --network host -v ./downloads:/downloads -v ./config.yaml:/app/config.yaml ghcr.io/jsdfhasuh/apple-music-downloader [参数]
+```
+
 ## 使用方法
 1. 确保解密程序 [wrapper](https://github.com/WorldObservationLog/wrapper) 正在运行
 2. 开始下载部分专辑：`go run main.go https://music.apple.com/us/album/whenever-you-need-somebody-2022-remaster/1624945511`。
@@ -72,6 +111,13 @@ http://127.0.0.1:5000
 - 网页端默认自动选择最高音质，按 Hi-Res/ALAC 优先策略下载
 - 页面不再提供 AAC/Atmos 手动选择，不支持 `--search`、`--select` 这类交互模式
 - 页面会实时显示日志、阶段状态和已解析的下载结果路径
+
+网页端容器：
+
+- 已发布镜像：`ghcr.io/jsdfhasuh/apple-music-downloader-webapp`
+- 本地构建：`docker build -f webapp/Dockerfile -t apple-music-webapp:test .`
+- 容器启动后会同时运行 Flask 网页端和 Telegram 机器人
+- 容器内优先读取 `/app/data/config.yaml`，可用数据卷挂载运行配置和持久化数据
 
 Telegram 私聊机器人：
 

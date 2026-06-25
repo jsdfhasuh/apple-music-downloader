@@ -27,6 +27,17 @@ For acquisition`aac-lc` `MV` `lyrics` You must fill in the information with a su
 
 Original script by Sorrow. Modified by me to include some fixes and improvements.
 
+## GitHub Container Images
+
+This fork publishes two GitHub Container Registry images from `.github/workflows/docker.yml`:
+
+- Downloader: `ghcr.io/jsdfhasuh/apple-music-downloader`
+- Flask dashboard and Telegram bot: `ghcr.io/jsdfhasuh/apple-music-downloader-webapp`
+
+The workflow builds both images for `linux/amd64`. Pushes to `main`, `v*` tags, and manual workflow dispatches publish images; pull requests build the images without pushing them.
+
+Published tags include `latest` for the default branch, branch or tag refs, and `sha-<commit>`.
+
 ## Running with Docker
 
 1. Make sure the decryption program [wrapper](https://github.com/WorldObservationLog/wrapper) is running
@@ -34,35 +45,35 @@ Original script by Sorrow. Modified by me to include some fixes and improvements
 2. Start the downloader with Docker:
    ```bash
    # show help
-   docker run --network host -v ./downloads:/downloads ghcr.io/zhaarey/apple-music-downloader --help
+   docker run --network host -v ./downloads:/downloads ghcr.io/jsdfhasuh/apple-music-downloader --help
 
    # start downloading some albums
-   docker run --network host -v ./downloads:/downloads ghcr.io/zhaarey/apple-music-downloader https://music.apple.com/ru/album/children-of-forever/1443732441 
+   docker run --network host -v ./downloads:/downloads ghcr.io/jsdfhasuh/apple-music-downloader https://music.apple.com/ru/album/children-of-forever/1443732441
 
    # start downloading single song
-   docker run --network host -v ./downloads:/downloads ghcr.io/zhaarey/apple-music-downloader --song https://music.apple.com/ru/album/bass-folk-song/1443732441?i=1443732453
+   docker run --network host -v ./downloads:/downloads ghcr.io/jsdfhasuh/apple-music-downloader --song https://music.apple.com/ru/album/bass-folk-song/1443732441?i=1443732453
 
    # start downloading select
-   docker run -it --network host -v ./downloads:/downloads ghcr.io/zhaarey/apple-music-downloader --select https://music.apple.com/ru/album/children-of-forever/1443732441
+   docker run -it --network host -v ./downloads:/downloads ghcr.io/jsdfhasuh/apple-music-downloader --select https://music.apple.com/ru/album/children-of-forever/1443732441
 
    # start downloading some playlists
-   docker run --network host -v ./downloads:/downloads ghcr.io/zhaarey/apple-music-downloader https://music.apple.com/us/playlist/taylor-swift-essentials/pl.3950454ced8c45a3b0cc693c2a7db97b
+   docker run --network host -v ./downloads:/downloads ghcr.io/jsdfhasuh/apple-music-downloader https://music.apple.com/us/playlist/taylor-swift-essentials/pl.3950454ced8c45a3b0cc693c2a7db97b
 
    # for dolby atmos
-   docker run --network host -v ./downloads:/downloads ghcr.io/zhaarey/apple-music-downloader --atmos https://music.apple.com/us/album/1989-taylors-version-deluxe/1713845538
+   docker run --network host -v ./downloads:/downloads ghcr.io/jsdfhasuh/apple-music-downloader --atmos https://music.apple.com/us/album/1989-taylors-version-deluxe/1713845538
    
    # for aac
-   docker run --network host -v ./downloads:/downloads ghcr.io/zhaarey/apple-music-downloader --aac https://music.apple.com/us/album/1989-taylors-version-deluxe/1713845538
+   docker run --network host -v ./downloads:/downloads ghcr.io/jsdfhasuh/apple-music-downloader --aac https://music.apple.com/us/album/1989-taylors-version-deluxe/1713845538
 
    # for see quality
-   docker run --network host -v ./downloads:/downloads ghcr.io/zhaarey/apple-music-downloader --debug https://music.apple.com/ru/album/miles-smiles/209407331
+   docker run --network host -v ./downloads:/downloads ghcr.io/jsdfhasuh/apple-music-downloader --debug https://music.apple.com/ru/album/miles-smiles/209407331
    ```
 
 You can change `config.yaml` by mounting a volume:
 
 > **Note:** Before running the following command, make sure that a `config.yaml` file exists in your current directory. You can create your own, or copy the default one from the repository (if available). If `./config.yaml` does not exist, Docker will create an empty directory instead of a file, which will cause the container to fail.
 ```bash
-docker run --network host -v ./downloads:/downloads -v ./config.yaml:/app/config.yaml ghcr.io/zhaarey/apple-music-downloader [args]
+docker run --network host -v ./downloads:/downloads -v ./config.yaml:/app/config.yaml ghcr.io/jsdfhasuh/apple-music-downloader [args]
 ```
 
 ## How to use
@@ -132,6 +143,8 @@ Telegram private bot:
 
 Webapp container runtime:
 
+- Published image: `ghcr.io/jsdfhasuh/apple-music-downloader-webapp`
+- Local build: `docker build -f webapp/Dockerfile -t apple-music-webapp:test .`
 - `webapp/Dockerfile` now starts both `webapp/app.py` and `webapp/telegram_bot.py`
 - Flask service logs and Telegram bot logs both go to the container stdout/stderr stream
 - Use `docker logs <container-name>` to inspect backend and bot logs together
