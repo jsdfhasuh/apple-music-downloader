@@ -64,6 +64,43 @@ docker run --network host -v ./downloads:/downloads ghcr.io/jsdfhasuh/apple-musi
 docker run --network host -v ./downloads:/downloads -v ./config.yaml:/app/config.yaml ghcr.io/jsdfhasuh/apple-music-downloader [参数]
 ```
 
+### Docker 运行网页端
+
+网页端容器本身不直接下载媒体。它会通过 Docker 调用一个已经存在、且容器名为 `applemusic_download` 的下载器容器，所以下载器和网页端需要运行在同一个 Docker daemon 上，并且挂载同一个下载目录到 `/downloads`。
+
+Linux / Unraid 示例：
+
+```bash
+mkdir -p downloads data
+
+# 启动下载器核心容器。网页端依赖这个固定容器名。
+docker run -d \
+  --name applemusic_download \
+  --restart unless-stopped \
+  --network host \
+  -v "$PWD/downloads:/downloads" \
+  -v "$PWD/config.yaml:/app/config.yaml:ro" \
+  ghcr.io/jsdfhasuh/apple-music-downloader:latest
+
+# 启动 Flask 网页端和 Telegram 机器人容器。
+docker run -d \
+  --name apple-music-webapp \
+  --restart unless-stopped \
+  -p 5000:5000 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v "$PWD/downloads:/downloads" \
+  -v "$PWD/data:/app/data" \
+  ghcr.io/jsdfhasuh/apple-music-downloader-webapp:latest
+```
+
+打开网页端：
+
+```text
+http://127.0.0.1:5000
+```
+
+Telegram token 等运行配置建议放在 `data/config.yaml`。容器内存在 `/app/data/config.yaml` 时会优先读取它，任务数据库和日志也会写到 `/app/data`。
+
 ## 使用方法
 1. 确保解密程序 [wrapper](https://github.com/WorldObservationLog/wrapper) 正在运行
 2. 开始下载部分专辑：`go run main.go https://music.apple.com/us/album/whenever-you-need-somebody-2022-remaster/1624945511`。

@@ -76,6 +76,43 @@ You can change `config.yaml` by mounting a volume:
 docker run --network host -v ./downloads:/downloads -v ./config.yaml:/app/config.yaml ghcr.io/jsdfhasuh/apple-music-downloader [args]
 ```
 
+### Running the web dashboard with Docker
+
+The dashboard container does not download media by itself. It uses Docker to call an existing downloader container named `applemusic_download`, so keep the downloader and webapp containers on the same Docker daemon and mount the same downloads directory into both containers.
+
+Linux / Unraid example:
+
+```bash
+mkdir -p downloads data
+
+# Start the downloader core container. The name is required by the webapp.
+docker run -d \
+  --name applemusic_download \
+  --restart unless-stopped \
+  --network host \
+  -v "$PWD/downloads:/downloads" \
+  -v "$PWD/config.yaml:/app/config.yaml:ro" \
+  ghcr.io/jsdfhasuh/apple-music-downloader:latest
+
+# Start the Flask dashboard and Telegram bot container.
+docker run -d \
+  --name apple-music-webapp \
+  --restart unless-stopped \
+  -p 5000:5000 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v "$PWD/downloads:/downloads" \
+  -v "$PWD/data:/app/data" \
+  ghcr.io/jsdfhasuh/apple-music-downloader-webapp:latest
+```
+
+Open the dashboard at:
+
+```text
+http://127.0.0.1:5000
+```
+
+Put runtime config such as Telegram tokens in `data/config.yaml`. The webapp reads `/app/data/config.yaml` first when that file exists, and writes task databases and logs under `/app/data`.
+
 ## How to use
 1. Make sure the decryption program [wrapper](https://github.com/WorldObservationLog/wrapper) is running
 2. Start downloading some albums: `go run main.go https://music.apple.com/us/album/whenever-you-need-somebody-2022-remaster/1624945511`.
