@@ -88,6 +88,10 @@ ARTWORK_EXTENSION_CONTENT_TYPES = {
   ".gif": "image/gif",
   ".avif": "image/avif",
 }
+DEFAULT_WRAPPER_RECOVERY_CONTAINER_NAME = "wrapper"
+DEFAULT_WRAPPER_RECOVERY_TIMEOUT_SECONDS = 60.0
+DEFAULT_WRAPPER_RECOVERY_COOLDOWN_SECONDS = 120.0
+DEFAULT_WRAPPER_RECOVERY_MAX_RETRIES_PER_TASK = 1
 
 
 @dataclass
@@ -102,6 +106,7 @@ class DownloadTask:
   url: str
   codec: str
   source: str = "web"
+  wrapperRecoveryAttempts: int = 0
   createdAt: float = field(default_factory=time.time)
   status: str = "pending"
   stage: str = "pending"
@@ -119,6 +124,7 @@ class DownloadTask:
       "url": self.url,
       "codec": self.codec,
       "source": self.source,
+      "wrapperRecoveryAttempts": self.wrapperRecoveryAttempts,
       "createdAt": self.createdAt,
       "status": self.status,
       "stage": self.stage,
@@ -1223,17 +1229,41 @@ class ArtistSubscriptionStore:
     }
 
 
+@dataclass
+class WrapperRecoveryConfig:
+  enabled: bool = False
+  containerName: str = DEFAULT_WRAPPER_RECOVERY_CONTAINER_NAME
+  dockerContext: str = ""
+  timeoutSeconds: float = DEFAULT_WRAPPER_RECOVERY_TIMEOUT_SECONDS
+  cooldownSeconds: float = DEFAULT_WRAPPER_RECOVERY_COOLDOWN_SECONDS
+  maxRetriesPerTask: int = DEFAULT_WRAPPER_RECOVERY_MAX_RETRIES_PER_TASK
+  decryptM3u8Port: str = ""
+
+
 class TaskStore:
   def __init__(self) -> None:
     self._tasks: dict[str, DownloadTask] = {}
     self._lock = threading.Lock()
 
-  def createTask(self, url: str, codec: str, source: str = "web", taskId: str | None = None) -> DownloadTask:
+  def createTask(
+    self,
+    url: str,
+    codec: str,
+    source: str = "web",
+    taskId: str | None = None,
+    wrapperRecoveryAttempts: int = 0,
+  ) -> DownloadTask:
     candidateTaskId = taskId or uuid.uuid4().hex
     with self._lock:
       if candidateTaskId in self._tasks:
         candidateTaskId = uuid.uuid4().hex
-      task = DownloadTask(id=candidateTaskId, url=url, codec=codec, source=source)
+      task = DownloadTask(
+        id=candidateTaskId,
+        url=url,
+        codec=codec,
+        source=source,
+        wrapperRecoveryAttempts=max(0, wrapperRecoveryAttempts),
+      )
       self._tasks[task.id] = task
     return task
 
@@ -1281,6 +1311,65 @@ class SerialTaskQueue:
         del self._pending[index]
         return True
     return False
+
+
+class WrapperRecoveryManager:
+  def __init__(self, config: WrapperRecoveryConfig) -> None:
+    self.config = config
+    self._lastRecoveryAttemptAt = 0.0
+    self._lock = threading.Lock()
+
+  def restartForTask(self, task: DownloadTask) -> bool:
+    if not self.config.enabled:
+      return False
+    reason = task.error or task.failureReasonCandidate
+    if not isRecoverableWrapperError(reason, self.config.decryptM3u8Port):
+      return False
+    if task.wrapperRecoveryAttempts >= self.config.maxRetriesPerTask:
+      task.appendLog(
+        "Wrapper recovery: automatic retry limit reached "
+        f"({task.wrapperRecoveryAttempts}/{self.config.maxRetriesPerTask})."
+      )
+      return False
+    now = time.time()
+    with self._lock:
+      if self._lastRecoveryAttemptAt > 0 and now - self._lastRecoveryAttemptAt < self.config.cooldownSeconds:
+        remainingSeconds = self.config.cooldownSeconds - (now - self._lastRecoveryAttemptAt)
+        task.appendLog(f"Wrapper recovery: cooldown active, skipping restart for {remainingSeconds:.0f}s.")
+        return False
+      self._lastRecoveryAttemptAt = now
+
+    command = buildWrapperRestartCommand(self.config)
+    task.appendLog("Wrapper recovery: detected recoverable decrypt service error.")
+    task.appendLog(f"Wrapper recovery: restarting Docker container {self.config.containerName}.")
+    try:
+      completed = subprocess.run(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=self.config.timeoutSeconds,
+        check=False,
+      )
+    except subprocess.TimeoutExpired:
+      task.appendLog(f"Wrapper recovery: restart timed out after {self.config.timeoutSeconds:g}s.")
+      return False
+    except Exception as exc:  # noqa: BLE001
+      task.appendLog(f"Wrapper recovery: restart failed: {exc}")
+      return False
+
+    output = (completed.stdout or "").strip()
+    if completed.returncode != 0:
+      if output:
+        task.appendLog(f"Wrapper recovery: restart failed: {output}")
+      else:
+        task.appendLog(f"Wrapper recovery: restart failed with code {completed.returncode}.")
+      return False
+    if output:
+      task.appendLog(f"Wrapper recovery: restart output: {output}")
+    task.appendLog("Wrapper recovery: restart succeeded.")
+    return True
 
 
 class DownloaderRunner:
@@ -1957,6 +2046,69 @@ def parseFloatConfigValue(rawValue: object, default: float) -> float:
     return default
 
 
+def parseIntConfigValue(rawValue: object, default: int) -> int:
+  if rawValue is None:
+    return default
+  try:
+    return int(str(rawValue).strip())
+  except ValueError:
+    return default
+
+
+def loadWrapperRecoveryConfig(configPath: Path | None = None) -> WrapperRecoveryConfig:
+  resolvedConfigPath = configPath or resolveConfigPath()
+  containerName = (
+    getConfigValue(resolvedConfigPath, "wrapper-recovery-container-name")
+    or DEFAULT_WRAPPER_RECOVERY_CONTAINER_NAME
+  ).strip()
+  timeoutSeconds = parseFloatConfigValue(
+    getConfigValue(resolvedConfigPath, "wrapper-recovery-timeout-seconds"),
+    DEFAULT_WRAPPER_RECOVERY_TIMEOUT_SECONDS,
+  )
+  cooldownSeconds = parseFloatConfigValue(
+    getConfigValue(resolvedConfigPath, "wrapper-recovery-cooldown-seconds"),
+    DEFAULT_WRAPPER_RECOVERY_COOLDOWN_SECONDS,
+  )
+  maxRetriesPerTask = parseIntConfigValue(
+    getConfigValue(resolvedConfigPath, "wrapper-recovery-max-retries-per-task"),
+    DEFAULT_WRAPPER_RECOVERY_MAX_RETRIES_PER_TASK,
+  )
+  return WrapperRecoveryConfig(
+    enabled=parseBoolConfigValue(getConfigValue(resolvedConfigPath, "wrapper-recovery-enabled"), default=False),
+    containerName=containerName or DEFAULT_WRAPPER_RECOVERY_CONTAINER_NAME,
+    dockerContext=(getConfigValue(resolvedConfigPath, "wrapper-recovery-docker-context") or "").strip(),
+    timeoutSeconds=max(1.0, timeoutSeconds),
+    cooldownSeconds=max(0.0, cooldownSeconds),
+    maxRetriesPerTask=max(0, maxRetriesPerTask),
+    decryptM3u8Port=(getConfigValue(resolvedConfigPath, "decrypt-m3u8-port") or "").strip(),
+  )
+
+
+def buildWrapperRestartCommand(config: WrapperRecoveryConfig) -> list[str]:
+  command = ["docker"]
+  if config.dockerContext:
+    command.extend(["--context", config.dockerContext])
+  command.extend(["restart", config.containerName])
+  return command
+
+
+def isRecoverableWrapperError(reason: str, decryptM3u8Port: str = "") -> bool:
+  normalizedReason = str(reason or "").strip()
+  if "Failed to run v2:" not in normalizedReason:
+    return False
+  if "connection reset by peer" not in normalizedReason.lower():
+    return False
+  normalizedPort = str(decryptM3u8Port or "").strip()
+  if not normalizedPort:
+    return False
+  if normalizedPort in normalizedReason:
+    return True
+  if ":" in normalizedPort:
+    return False
+  portPart = normalizedPort.rsplit(":", 1)[-1]
+  return bool(portPart and f":{portPart}" in normalizedReason)
+
+
 def getRecoverPendingMaxAgeHours() -> float:
   configPath = resolveConfigPath()
   return parseFloatConfigValue(getConfigValue(configPath, "recover-pending-max-age-hours"), default=12.0)
@@ -1979,6 +2131,38 @@ def isRecoverableRecordFresh(record: dict[str, str], maxAgeHours: float) -> bool
   return ageSeconds <= maxAgeHours * 3600
 
 
+def maybeRecoverWrapperFailure(
+  app: Flask,
+  taskStore: TaskStore,
+  taskQueue: SerialTaskQueue,
+  historyStore: DownloadHistoryStore,
+  task: DownloadTask,
+  albumId: str,
+) -> None:
+  recoveryManager = app.config.get("WRAPPER_RECOVERY_MANAGER")
+  if not isinstance(recoveryManager, WrapperRecoveryManager):
+    return
+  if not recoveryManager.restartForTask(task):
+    return
+  try:
+    responsePayload = startTask(
+      app,
+      taskStore,
+      taskQueue,
+      historyStore,
+      task.url,
+      task.codec,
+      task.source,
+      wrapperRecoveryAttempts=task.wrapperRecoveryAttempts + 1,
+    )
+  except Exception as exc:  # noqa: BLE001
+    task.appendLog(f"Wrapper recovery: failed to queue automatic retry: {exc}")
+    return
+  retryTaskId = str(responsePayload["taskId"])
+  task.appendLog(f"Wrapper recovery: queued automatic retry task {retryTaskId}.")
+  syncSubscriptionAlbumStatus(app, albumId, "queued", retryTaskId)
+
+
 def startTask(
   app: Flask,
   taskStore: TaskStore,
@@ -1988,9 +2172,10 @@ def startTask(
   codec: str,
   source: str = "web",
   taskId: str | None = None,
+  wrapperRecoveryAttempts: int = 0,
 ) -> dict[str, object]:
   albumId = extractAlbumIdFromUrl(url)
-  task = taskStore.createTask(url, codec, source, taskId)
+  task = taskStore.createTask(url, codec, source, taskId, wrapperRecoveryAttempts)
   runner = app.config["RUNNER_FACTORY"]()
 
   def runTask() -> None:
@@ -2008,10 +2193,12 @@ def startTask(
           markTaskFailed(task, "download finished without any result")
         historyStore.saveFailed(url, task.id, codec, task.error or "download failed", source, albumId)
         syncSubscriptionAlbumStatus(app, albumId, "failed", task.id)
+        maybeRecoverWrapperFailure(app, taskStore, taskQueue, historyStore, task, albumId)
     except Exception as exc:  # noqa: BLE001
       markTaskFailed(task, str(exc))
       historyStore.saveFailed(url, task.id, codec, str(exc), source, albumId)
       syncSubscriptionAlbumStatus(app, albumId, "failed", task.id)
+      maybeRecoverWrapperFailure(app, taskStore, taskQueue, historyStore, task, albumId)
     finally:
       taskQueue.complete(task.id)
 
@@ -2915,6 +3102,7 @@ def createApp(
   app.config["SUBSCRIPTION_STOREFRONT"] = getConfiguredSubscriptionStorefront(configPath)
   subscriptionStore.migrateSubscriptionsToStorefront(app.config["SUBSCRIPTION_STOREFRONT"])
   app.config["ARTWORK_CACHE_DIR"] = Path(historyDbPath).parent / "artwork_cache"
+  app.config["WRAPPER_RECOVERY_MANAGER"] = WrapperRecoveryManager(loadWrapperRecoveryConfig(configPath))
 
   @app.get("/")
   def index() -> str:
@@ -3159,6 +3347,7 @@ def createApp(
         "stage": task.stage,
         "progress": task.progress,
         "source": task.source,
+        "wrapperRecoveryAttempts": task.wrapperRecoveryAttempts,
         "createdAt": task.createdAt,
       }
       taskPayloads.append(payload)

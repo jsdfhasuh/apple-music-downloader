@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 
 from webapp.apple_music import AppleMusicAlbum, AppleMusicArtist, formatArtworkUrl
-from webapp.app import ArtistSubscriptionStore, DownloadHistoryStore, DownloadTask, DownloaderRunner, PipelineRunner, createApp, getArtworkCacheDir, runAutomaticSubscriptionScan, startSubscriptionScheduler, updateTaskFromLine
+from webapp.app import ArtistSubscriptionStore, DownloadHistoryStore, DownloadTask, DownloaderRunner, PipelineRunner, createApp, getArtworkCacheDir, isRecoverableWrapperError, runAutomaticSubscriptionScan, startSubscriptionScheduler, updateTaskFromLine
 
 
 class FakeRunner:
@@ -47,6 +47,7 @@ class FakeRunner:
 
 class FakeAppleMusicClient:
   def __init__(self):
+    self.storefront = "cn"
     self.searchResults = [
       AppleMusicArtist(
         artistId="12345",
@@ -79,6 +80,19 @@ class FakeAppleMusicClient:
   def listArtistAlbums(self, storefront, artistId):
     self.albumCalls.append((storefront, artistId))
     return self.albums
+
+
+WRAPPER_RESET_FAILURE_LINE = (
+  "Decrypting... 5% (2/25 MB, 1.1 MB/s) "
+  "Failed to run v2: decryptFragment: read tcp "
+  "192.168.100.93:59468->192.168.100.56:10020: read: connection reset by peer"
+)
+WRAPPER_FAILURE_SUMMARY_LINE = "=======  [✔ ] Completed: 0/1  |  [⚠ ] Warnings: 0  |  [✖ ] Errors: 1  ======="
+
+
+def failWithWrapperReset(task: DownloadTask) -> None:
+  updateTaskFromLine(task, WRAPPER_RESET_FAILURE_LINE)
+  updateTaskFromLine(task, WRAPPER_FAILURE_SUMMARY_LINE)
 
 
 class FlaskDashboardTest(unittest.TestCase):
@@ -1018,6 +1032,273 @@ class FlaskDashboardTest(unittest.TestCase):
     self.assertEqual(second.status_code, 202)
     self.assertEqual(len(restartedRunner.calls), 1)
     self.assertNotEqual(secondPayload["taskId"], firstPayload["taskId"])
+
+  def testRecoverableWrapperErrorDetectionRequiresRunV2ConnectionReset(self):
+    self.assertTrue(isRecoverableWrapperError(
+      "Failed to run v2: decryptFragment: read tcp 192.168.100.93:59468->192.168.100.56:10020: read: connection reset by peer",
+      "192.168.100.56:10020",
+    ))
+    self.assertFalse(isRecoverableWrapperError(
+      "Failed to run v2: decryptFragment: read tcp 192.168.100.93:59468->192.168.100.56:10020: read: connection reset by peer",
+      "",
+    ))
+    self.assertFalse(isRecoverableWrapperError(
+      "Failed to dl aac-lc: Unavailable",
+      "192.168.100.56:10020",
+    ))
+    self.assertFalse(isRecoverableWrapperError(
+      "Failed to run v2: decryptFragment: read tcp 192.168.100.93:59468->192.168.100.56:10020: connect: no route to host",
+      "192.168.100.56:10020",
+    ))
+    self.assertFalse(isRecoverableWrapperError(
+      "Failed to run v2: decryptFragment: read tcp 192.168.100.93:59468->192.168.100.99:10020: read: connection reset by peer",
+      "192.168.100.56:10021",
+    ))
+
+  def testWrapperRecoveryRestartsContainerAndRetriesTaskOnce(self):
+    calls: list[tuple[str, str, str, int]] = []
+
+    def runner(task, url, codec):
+      calls.append((task.id, url, codec, task.wrapperRecoveryAttempts))
+      if len(calls) == 1:
+        failWithWrapperReset(task)
+        return
+      task.setResult([{
+        "path": "/downloads/recovered.flac",
+        "artist": "Recovered Artist",
+        "album": "Recovered Album",
+        "song": "Recovered Song",
+      }])
+      task.setStage("completed")
+      task.setStatus("completed")
+      task.setProgress(100)
+
+    app = self.createAppWithConfig(
+      "\n".join([
+        "wrapper-recovery-enabled: true",
+        'wrapper-recovery-container-name: "wrapper"',
+        'decrypt-m3u8-port: "192.168.100.56:10020"',
+        "wrapper-recovery-cooldown-seconds: 0",
+      ]),
+      lambda: runner,
+      "wrapper-retry-downloads.db",
+    )
+    client = app.test_client()
+
+    with patch(
+      "webapp.app.subprocess.run",
+      return_value=subprocess.CompletedProcess(["docker", "restart", "wrapper"], 0, stdout="wrapper\n"),
+    ) as restartRun:
+      response = client.post(
+        "/api/downloads",
+        data=json.dumps({"url": "https://music.apple.com/cn/album/wrapper-retry/111"}),
+        content_type="application/json",
+      )
+
+    payload = response.get_json()
+    originalTask = client.get(f"/api/tasks/{payload['taskId']}").get_json()
+    tasks = client.get("/api/tasks").get_json()
+    historyRecord = app.config["HISTORY_STORE"].getByUrl("https://music.apple.com/cn/album/wrapper-retry/111")
+
+    self.assertEqual(response.status_code, 202)
+    self.assertEqual(restartRun.call_args.args[0], ["docker", "restart", "wrapper"])
+    self.assertEqual(len(calls), 2)
+    self.assertEqual(calls[0][3], 0)
+    self.assertEqual(calls[1][3], 1)
+    self.assertEqual(originalTask["status"], "failed")
+    self.assertTrue(any("queued automatic retry task" in line for line in originalTask["logs"]))
+    self.assertEqual(len(tasks), 2)
+    self.assertEqual(historyRecord["status"], "completed")
+
+  def testWrapperRecoveryUsesConfiguredDockerContext(self):
+    calls: list[str] = []
+
+    def runner(task, url, codec):
+      calls.append(task.id)
+      if len(calls) == 1:
+        failWithWrapperReset(task)
+        return
+      task.setResult([{
+        "path": "/downloads/context-recovered.flac",
+        "artist": "Recovered Artist",
+        "album": "Recovered Album",
+        "song": "Recovered Song",
+      }])
+      task.setStage("completed")
+      task.setStatus("completed")
+      task.setProgress(100)
+
+    app = self.createAppWithConfig(
+      "\n".join([
+        "wrapper-recovery-enabled: true",
+        'wrapper-recovery-container-name: "ckc-wrapper"',
+        'wrapper-recovery-docker-context: "unraid-2375"',
+        'decrypt-m3u8-port: "192.168.100.56:10020"',
+        "wrapper-recovery-cooldown-seconds: 0",
+      ]),
+      lambda: runner,
+      "wrapper-context-downloads.db",
+    )
+    client = app.test_client()
+
+    with patch(
+      "webapp.app.subprocess.run",
+      return_value=subprocess.CompletedProcess(
+        ["docker", "--context", "unraid-2375", "restart", "ckc-wrapper"],
+        0,
+        stdout="ckc-wrapper\n",
+      ),
+    ) as restartRun:
+      client.post(
+        "/api/downloads",
+        data=json.dumps({"url": "https://music.apple.com/cn/album/wrapper-context/222"}),
+        content_type="application/json",
+      )
+
+    self.assertEqual(
+      restartRun.call_args.args[0],
+      ["docker", "--context", "unraid-2375", "restart", "ckc-wrapper"],
+    )
+
+  def testWrapperRecoveryTimeoutDoesNotBlockNextTask(self):
+    calls: list[str] = []
+
+    def runner(task, url, codec):
+      calls.append(url)
+      if url.endswith("/wrapper-timeout/333"):
+        failWithWrapperReset(task)
+        return
+      task.setResult([{
+        "path": "/downloads/after-timeout.flac",
+        "artist": "Recovered Artist",
+        "album": "Recovered Album",
+        "song": "Recovered Song",
+      }])
+      task.setStage("completed")
+      task.setStatus("completed")
+      task.setProgress(100)
+
+    app = self.createAppWithConfig(
+      "\n".join([
+        "wrapper-recovery-enabled: true",
+        'wrapper-recovery-container-name: "wrapper"',
+        'decrypt-m3u8-port: "192.168.100.56:10020"',
+        "wrapper-recovery-timeout-seconds: 1",
+        "wrapper-recovery-cooldown-seconds: 0",
+      ]),
+      lambda: runner,
+      "wrapper-timeout-downloads.db",
+    )
+    client = app.test_client()
+
+    with patch(
+      "webapp.app.subprocess.run",
+      side_effect=subprocess.TimeoutExpired(["docker", "restart", "wrapper"], 1),
+    ):
+      first = client.post(
+        "/api/downloads",
+        data=json.dumps({"url": "https://music.apple.com/cn/album/wrapper-timeout/333"}),
+        content_type="application/json",
+      )
+    second = client.post(
+      "/api/downloads",
+      data=json.dumps({"url": "https://music.apple.com/cn/album/after-timeout/334"}),
+      content_type="application/json",
+    )
+
+    firstTask = client.get(f"/api/tasks/{first.get_json()['taskId']}").get_json()
+    secondTask = client.get(f"/api/tasks/{second.get_json()['taskId']}").get_json()
+
+    self.assertEqual(firstTask["status"], "failed")
+    self.assertTrue(any("restart timed out" in line for line in firstTask["logs"]))
+    self.assertEqual(secondTask["status"], "completed")
+    self.assertEqual(calls, [
+      "https://music.apple.com/cn/album/wrapper-timeout/333",
+      "https://music.apple.com/cn/album/after-timeout/334",
+    ])
+
+  def testWrapperRecoveryCooldownPreventsConsecutiveRestarts(self):
+    calls: list[tuple[str, int]] = []
+
+    def runner(task, url, codec):
+      calls.append((url, task.wrapperRecoveryAttempts))
+      failWithWrapperReset(task)
+
+    app = self.createAppWithConfig(
+      "\n".join([
+        "wrapper-recovery-enabled: true",
+        'wrapper-recovery-container-name: "wrapper"',
+        'decrypt-m3u8-port: "192.168.100.56:10020"',
+        "wrapper-recovery-cooldown-seconds: 120",
+      ]),
+      lambda: runner,
+      "wrapper-cooldown-downloads.db",
+    )
+    client = app.test_client()
+
+    with patch(
+      "webapp.app.subprocess.run",
+      return_value=subprocess.CompletedProcess(["docker", "restart", "wrapper"], 0, stdout="wrapper\n"),
+    ) as restartRun:
+      client.post(
+        "/api/downloads",
+        data=json.dumps({"url": "https://music.apple.com/cn/album/cooldown-one/444"}),
+        content_type="application/json",
+      )
+      second = client.post(
+        "/api/downloads",
+        data=json.dumps({"url": "https://music.apple.com/cn/album/cooldown-two/445"}),
+        content_type="application/json",
+      )
+
+    secondTask = client.get(f"/api/tasks/{second.get_json()['taskId']}").get_json()
+
+    self.assertEqual(restartRun.call_count, 1)
+    self.assertEqual(calls[0][1], 0)
+    self.assertEqual(calls[1][1], 1)
+    self.assertEqual(calls[2][0], "https://music.apple.com/cn/album/cooldown-two/445")
+    self.assertTrue(any("cooldown active" in line for line in secondTask["logs"]))
+
+  def testWrapperRecoveryRetryLimitPreventsInfiniteRetries(self):
+    calls: list[int] = []
+
+    def runner(task, url, codec):
+      calls.append(task.wrapperRecoveryAttempts)
+      failWithWrapperReset(task)
+
+    app = self.createAppWithConfig(
+      "\n".join([
+        "wrapper-recovery-enabled: true",
+        'wrapper-recovery-container-name: "wrapper"',
+        'decrypt-m3u8-port: "192.168.100.56:10020"',
+        "wrapper-recovery-cooldown-seconds: 0",
+        "wrapper-recovery-max-retries-per-task: 1",
+      ]),
+      lambda: runner,
+      "wrapper-limit-downloads.db",
+    )
+    client = app.test_client()
+
+    with patch(
+      "webapp.app.subprocess.run",
+      return_value=subprocess.CompletedProcess(["docker", "restart", "wrapper"], 0, stdout="wrapper\n"),
+    ) as restartRun:
+      response = client.post(
+        "/api/downloads",
+        data=json.dumps({"url": "https://music.apple.com/cn/album/retry-limit/555"}),
+        content_type="application/json",
+      )
+
+    tasks = client.get("/api/tasks").get_json()
+    retryTask = max(tasks, key=lambda task: task["wrapperRecoveryAttempts"])
+    retryTaskDetails = client.get(f"/api/tasks/{retryTask['taskId']}").get_json()
+
+    self.assertEqual(response.status_code, 202)
+    self.assertEqual(restartRun.call_count, 1)
+    self.assertEqual(calls, [0, 1])
+    self.assertEqual(len(tasks), 2)
+    self.assertEqual(retryTask["status"], "failed")
+    self.assertTrue(any("automatic retry limit reached" in line for line in retryTaskDetails["logs"]))
 
   def testRetryFailedTasksReturnsZeroWhenNoFailures(self):
     response = self.client.post("/api/tasks/retry-failed")

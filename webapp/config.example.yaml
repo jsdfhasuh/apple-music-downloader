@@ -17,3 +17,15 @@ telegram-store-path: "data/telegram_tasks.db"
 
 # Recover queued/running tasks on webapp startup. Set to 0 to disable the age limit.
 recover-pending-max-age-hours: 12
+
+# Restart the wrapper CKC/decrypt service container after a recoverable runv2
+# connection reset, then retry the current task once. Disabled by default.
+# Set decrypt-m3u8-port to the downloader's configured decrypt service endpoint;
+# wrapper recovery will not trigger unless the failure points to that endpoint.
+decrypt-m3u8-port: ""
+wrapper-recovery-enabled: false
+wrapper-recovery-container-name: "wrapper"
+wrapper-recovery-docker-context: ""
+wrapper-recovery-timeout-seconds: 60
+wrapper-recovery-cooldown-seconds: 120
+wrapper-recovery-max-retries-per-task: 1
