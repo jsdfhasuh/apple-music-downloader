@@ -325,6 +325,21 @@ test("renderHistoryList escapes status and URL fields", () => {
   })
 })
 
+test("renderHistoryList shows escaped failed reason", () => {
+  withFakeElement("history-list", (element) => {
+    renderHistoryList([{
+      status: "failed",
+      url: "https://music.apple.com/cn/album/x/1",
+      error: 'Failed to run v2: <script>alert("x")</script>',
+      updated_at: "2026-06-26 12:00:00",
+    }])
+
+    assert.match(element.innerHTML, /history-error-reason/)
+    assert.match(element.innerHTML, /失败原因：Failed to run v2: &lt;script&gt;alert\(&quot;x&quot;\)&lt;\/script&gt;/)
+    assert.doesNotMatch(element.innerHTML, /<script>/)
+  })
+})
+
 test("normalizeHistoryStatus recognizes cancelled records", () => {
   assert.equal(normalizeHistoryStatus("cancelled"), "cancelled")
 })
@@ -351,6 +366,25 @@ test("renderTaskList shows cancel action only for queued tasks", () => {
     assert.match(element.innerHTML, /task-cancel-btn/)
     assert.match(element.innerHTML, /data-task-id="queued-task"/)
     assert.doesNotMatch(element.innerHTML, /<button type="button" class="task-item/)
+  })
+})
+
+test("renderTaskList shows escaped failed reason", () => {
+  withFakeElement("task-list", (element) => {
+    renderTaskList([
+      {
+        taskId: "failed-task",
+        status: "failed",
+        stage: "failed",
+        source: "web",
+        url: "https://music.apple.com/cn/album/failed-album/789",
+        error: 'Failed to dl aac-lc: <img src=x onerror="alert(1)">',
+      },
+    ])
+
+    assert.match(element.innerHTML, /task-error-reason/)
+    assert.match(element.innerHTML, /失败原因：Failed to dl aac-lc: &lt;img src=x onerror=&quot;alert\(1\)&quot;&gt;/)
+    assert.doesNotMatch(element.innerHTML, /<img/)
   })
 })
 

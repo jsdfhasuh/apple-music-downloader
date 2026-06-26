@@ -704,6 +704,15 @@ select:focus {
   word-break: break-all;
 }
 
+.task-error-reason,
+.history-error-reason {
+  margin-top: 8px;
+  color: var(--red);
+  font-size: 12px;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
 .task-progress {
   color: #1f2937;
   font-family: "SFMono-Regular", Consolas, monospace;

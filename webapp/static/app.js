@@ -80,6 +80,7 @@ const demoStore = {
       codec: "atmos",
       task_id: "demo-history-2",
       album_id: "1529621453",
+      error: "widevine key exchange returned HTTP 503",
       updated_at: "2026-06-07 08:38:03",
     },
   ],
@@ -1202,6 +1203,9 @@ function renderTaskList(tasks) {
     const source = task.source === "telegram" ? "telegram" : task.source === "subscription" ? "subscription" : "web";
     const albumName = getTaskAlbumName(task) || "未知专辑";
     const canCancel = task.status === "queued";
+    const errorReason = task.status === "failed" && task.error
+      ? `<p class="task-error-reason">失败原因：${escapeHtml(task.error)}</p>`
+      : "";
     return `
       <article class="task-item${task.taskId === state.selectedTaskId ? " selected" : ""}" data-task-id="${escapeHtml(task.taskId || "")}" role="button" tabindex="0">
         <div class="task-item-top">
@@ -1214,6 +1218,7 @@ function renderTaskList(tasks) {
           <span>${escapeHtml(task.status || "pending")}</span>
           <span>${escapeHtml(task.stage || "idle")}</span>
         </div>
+        ${errorReason}
         ${canCancel ? `<div class="task-actions"><button type="button" class="secondary-button compact-button task-cancel-btn" data-task-id="${escapeHtml(task.taskId || "")}">取消</button></div>` : ""}
       </article>
     `;
@@ -1307,6 +1312,9 @@ function renderHistoryList(records) {
     const status = normalizeHistoryStatus(record.status);
     const rawStatus = record.status || "-";
     const url = record.url || "-";
+    const errorReason = status === "failed" && record.error
+      ? `<p class="history-error-reason">失败原因：${escapeHtml(record.error)}</p>`
+      : "";
     return `
       <div class="history-item${status === "failed" ? " history-failed" : ""}">
         <div class="history-item-top">
@@ -1314,6 +1322,7 @@ function renderHistoryList(records) {
           ${status === "failed" ? `<button type="button" class="secondary-button history-retry-btn" data-url="${escapeHtml(url)}">重试</button>` : ""}
         </div>
         <p class="history-url">${escapeHtml(url)}</p>
+        ${errorReason}
         <p class="history-updated">${escapeHtml(record.updated_at || "-")}</p>
       </div>
     `;
