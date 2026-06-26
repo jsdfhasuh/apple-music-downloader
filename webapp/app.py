@@ -25,14 +25,27 @@ from webapp.config_loader import getConfigValue, resolveConfigPath
 
 APPLE_MUSIC_URL_RE = re.compile(r"^https://music\.apple\.com/[a-z]{2}/")
 DECRYPT_PROGRESS_RE = re.compile(r"Decrypting\.\.\.\s+(\d+)%")
-DOWNLOAD_SUMMARY_RE = re.compile(r"Completed:\s+(\d+)/(\d+)")
+DOWNLOAD_SUMMARY_RE = re.compile(r"Completed:\s+(\d+)/(\d+).*Errors:\s+(\d+)")
 TRAILING_URL_PUNCTUATION = ".,;:!)]}>，。；：！）】》、"
 DEFAULT_COMPLETED_ROOT = Path("/downloads/completed")
 DOWNLOAD_FORMAT_DIRS = {"ALAC", "AAC", "ATMOS", "Atmos"}
 SUBSCRIPTION_SCAN_INTERVAL_SECONDS = 24 * 60 * 60
+INTERACTIVE_RETRY_PROMPT = "Error detected, press Enter to try again..."
 RETRY_PROMPT_LINES = {
-  "Error detected, press Enter to try again...",
+  INTERACTIVE_RETRY_PROMPT,
   "Start trying again...",
+}
+FAILURE_REASON_MARKERS = (
+  "Failed to run v2:",
+  "Failed to rip album:",
+  "Failed to dl ",
+  "Failed ",
+  "Error:",
+  "Error ",
+)
+GENERIC_FAILURE_REASONS = {
+  "download finished without any result",
+  "download requested interactive retry after errors",
 }
 SUBSCRIPTION_POLICY_CONFIRM = "confirm"
 SUBSCRIPTION_POLICY_AUTO = "auto"
@@ -90,6 +103,7 @@ class DownloadTask:
   logs: list[str] = field(default_factory=list)
   result: list[dict[str, str]] = field(default_factory=list)
   error: str = ""
+  failureReasonCandidate: str = ""
   events: list[TaskEvent] = field(default_factory=list)
   condition: threading.Condition = field(default_factory=threading.Condition)
 
@@ -861,7 +875,7 @@ class ArtistSubscriptionStore:
       connection.commit()
       return cursor.rowcount
 
-  def resetSeenAlbumAfterTaskCancellation(self, albumId: str, taskId: str) -> int:
+  def ignoreSeenAlbumAfterTaskCancellation(self, albumId: str, taskId: str) -> int:
     if not albumId or not taskId:
       return 0
     with closing(self._connect()) as connection:
@@ -873,8 +887,8 @@ class ArtistSubscriptionStore:
           task_id = '',
           detected_status = 'missing',
           user_state = CASE
-            WHEN user_state = 'subscribed' THEN 'pending'
-            ELSE user_state
+            WHEN user_state = 'imported' THEN 'imported'
+            ELSE 'ignored'
           END,
           updated_at = CURRENT_TIMESTAMP
         WHERE album_id = ?
@@ -1011,6 +1025,7 @@ class DownloaderRunner:
     command = buildCommand(url, codec)
     process = subprocess.Popen(
       command,
+      stdin=subprocess.DEVNULL,
       stdout=subprocess.PIPE,
       stderr=subprocess.STDOUT,
       text=True,
@@ -1019,15 +1034,189 @@ class DownloaderRunner:
     assert process.stdout is not None
     task.setStatus("running")
     lastOutputLine = ""
+    terminatedForRetryPrompt = False
     for line in iterOutput(process.stdout):
       task.appendLog(line)
       lastOutputLine = line.strip() or lastOutputLine
       updateTaskFromLine(task, line)
+      if line.strip() == INTERACTIVE_RETRY_PROMPT:
+        terminatedForRetryPrompt = True
+        markTaskFailed(task, "download requested interactive retry after errors")
+        terminateProcess(process)
+        terminateDownloaderContainerProcess(url)
+        break
     returnCode = process.wait()
-    if returnCode != 0 and task.status != "failed":
-      task.setStage("failed")
-      task.setStatus("failed")
-      task.setError(lastOutputLine or f"download process exited with code {returnCode}")
+    if returnCode != 0 and task.status != "failed" and not terminatedForRetryPrompt:
+      markTaskFailed(task, task.failureReasonCandidate or lastOutputLine or f"download process exited with code {returnCode}")
+
+
+def terminateProcess(process: subprocess.Popen[str]) -> None:
+  if process.poll() is not None:
+    return
+  process.terminate()
+  try:
+    process.wait(timeout=5)
+    return
+  except subprocess.TimeoutExpired:
+    pass
+  process.kill()
+  process.wait()
+
+
+def terminateDownloaderContainerProcess(url: str) -> None:
+  script = r"""
+target=${APPLE_MUSIC_DL_TARGET_URL:-}
+[ -n "$target" ] || exit 0
+for p in /proc/[0-9]*; do
+  pid=${p##*/}
+  cmd=$(tr '\000' ' ' < "$p/cmdline" 2>/dev/null || true)
+  case "$cmd" in
+    *apple-music-dl*"$target"*) kill -TERM "$pid" 2>/dev/null || true ;;
+  esac
+done
+"""
+  try:
+    subprocess.run(
+      [
+        "docker",
+        "exec",
+        "-e",
+        f"APPLE_MUSIC_DL_TARGET_URL={url}",
+        "applemusic_download",
+        "sh",
+        "-lc",
+        script,
+      ],
+      stdin=subprocess.DEVNULL,
+      stdout=subprocess.DEVNULL,
+      stderr=subprocess.DEVNULL,
+      timeout=5,
+      check=False,
+    )
+  except Exception:
+    pass
+
+
+def findFileInAlbumDir(albumDir: Path, filename: str) -> Path | None:
+  directCandidate = albumDir / filename
+  if safePathIsFile(directCandidate):
+    return directCandidate
+  if not safePathIsDir(albumDir):
+    return None
+  matches: list[Path] = []
+  try:
+    for candidate in albumDir.rglob("*"):
+      if candidate.name == filename and safePathIsFile(candidate):
+        matches.append(candidate)
+        if len(matches) > 1:
+          return None
+  except OSError:
+    return None
+  return matches[0] if len(matches) == 1 else None
+
+
+def appendCandidateAlbumDir(candidates: list[Path], seen: set[Path], candidate: Path) -> None:
+  if candidate in seen:
+    return
+  seen.add(candidate)
+  candidates.append(candidate)
+
+
+def appendCompletedAlbumNameCandidates(
+  candidates: list[Path],
+  seen: set[Path],
+  completedRoot: Path,
+  albumName: str,
+) -> None:
+  if not albumName.strip() or not safePathIsDir(completedRoot):
+    return
+  sanitizedAlbumName = sanitizePathComponent(albumName.strip())
+  try:
+    artistDirs = list(completedRoot.iterdir())
+  except OSError:
+    return
+  for artistDir in artistDirs:
+    if safePathIsDir(artistDir):
+      appendCandidateAlbumDir(candidates, seen, artistDir / sanitizedAlbumName)
+
+
+def resultPathWithinAlbumDir(path: Path, albumDir: Path) -> bool:
+  try:
+    path.relative_to(albumDir)
+    return True
+  except ValueError:
+    return False
+
+
+def findResultPathAfterNfo(
+  item: dict[str, str],
+  originalPath: Path,
+  sourceAlbumDirs: list[Path],
+  completedRoot: Path,
+) -> Path | None:
+  if safePathIsFile(originalPath):
+    return originalPath
+  if not originalPath.name:
+    return None
+
+  candidates: list[Path] = []
+  seen: set[Path] = set()
+  for albumDir in getCompletedAlbumCandidateDirs(item, originalPath, completedRoot):
+    appendCandidateAlbumDir(candidates, seen, albumDir)
+
+  for sourceAlbumDir in sourceAlbumDirs:
+    if resultPathWithinAlbumDir(originalPath, sourceAlbumDir):
+      appendCandidateAlbumDir(candidates, seen, sourceAlbumDir)
+    appendCompletedAlbumNameCandidates(candidates, seen, completedRoot, sourceAlbumDir.name)
+
+  itemAlbum = item.get("album", "").strip()
+  if itemAlbum:
+    appendCompletedAlbumNameCandidates(candidates, seen, completedRoot, itemAlbum)
+
+  parts = originalPath.parts
+  for index, part in enumerate(parts):
+    if part in DOWNLOAD_FORMAT_DIRS and index + 2 < len(parts):
+      appendCompletedAlbumNameCandidates(candidates, seen, completedRoot, parts[index + 2])
+      break
+
+  for albumDir in candidates:
+    foundPath = findFileInAlbumDir(albumDir, originalPath.name)
+    if foundPath is not None:
+      return foundPath
+
+  if not safePathIsDir(completedRoot):
+    return None
+  matches: list[Path] = []
+  try:
+    for candidate in completedRoot.rglob("*"):
+      if candidate.name == originalPath.name and safePathIsFile(candidate):
+        matches.append(candidate)
+        if len(matches) > 1:
+          return None
+  except OSError:
+    return None
+  return matches[0] if len(matches) == 1 else None
+
+
+def refreshResultPathsAfterNfo(task: DownloadTask, sourceAlbumDirs: list[Path]) -> None:
+  completedRoot = getCompletedRoot()
+  updatedResult: list[dict[str, str]] = []
+  changed = False
+  for item in task.result:
+    rawPath = item.get("path", "").strip()
+    if not rawPath:
+      updatedResult.append(item)
+      continue
+    movedPath = findResultPathAfterNfo(item, Path(rawPath), sourceAlbumDirs, completedRoot)
+    if movedPath is None or str(movedPath) == rawPath:
+      updatedResult.append(item)
+      continue
+    updatedResult.append({**item, "path": str(movedPath)})
+    changed = True
+
+  if changed:
+    task.setResult(updatedResult)
+    task.publishEvent("result", result=updatedResult)
 
 
 class PipelineRunner:
@@ -1040,9 +1229,7 @@ class PipelineRunner:
     if task.status == "failed":
       return
     if not task.result:
-      task.setStage("failed")
-      task.setStatus("failed")
-      task.setError("download finished without any result")
+      markTaskFailed(task, "download finished without any result")
       return
     if task.result:
       if task.status == "completed":
@@ -1072,9 +1259,8 @@ class PipelineRunner:
         task.appendLog(f"Skipped conversion (not M4A): {sourcePath}")
         continue
       if not safePathExists(Path(sourcePath)):
-        task.setStage("failed")
-        task.setStatus("failed")
-        task.setError(
+        markTaskFailed(
+          task,
           f"Source file not accessible: {sourcePath}. Mount the downloads directory into the webapp container."
         )
         return
@@ -1090,9 +1276,7 @@ class PipelineRunner:
       if outputPath is not None and safePathExists(outputPath):
         finalPath = outputPath
       if not safePathExists(finalPath):
-        task.setStage("failed")
-        task.setStatus("failed")
-        task.setError(f"Converted file not found: {finalPath}")
+        markTaskFailed(task, f"Converted file not found: {finalPath}")
         return
       task.appendLog(f"Conversion output: {finalPath}")
       newItem = {**item, "path": str(finalPath)}
@@ -1109,8 +1293,12 @@ class PipelineRunner:
     if not directories:
       task.appendLog("No album directories found, skipping NFO build")
       return
-    for directory in sorted(directories):
-      self._runScript(task, ["python", "-m", "tools.build_nfo", directory])
+    sourceAlbumDirs = [Path(directory) for directory in sorted(directories)]
+    for directory in sourceAlbumDirs:
+      self._runScript(task, ["python", "-m", "tools.build_nfo", str(directory)])
+      if task.status == "failed":
+        return
+    refreshResultPathsAfterNfo(task, sourceAlbumDirs)
 
   def _runScript(self, task: DownloadTask, command: list[str]) -> str | None:
     task.appendLog(f"Running: {' '.join(command)}")
@@ -1129,10 +1317,8 @@ class PipelineRunner:
         lastLine = line.strip()
     returnCode = process.wait()
     if returnCode != 0:
-      task.setStage("failed")
-      task.setStatus("failed")
       scriptName = command[2] if len(command) > 2 and command[1] == "-m" else Path(command[1]).name if len(command) > 1 else "script"
-      task.setError(f"{scriptName} exited with code {returnCode}")
+      markTaskFailed(task, f"{scriptName} exited with code {returnCode}")
       return None
     return lastLine
 
@@ -1171,8 +1357,92 @@ def iterOutput(stream) -> Generator[str, None, None]:
     buffer += char
 
 
+def isGenericFailureReason(reason: str) -> bool:
+  return (
+    reason.startswith("download summary reported ")
+    or reason.startswith("download process exited with code ")
+    or reason in GENERIC_FAILURE_REASONS
+  )
+
+
+def setFailureReason(task: DownloadTask, reason: str) -> None:
+  cleaned = reason.strip()
+  if not cleaned:
+    return
+  if not task.error or isGenericFailureReason(task.error):
+    task.setError(cleaned)
+
+
+def setFailureReasonCandidate(task: DownloadTask, reason: str) -> None:
+  cleaned = reason.strip()
+  if not cleaned:
+    return
+  if not task.failureReasonCandidate or isGenericFailureReason(task.failureReasonCandidate):
+    task.failureReasonCandidate = cleaned
+
+
+def extractFailureReasonFromLine(line: str) -> str:
+  cleaned = line.strip()
+  if not cleaned or cleaned in RETRY_PROMPT_LINES:
+    return ""
+  for marker in FAILURE_REASON_MARKERS:
+    markerIndex = cleaned.find(marker)
+    if markerIndex >= 0:
+      return cleaned[markerIndex:].strip()
+  return ""
+
+
+def markTaskFailed(task: DownloadTask, reason: str = "") -> None:
+  cleanedReason = reason.strip()
+  if task.failureReasonCandidate and (not cleanedReason or isGenericFailureReason(cleanedReason)):
+    cleanedReason = task.failureReasonCandidate
+  setFailureReason(task, cleanedReason)
+  task.setStage("failed")
+  task.setStatus("failed")
+
+
 def updateTaskFromLine(task: DownloadTask, line: str) -> None:
   if line in RETRY_PROMPT_LINES:
+    return
+  if line.startswith("=======  [✔ ] Completed:"):
+    summaryMatch = DOWNLOAD_SUMMARY_RE.search(line)
+    if summaryMatch:
+      completedCount = int(summaryMatch.group(1))
+      totalCount = int(summaryMatch.group(2))
+      errorCount = int(summaryMatch.group(3))
+      if errorCount > 0 or totalCount <= 0 or completedCount < totalCount:
+        if errorCount > 0:
+          reason = f"download summary reported {errorCount} errors"
+        elif completedCount < totalCount:
+          reason = f"download summary reported incomplete tracks ({completedCount}/{totalCount} completed)"
+        else:
+          reason = "download summary reported zero completed tracks"
+        markTaskFailed(task, reason)
+        return
+    task.setStage("completed")
+    task.setStatus("completed")
+    task.setProgress(100)
+    return
+  if line.startswith("["):
+    try:
+      parsed = json.loads(line)
+    except json.JSONDecodeError:
+      parsed = None
+    if isinstance(parsed, list):
+      result: list[dict[str, str]] = []
+      for item in parsed:
+        if isinstance(item, dict):
+          normalized: dict[str, str] = {}
+          for key, value in item.items():
+            if isinstance(key, str) and isinstance(value, str):
+              normalized[key] = value
+          result.append(normalized)
+      task.setResult(result)
+      task.publishEvent("result", result=result)
+      return
+  failureReason = extractFailureReasonFromLine(line)
+  if failureReason:
+    setFailureReasonCandidate(task, failureReason)
     return
   if line.startswith("Queue "):
     task.setStage("queued")
@@ -1205,41 +1475,6 @@ def updateTaskFromLine(task: DownloadTask, line: str) -> None:
     task.setStage("converting")
     task.setProgress(max(task.progress, 98))
     return
-  if line.startswith("=======  [✔ ] Completed:"):
-    summaryMatch = DOWNLOAD_SUMMARY_RE.search(line)
-    if summaryMatch:
-      completedCount = int(summaryMatch.group(1))
-      if completedCount <= 0 and not task.result:
-        if task.status != "failed":
-          task.setStage("failed")
-          task.setStatus("failed")
-          task.setError("download summary reported zero completed tracks")
-        return
-    task.setStage("completed")
-    task.setStatus("completed")
-    task.setProgress(100)
-    return
-  if line.startswith("["):
-    try:
-      parsed = json.loads(line)
-    except json.JSONDecodeError:
-      return
-    if isinstance(parsed, list):
-      result: list[dict[str, str]] = []
-      for item in parsed:
-        if isinstance(item, dict):
-          normalized: dict[str, str] = {}
-          for key, value in item.items():
-            if isinstance(key, str) and isinstance(value, str):
-              normalized[key] = value
-          result.append(normalized)
-      task.setResult(result)
-      task.publishEvent("result", result=result)
-      return
-  if "Failed" in line or "Error" in line:
-    task.setStage("failed")
-    task.setStatus("failed")
-    task.setError(line)
 
 
 def normalizeUrl(url: str) -> str:
@@ -1436,21 +1671,16 @@ def startTask(
         historyStore.saveCompleted(url, task.id, codec, task.result, albumId)
         syncSubscriptionAlbumStatus(app, albumId, "completed", task.id)
       elif task.status == "completed" and not task.result:
-        task.setStage("failed")
-        task.setStatus("failed")
-        task.setError("download finished without any result")
+        markTaskFailed(task, "download finished without any result")
         historyStore.saveFailed(url, task.id, codec, task.error or "download failed", source, albumId)
         syncSubscriptionAlbumStatus(app, albumId, "failed", task.id)
       elif task.status == "failed":
         if not task.error:
-          task.setStage("failed")
-          task.setError("download finished without any result")
+          markTaskFailed(task, "download finished without any result")
         historyStore.saveFailed(url, task.id, codec, task.error or "download failed", source, albumId)
         syncSubscriptionAlbumStatus(app, albumId, "failed", task.id)
     except Exception as exc:  # noqa: BLE001
-      task.setStage("failed")
-      task.setStatus("failed")
-      task.setError(str(exc))
+      markTaskFailed(task, str(exc))
       historyStore.saveFailed(url, task.id, codec, str(exc), source, albumId)
       syncSubscriptionAlbumStatus(app, albumId, "failed", task.id)
     finally:
@@ -1503,15 +1733,15 @@ def cancelQueuedTask(
     return {"error": "task is no longer queued"}, 409
 
   albumId = extractAlbumIdFromUrl(task.url)
+  task.setError("cancelled before start")
   task.setStage("cancelled")
   task.setStatus("cancelled")
-  task.setError("cancelled before start")
   task.appendLog("queued task cancelled before start")
   historyStore.saveCancelled(task.url, task.id, task.codec, task.source, albumId)
 
   subscriptionStore = app.config.get("SUBSCRIPTION_STORE")
   if isinstance(subscriptionStore, ArtistSubscriptionStore):
-    subscriptionStore.resetSeenAlbumAfterTaskCancellation(albumId, task.id)
+    subscriptionStore.ignoreSeenAlbumAfterTaskCancellation(albumId, task.id)
 
   return {"cancelled": True, "task": task.toDict()}, 200
 
@@ -2171,22 +2401,27 @@ def applySubscriptionAlbumAction(
   return payload
 
 
+def runAutomaticSubscriptionScan(app: Flask) -> None:
+  payload, error = scanAllSubscriptions(app, blocking=False)
+  if error:
+    print(f"[subscriptions] skipped automatic scan: {error}", flush=True)
+    return
+  if payload is None:
+    return
+  print(f"[subscriptions] automatic scan completed: {payload}", flush=True)
+  notifyTelegramSubscriptionSummary(payload)
+
+
 def startSubscriptionScheduler(app: Flask) -> None:
   if app.config.get("SUBSCRIPTION_SCHEDULER_STARTED"):
     return
   app.config["SUBSCRIPTION_SCHEDULER_STARTED"] = True
 
   def runLoop() -> None:
+    runAutomaticSubscriptionScan(app)
     while True:
       time.sleep(SUBSCRIPTION_SCAN_INTERVAL_SECONDS)
-      payload, error = scanAllSubscriptions(app, blocking=False)
-      if error:
-        print(f"[subscriptions] skipped automatic scan: {error}", flush=True)
-        continue
-      if payload is None:
-        continue
-      print(f"[subscriptions] automatic scan completed: {payload}", flush=True)
-      notifyTelegramSubscriptionSummary(payload)
+      runAutomaticSubscriptionScan(app)
 
   thread = threading.Thread(target=runLoop, daemon=True)
   thread.start()
@@ -2534,6 +2769,7 @@ def createApp(
         "task_id": record["task_id"],
         "source": record.get("source", "web"),
         "album_id": record.get("album_id", ""),
+        "error": record.get("error", ""),
       }
       for record in records
     ])

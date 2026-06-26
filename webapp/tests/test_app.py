@@ -1,7 +1,9 @@
 import io
 import json
 import os
+import shutil
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import time
@@ -11,7 +13,7 @@ from unittest.mock import patch
 
 
 from webapp.apple_music import AppleMusicAlbum, AppleMusicArtist, formatArtworkUrl
-from webapp.app import ArtistSubscriptionStore, DownloadHistoryStore, DownloadTask, DownloaderRunner, PipelineRunner, createApp, getArtworkCacheDir, updateTaskFromLine
+from webapp.app import ArtistSubscriptionStore, DownloadHistoryStore, DownloadTask, DownloaderRunner, PipelineRunner, createApp, getArtworkCacheDir, runAutomaticSubscriptionScan, startSubscriptionScheduler, updateTaskFromLine
 
 
 class FakeRunner:
@@ -115,6 +117,47 @@ class FlaskDashboardTest(unittest.TestCase):
 
     self.assertEqual(startScheduler.call_count, 1)
 
+  def testAutomaticSubscriptionScanNotifiesSummary(self):
+    payload = {"scannedCount": 1, "queuedCount": 0}
+
+    with patch("webapp.app.scanAllSubscriptions", return_value=(payload, "")) as scanAll:
+      with patch("webapp.app.notifyTelegramSubscriptionSummary") as notifyTelegram:
+        runAutomaticSubscriptionScan(self.client.application)
+
+    scanAll.assert_called_once_with(self.client.application, blocking=False)
+    notifyTelegram.assert_called_once_with(payload)
+
+  def testSubscriptionSchedulerScansBeforeFirstSleep(self):
+    app = createApp(
+      dbPath=f"{self.tempDir.name}/scheduler-immediate-downloads.db",
+      recoverPending=False,
+    )
+    captured = {}
+
+    class FakeThread:
+      def __init__(self, target, daemon):
+        captured["target"] = target
+        captured["daemon"] = daemon
+
+      def start(self):
+        captured["started"] = True
+
+    class StopLoop(Exception):
+      pass
+
+    with patch("webapp.app.threading.Thread", FakeThread):
+      startSubscriptionScheduler(app)
+
+    with patch("webapp.app.scanAllSubscriptions", return_value=({"scannedCount": 1}, "")) as scanAll:
+      with patch("webapp.app.notifyTelegramSubscriptionSummary"):
+        with patch("webapp.app.time.sleep", side_effect=StopLoop):
+          with self.assertRaises(StopLoop):
+            captured["target"]()
+
+    self.assertTrue(captured["started"])
+    self.assertTrue(captured["daemon"])
+    scanAll.assert_called_once_with(app, blocking=False)
+
   def testCreateTaskRejectsInvalidUrl(self):
     response = self.client.post(
       "/api/tasks",
@@ -177,6 +220,7 @@ class FlaskDashboardTest(unittest.TestCase):
     self.assertEqual(taskPayload["stage"], "failed")
     self.assertEqual(taskPayload["error"], "download finished without any result")
     self.assertEqual(historyPayload[0]["status"], "failed")
+    self.assertEqual(historyPayload[0]["error"], "download finished without any result")
 
   def testCreateDownloadShortcutUsesDefaultCodec(self):
     response = self.client.post(
@@ -1279,6 +1323,84 @@ class FlaskDashboardTest(unittest.TestCase):
     self.assertEqual(Path(taskPayload["result"][0]["path"]), Path(derivedFlacPath))
     self.assertEqual(scriptCalls[1][3], self.tempDir.name)
 
+  def testPipelineStoresMovedCompletedPathWhenAlbumArtistDiffersFromTrackArtist(self):
+    completedRoot = Path(self.tempDir.name) / "completed"
+    sourceDir = Path(self.tempDir.name) / "downloads" / "ALAC" / "Track Artist" / "Example Album"
+    sourcePath = sourceDir / "01. Example.flac"
+    targetDir = completedRoot / "Album Artist" / "Example Album"
+    targetPath = targetDir / sourcePath.name
+    configPath = Path(self.tempDir.name) / "config.yaml"
+    calls: list[tuple[str, str, str]] = []
+    sourceDir.mkdir(parents=True)
+    sourcePath.write_text("fake flac", encoding="utf-8")
+    configPath.write_text(f'completed-root-folder: "{completedRoot}"\n', encoding="utf-8")
+
+    def fakeDownloadRunner(task, url, codec):
+      calls.append((task.id, url, codec))
+      task.setResult([
+        {
+          "path": str(sourcePath),
+          "artist": "Track Artist",
+          "album": "Example Album",
+          "song": "Example Song"
+        }
+      ])
+      task.setStatus("completed")
+
+    class MovingPipelineRunner(PipelineRunner):
+      def __init__(self, downloadRunner):
+        super().__init__(downloadRunner)
+
+      def _runScript(self, task, command):
+        if command[:3] == ["python", "-m", "tools.build_nfo"]:
+          targetDir.parent.mkdir(parents=True, exist_ok=True)
+          shutil.move(command[3], targetDir)
+          return f"专辑已移动到完成目录: {targetDir}"
+        return ""
+
+    originalConfigPath = os.environ.get("WEBAPP_CONFIG_PATH")
+    url = "https://music.apple.com/cn/album/moved-album-artist/1895089348"
+    try:
+      os.environ["WEBAPP_CONFIG_PATH"] = str(configPath)
+      app = createApp(
+        runnerFactory=lambda: MovingPipelineRunner(fakeDownloadRunner),
+        dbPath=f"{self.tempDir.name}/downloads.db"
+      )
+      app.config["TESTING"] = True
+      client = app.test_client()
+
+      response = client.post(
+        "/api/downloads",
+        data=json.dumps({"url": url}),
+        content_type="application/json"
+      )
+      payload = response.get_json()
+      taskPayload = client.get(f"/api/tasks/{payload['taskId']}").get_json()
+      historyStore = app.config["HISTORY_STORE"]
+      record = historyStore.getByUrl(url)
+      storedResult = json.loads(record["result_json"])
+
+      secondResponse = client.post(
+        "/api/downloads",
+        data=json.dumps({"url": url}),
+        content_type="application/json"
+      )
+      secondPayload = secondResponse.get_json()
+    finally:
+      if originalConfigPath is None:
+        os.environ.pop("WEBAPP_CONFIG_PATH", None)
+      else:
+        os.environ["WEBAPP_CONFIG_PATH"] = originalConfigPath
+
+    self.assertEqual(response.status_code, 202)
+    self.assertEqual(Path(taskPayload["result"][0]["path"]), targetPath)
+    self.assertEqual(Path(storedResult[0]["path"]), targetPath)
+    self.assertTrue(targetPath.is_file())
+    self.assertEqual(secondResponse.status_code, 200)
+    self.assertEqual(secondPayload["status"], "completed")
+    self.assertEqual(secondPayload["message"], "already downloaded")
+    self.assertEqual(len(calls), 1)
+
   def testPipelineFailsWhenSourceFileMissing(self):
     def fakeDownloadRunner(task, url, codec):
       task.setResult([
@@ -1330,6 +1452,7 @@ class FlaskDashboardTest(unittest.TestCase):
     self.assertEqual(len(payload), 1)
     self.assertEqual(payload[0]["url"], "https://music.apple.com/cn/album/intro-hit-me-hard-and-soft-tour-single/1895089347")
     self.assertEqual(payload[0]["status"], "completed")
+    self.assertEqual(payload[0]["error"], "")
     self.assertIn("created_at", payload[0])
     self.assertIn("updated_at", payload[0])
 
@@ -1939,6 +2062,47 @@ class FlaskDashboardTest(unittest.TestCase):
     self.assertEqual(recentAlbums["777"]["userState"], "ignored")
     self.assertEqual(recentAlbums["888"]["userState"], "imported")
 
+  def testCancelledSubscriptionAutoAlbumIsIgnoredAcrossScans(self):
+    fakeAppleMusic = FakeAppleMusicClient()
+    fakeAppleMusic.albums = [
+      AppleMusicAlbum(
+        albumId="444",
+        name="Auto Cancelled Album",
+        url="https://music.apple.com/cn/album/auto-cancelled-album/444",
+      )
+    ]
+    app = self.client.application
+    app.config["APPLE_MUSIC_CLIENT_FACTORY"] = lambda: fakeAppleMusic
+
+    createResponse = self.client.post(
+      "/api/subscriptions",
+      data=json.dumps({"artistUrl": "https://music.apple.com/cn/artist/example-artist/12345"}),
+      content_type="application/json",
+    )
+    subscriptionId = createResponse.get_json()["subscription"]["id"]
+    self.client.patch(
+      f"/api/subscriptions/{subscriptionId}",
+      data=json.dumps({"newAlbumPolicy": "auto"}),
+      content_type="application/json",
+    )
+
+    subscriptionStore = app.config["SUBSCRIPTION_STORE"]
+    subscriptionStore.updateSeenAlbumDetection(subscriptionId, "444", "queued", "cancelled-task", "subscribed")
+    ignoredCount = subscriptionStore.ignoreSeenAlbumAfterTaskCancellation("444", "cancelled-task")
+
+    scanResponse = self.client.post(f"/api/subscriptions/{subscriptionId}/scan")
+    scanPayload = scanResponse.get_json()
+    subscriptions = self.client.get("/api/subscriptions").get_json()
+    recentAlbums = {album["albumId"]: album for album in subscriptions[0]["recentAlbums"]}
+
+    self.assertEqual(ignoredCount, 1)
+    self.assertEqual(scanResponse.status_code, 200)
+    self.assertEqual(scanPayload["queuedCount"], 0)
+    self.assertEqual(scanPayload["skippedIgnoredCount"], 1)
+    self.assertEqual(len(self.runner.calls), 0)
+    self.assertEqual(recentAlbums["444"]["userState"], "ignored")
+    self.assertEqual(recentAlbums["444"]["detectedStatus"], "missing")
+
   def testSubscriptionAlbumCanBeMarkedCompletedManually(self):
     fakeAppleMusic = FakeAppleMusicClient()
     fakeAppleMusic.albums = [
@@ -2109,7 +2273,7 @@ class FlaskDashboardTest(unittest.TestCase):
 
 
 class DownloaderRunnerTest(unittest.TestCase):
-  def testIgnoresRetryPromptAfterCompletedSummary(self):
+  def testSummaryWithErrorsMarksTaskFailed(self):
     task = DownloadTask(
       id="task-id",
       url="https://music.apple.com/cn/album/example/123",
@@ -2119,9 +2283,13 @@ class DownloaderRunnerTest(unittest.TestCase):
     updateTaskFromLine(task, "=======  [✔ ] Completed: 1/1  |  [⚠ ] Warnings: 0  |  [✖ ] Errors: 1  =======")
     updateTaskFromLine(task, "Error detected, press Enter to try again...")
 
-    self.assertEqual(task.status, "completed")
-    self.assertEqual(task.stage, "completed")
-    self.assertEqual(task.progress, 100)
+    self.assertEqual(task.status, "failed")
+    self.assertEqual(task.stage, "failed")
+    self.assertEqual(task.error, "download summary reported 1 errors")
+    self.assertEqual(
+      [event.eventType for event in task.events],
+      ["error", "stage", "status"],
+    )
 
   def testZeroTrackCompletedSummaryDoesNotOverrideFailure(self):
     task = DownloadTask(
@@ -2136,6 +2304,41 @@ class DownloaderRunnerTest(unittest.TestCase):
     self.assertEqual(task.status, "failed")
     self.assertEqual(task.stage, "failed")
     self.assertEqual(task.error, "Failed to rip album: error getting album response")
+
+  def testNonTerminalFailureLogDoesNotMarkSuccessfulTaskFailed(self):
+    task = DownloadTask(
+      id="task-id",
+      url="https://music.apple.com/cn/music-video/example/123",
+      codec="alac"
+    )
+
+    updateTaskFromLine(task, "Failed to save MV thumbnail: connection reset by peer")
+    updateTaskFromLine(task, "=======  [✔ ] Completed: 1/1  |  [⚠ ] Warnings: 0  |  [✖ ] Errors: 0  =======")
+
+    self.assertEqual(task.status, "completed")
+    self.assertEqual(task.stage, "completed")
+    self.assertEqual(task.error, "")
+    self.assertEqual(task.progress, 100)
+
+  def testInlineDecryptFailureReasonOverridesProgress(self):
+    task = DownloadTask(
+      id="task-id",
+      url="https://music.apple.com/cn/album/example/123",
+      codec="alac"
+    )
+
+    updateTaskFromLine(
+      task,
+      "Decrypting... 5% (2/25 MB, 1.1 MB/s) Failed to run v2: decryptFragment: read tcp 192.168.100.93:59468->192.168.100.56:10020: read: connection reset by peer"
+    )
+    updateTaskFromLine(task, "=======  [✔ ] Completed: 0/1  |  [⚠ ] Warnings: 0  |  [✖ ] Errors: 1  =======")
+
+    self.assertEqual(task.status, "failed")
+    self.assertEqual(task.stage, "failed")
+    self.assertEqual(
+      task.error,
+      "Failed to run v2: decryptFragment: read tcp 192.168.100.93:59468->192.168.100.56:10020: read: connection reset by peer"
+    )
 
   def testMarksTaskFailedWhenProcessExitsNonZeroAfterNetworkError(self):
     task = DownloadTask(
@@ -2159,6 +2362,46 @@ class DownloaderRunnerTest(unittest.TestCase):
     self.assertEqual(task.status, "failed")
     self.assertEqual(task.stage, "failed")
     self.assertIn("no route to host", task.error)
+
+  def testTerminatesDownloaderWhenInteractiveRetryPromptAppears(self):
+    task = DownloadTask(
+      id="task-id",
+      url="https://music.apple.com/cn/album/example/123",
+      codec="alac"
+    )
+
+    class FakeProcess:
+      def __init__(self):
+        self.stdout = io.StringIO(
+          "Failed to rip album: example error\n"
+          "=======  [✔ ] Completed: 0/1  |  [⚠ ] Warnings: 0  |  [✖ ] Errors: 1  =======\n"
+          "Error detected, press Enter to try again...\n"
+        )
+        self.terminated = False
+
+      def poll(self):
+        return -15 if self.terminated else None
+
+      def terminate(self):
+        self.terminated = True
+
+      def kill(self):
+        self.terminated = True
+
+      def wait(self, timeout=None):
+        return -15 if self.terminated else 0
+
+    fakeProcess = FakeProcess()
+    with patch("webapp.app.subprocess.Popen", return_value=fakeProcess) as popen:
+      with patch("webapp.app.subprocess.run") as cleanupRun:
+        DownloaderRunner()(task, task.url, task.codec)
+
+    self.assertTrue(fakeProcess.terminated)
+    self.assertEqual(task.status, "failed")
+    self.assertEqual(task.stage, "failed")
+    self.assertEqual(task.error, "Failed to rip album: example error")
+    self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
+    self.assertEqual(cleanupRun.call_count, 1)
 
 
 if __name__ == "__main__":
