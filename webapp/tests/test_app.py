@@ -58,11 +58,16 @@ class FakeAppleMusicClient:
     ]
     self.artist = self.searchResults[0]
     self.albums: list[AppleMusicAlbum] = []
+    self.searchTerms: list[str] = []
+    self.artistCalls: list[tuple[str, str]] = []
+    self.albumCalls: list[tuple[str, str]] = []
 
   def searchArtists(self, term):
+    self.searchTerms.append(term)
     return self.searchResults
 
   def getArtist(self, storefront, artistId):
+    self.artistCalls.append((storefront, artistId))
     return AppleMusicArtist(
       artistId=artistId,
       storefront=storefront,
@@ -72,6 +77,7 @@ class FakeAppleMusicClient:
     )
 
   def listArtistAlbums(self, storefront, artistId):
+    self.albumCalls.append((storefront, artistId))
     return self.albums
 
 
@@ -91,6 +97,26 @@ class FlaskDashboardTest(unittest.TestCase):
 
   def tearDown(self):
     self.tempDir.cleanup()
+
+  def createAppWithConfig(self, configText, runnerFactory, dbName="configured-downloads.db", appleMusicClientFactory=None):
+    configPath = Path(self.tempDir.name) / f"{dbName}.yaml"
+    configPath.write_text(configText, encoding="utf-8")
+    originalConfigPath = os.environ.get("WEBAPP_CONFIG_PATH")
+    try:
+      os.environ["WEBAPP_CONFIG_PATH"] = str(configPath)
+      app = createApp(
+        runnerFactory=runnerFactory,
+        dbPath=f"{self.tempDir.name}/{dbName}",
+        recoverPending=False,
+        appleMusicClientFactory=appleMusicClientFactory,
+      )
+    finally:
+      if originalConfigPath is None:
+        os.environ.pop("WEBAPP_CONFIG_PATH", None)
+      else:
+        os.environ["WEBAPP_CONFIG_PATH"] = originalConfigPath
+    app.config["TESTING"] = True
+    return app
 
   def testIndexPageLoads(self):
     response = self.client.get("/")
@@ -116,6 +142,14 @@ class FlaskDashboardTest(unittest.TestCase):
       )
 
     self.assertEqual(startScheduler.call_count, 1)
+
+  def testCreateAppRejectsInvalidSubscriptionStorefront(self):
+    with self.assertRaisesRegex(ValueError, "subscription-storefront"):
+      self.createAppWithConfig(
+        'subscription-storefront: "zh-cn"',
+        lambda: self.runner,
+        "invalid-subscription-storefront.db",
+      )
 
   def testAutomaticSubscriptionScanNotifiesSummary(self):
     payload = {"scannedCount": 1, "queuedCount": 0}
@@ -499,6 +533,27 @@ class FlaskDashboardTest(unittest.TestCase):
       self.runner.calls[0][1],
       "https://music.apple.com/cn/album/intro-hit-me-hard-and-soft-tour-single/1895089347",
     )
+
+  def testDownloadShortcutPreservesManualUrlStorefrontWhenSubscriptionStorefrontIsCn(self):
+    app = self.createAppWithConfig(
+      "\n".join([
+        'storefront: "hk"',
+        'subscription-storefront: "cn"',
+      ]),
+      lambda: self.runner,
+      "manual-storefront-downloads.db",
+    )
+    client = app.test_client()
+    url = "https://music.apple.com/hk/album/manual-storefront/1895089347?ls"
+
+    response = client.post(
+      "/api/downloads",
+      data=json.dumps({"url": url, "source": "telegram"}),
+      content_type="application/json",
+    )
+
+    self.assertEqual(response.status_code, 202)
+    self.assertEqual(self.runner.calls[0][1], url)
 
   def testDownloadHistoryBackfillsAlbumIdFromExistingUrls(self):
     dbPath = f"{self.tempDir.name}/backfill-downloads.db"
@@ -1710,6 +1765,104 @@ class FlaskDashboardTest(unittest.TestCase):
     self.assertEqual(payload["results"][0]["artistName"], "Example Artist")
     self.assertEqual(payload["results"][0]["artistArtworkUrl"], "https://is1-ssl.mzstatic.com/image/thumb/artist-example/512x512bb.jpg")
 
+  def testSubscriptionSearchUsesConfiguredSubscriptionStorefront(self):
+    factoryStorefronts: list[str | None] = []
+
+    def appleMusicFactory(storefront=None):
+      factoryStorefronts.append(storefront)
+      fakeAppleMusic = FakeAppleMusicClient()
+      fakeAppleMusic.searchResults = [
+        AppleMusicArtist(
+          artistId="12345",
+          storefront=storefront or "",
+          name="Example Artist",
+          url=f"https://music.apple.com/{storefront}/artist/example-artist/12345",
+        )
+      ]
+      return fakeAppleMusic
+
+    app = self.createAppWithConfig(
+      "\n".join([
+        'storefront: "hk"',
+        'subscription-storefront: "cn"',
+      ]),
+      lambda: self.runner,
+      "subscription-search-storefront.db",
+      appleMusicFactory,
+    )
+    client = app.test_client()
+
+    response = client.post(
+      "/api/subscriptions/search",
+      data=json.dumps({"term": "Example"}),
+      content_type="application/json",
+    )
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(factoryStorefronts, ["cn"])
+    self.assertEqual(payload["results"][0]["storefront"], "cn")
+    self.assertEqual(payload["results"][0]["artistUrl"], "https://music.apple.com/cn/artist/example-artist/12345")
+
+  def testSubscriptionSearchDoesNotMaskFactoryTypeError(self):
+    fakeAppleMusic = FakeAppleMusicClient()
+
+    def appleMusicFactory(storefront=None):
+      if storefront is not None:
+        raise TypeError("storefront factory failed")
+      return fakeAppleMusic
+
+    app = self.createAppWithConfig(
+      'subscription-storefront: "cn"',
+      lambda: self.runner,
+      "subscription-search-factory-typeerror.db",
+      appleMusicFactory,
+    )
+    client = app.test_client()
+
+    response = client.post(
+      "/api/subscriptions/search",
+      data=json.dumps({"term": "Example"}),
+      content_type="application/json",
+    )
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 502)
+    self.assertEqual(payload["error"], "storefront factory failed")
+
+  def testCreateSubscriptionFromHkArtistUrlUsesCnStorefront(self):
+    fakeAppleMusic = FakeAppleMusicClient()
+    factoryStorefronts: list[str | None] = []
+
+    def appleMusicFactory(storefront=None):
+      factoryStorefronts.append(storefront)
+      return fakeAppleMusic
+
+    app = self.createAppWithConfig(
+      "\n".join([
+        'storefront: "hk"',
+        'subscription-storefront: "cn"',
+      ]),
+      lambda: self.runner,
+      "subscription-create-cn.db",
+      appleMusicFactory,
+    )
+    client = app.test_client()
+
+    response = client.post(
+      "/api/subscriptions",
+      data=json.dumps({"artistUrl": "https://music.apple.com/hk/artist/example-artist/12345"}),
+      content_type="application/json",
+    )
+    payload = response.get_json()
+
+    self.assertEqual(response.status_code, 201)
+    self.assertEqual(payload["subscription"]["storefront"], "cn")
+    self.assertEqual(payload["subscription"]["artistUrl"], "https://music.apple.com/cn/artist/example-artist/12345")
+    self.assertEqual(fakeAppleMusic.artistCalls, [("cn", "12345")])
+    self.assertEqual(fakeAppleMusic.albumCalls, [("cn", "12345")])
+    self.assertEqual(factoryStorefronts, ["cn", "cn"])
+
   def testFormatArtworkUrlSubstitutesTemplateAndRejectsUnsafeUrls(self):
     self.assertEqual(
       formatArtworkUrl({"url": "https://is1-ssl.mzstatic.com/image/thumb/demo/{w}x{h}bb.{f}"}, 256),
@@ -1891,6 +2044,485 @@ class FlaskDashboardTest(unittest.TestCase):
       subscriptionStore.getSeenAlbum(subscriptionId, "upsert-artwork")["artworkUrl"],
       "https://is1-ssl.mzstatic.com/image/thumb/upsert-album/512x512bb.jpg",
     )
+
+  def testExistingSubscriptionsAreMigratedToConfiguredSubscriptionStorefront(self):
+    dbName = "subscription-migrate-cn.db"
+    dbPath = f"{self.tempDir.name}/{dbName}"
+    subscriptionStore = ArtistSubscriptionStore(dbPath)
+    subscription, _created = subscriptionStore.createOrEnable(AppleMusicArtist(
+      artistId="migrate-artist",
+      storefront="hk",
+      name="Migrate Artist",
+      url="https://music.apple.com/hk/artist/migrate-artist/migrate-artist",
+    ))
+    subscriptionId = int(subscription["id"])
+    subscriptionStore.updateSubscriptionPolicy(subscriptionId, "auto")
+
+    fakeAppleMusic = FakeAppleMusicClient()
+    fakeAppleMusic.albums = [
+      AppleMusicAlbum(
+        albumId="cn-album",
+        name="CN Album",
+        url="https://music.apple.com/cn/album/cn-album/cn-album",
+      )
+    ]
+    app = self.createAppWithConfig(
+      "\n".join([
+        'storefront: "hk"',
+        'subscription-storefront: "cn"',
+      ]),
+      lambda: self.runner,
+      dbName,
+      lambda storefront=None: fakeAppleMusic,
+    )
+    client = app.test_client()
+
+    migratedSubscription = app.config["SUBSCRIPTION_STORE"].get(subscriptionId)
+    scanResponse = client.post(f"/api/subscriptions/{subscriptionId}/scan")
+    scanPayload = scanResponse.get_json()
+    subscriptions = client.get("/api/subscriptions").get_json()
+
+    self.assertEqual(migratedSubscription["storefront"], "cn")
+    self.assertEqual(migratedSubscription["newAlbumPolicy"], "auto")
+    self.assertEqual(scanResponse.status_code, 200)
+    self.assertEqual(scanPayload["queuedCount"], 1)
+    self.assertEqual(fakeAppleMusic.albumCalls, [("cn", "migrate-artist")])
+    self.assertEqual(self.runner.calls[0][1], "https://music.apple.com/cn/album/cn-album/cn-album")
+    self.assertEqual(subscriptions[0]["recentAlbums"][0]["albumUrl"], "https://music.apple.com/cn/album/cn-album/cn-album")
+
+  def testMergedSubscriptionKeepsStrongerDuplicateAlbumState(self):
+    dbName = "subscription-merge-duplicate-state.db"
+    dbPath = f"{self.tempDir.name}/{dbName}"
+    subscriptionStore = ArtistSubscriptionStore(dbPath)
+    hkSubscription, _created = subscriptionStore.createOrEnable(AppleMusicArtist(
+      artistId="duplicate-artist",
+      storefront="hk",
+      name="Duplicate Artist",
+      url="https://music.apple.com/hk/artist/duplicate-artist/123",
+    ))
+    cnSubscription, _created = subscriptionStore.createOrEnable(AppleMusicArtist(
+      artistId="duplicate-artist",
+      storefront="cn",
+      name="Duplicate Artist",
+      url="https://music.apple.com/cn/artist/duplicate-artist/123",
+    ))
+    hkSubscriptionId = int(hkSubscription["id"])
+    cnSubscriptionId = int(cnSubscription["id"])
+    subscriptionStore.upsertSeenAlbum(
+      hkSubscriptionId,
+      AppleMusicAlbum(
+        albumId="duplicate-album",
+        name="Duplicate Album",
+        url="https://music.apple.com/hk/album/duplicate-album/duplicate-album",
+        releaseDate="2024-04-01",
+      ),
+      status="completed",
+      taskId="completed-task",
+      userState="subscribed",
+      detectedStatus="completed",
+    )
+    subscriptionStore.upsertSeenAlbum(
+      cnSubscriptionId,
+      AppleMusicAlbum(
+        albumId="duplicate-album",
+        name="Duplicate Album",
+        url="https://music.apple.com/cn/album/duplicate-album/duplicate-album",
+        releaseDate="2024-04-01",
+      ),
+      status="failed",
+      taskId="failed-task",
+      userState="pending",
+      detectedStatus="failed_history",
+    )
+
+    result = subscriptionStore.migrateSubscriptionsToStorefront("cn")
+    mergedAlbum = subscriptionStore.getSeenAlbum(cnSubscriptionId, "duplicate-album")
+
+    self.assertEqual(result["mergedSubscriptions"], 1)
+    self.assertEqual(result["deletedDuplicateAlbums"], 1)
+    self.assertIsNone(subscriptionStore.get(hkSubscriptionId))
+    self.assertEqual(mergedAlbum["albumUrl"], "https://music.apple.com/cn/album/duplicate-album/duplicate-album")
+    self.assertEqual(mergedAlbum["detectedStatus"], "completed")
+    self.assertEqual(mergedAlbum["taskId"], "completed-task")
+
+  def testMigratedSubscriptionInheritsCompletedHkAlbumForCnEquivalent(self):
+    dbName = "subscription-inherit-completed-cn.db"
+    dbPath = f"{self.tempDir.name}/{dbName}"
+    historyStore = DownloadHistoryStore(dbPath)
+    subscriptionStore = ArtistSubscriptionStore(dbPath)
+    subscription, _created = subscriptionStore.createOrEnable(AppleMusicArtist(
+      artistId="migrate-completed-artist",
+      storefront="hk",
+      name="Migrate Completed Artist",
+      url="https://music.apple.com/hk/artist/migrate-completed-artist/123",
+    ))
+    subscriptionId = int(subscription["id"])
+    subscriptionStore.updateSubscriptionPolicy(subscriptionId, "auto")
+    subscriptionStore.upsertSeenAlbum(
+      subscriptionId,
+      AppleMusicAlbum(
+        albumId="hk-completed",
+        name="Same Album - EP",
+        url="https://music.apple.com/hk/album/same-album-ep/hk-completed",
+        releaseDate="2024-01-02",
+        artworkUrl="https://is1-ssl.mzstatic.com/image/thumb/Music/asset/512x512bb.jpg",
+      ),
+      status="completed",
+      taskId="old-completed-task",
+      userState="subscribed",
+      detectedStatus="completed",
+    )
+    historyStore.saveRunning(
+      "https://music.apple.com/hk/album/same-album-ep/hk-completed",
+      "old-completed-task",
+      "alac",
+      "subscription",
+      "hk-completed",
+    )
+    historyStore.saveCompleted(
+      "https://music.apple.com/hk/album/same-album-ep/hk-completed",
+      "old-completed-task",
+      "alac",
+      [{"path": str(self.resultPath)}],
+      "hk-completed",
+    )
+
+    fakeAppleMusic = FakeAppleMusicClient()
+    fakeAppleMusic.albums = [
+      AppleMusicAlbum(
+        albumId="cn-completed",
+        name="Same Album - EP",
+        url="https://music.apple.com/cn/album/same-album-ep/cn-completed",
+        releaseDate="2024-01-02",
+        artworkUrl="https://is1-ssl.mzstatic.com/image/thumb/Music/asset/1024x1024bb.jpg",
+      )
+    ]
+    app = self.createAppWithConfig(
+      "\n".join([
+        'storefront: "hk"',
+        'subscription-storefront: "cn"',
+      ]),
+      lambda: self.runner,
+      dbName,
+      lambda storefront=None: fakeAppleMusic,
+    )
+    client = app.test_client()
+
+    response = client.post(f"/api/subscriptions/{subscriptionId}/scan")
+    payload = response.get_json()
+    cnSeenAlbum = app.config["SUBSCRIPTION_STORE"].getSeenAlbum(subscriptionId, "cn-completed")
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(payload["queuedCount"], 0)
+    self.assertEqual(payload["skippedCompletedCount"], 1)
+    self.assertEqual(self.runner.calls, [])
+    self.assertEqual(cnSeenAlbum["detectedStatus"], "completed")
+    self.assertEqual(cnSeenAlbum["taskId"], "old-completed-task")
+
+  def testMigratedSubscriptionDoesNotInheritCompletedEquivalentWithoutUsableHistory(self):
+    dbName = "subscription-no-stale-completed-equivalent-cn.db"
+    dbPath = f"{self.tempDir.name}/{dbName}"
+    subscriptionStore = ArtistSubscriptionStore(dbPath)
+    subscription, _created = subscriptionStore.createOrEnable(AppleMusicArtist(
+      artistId="stale-completed-artist",
+      storefront="hk",
+      name="Stale Completed Artist",
+      url="https://music.apple.com/hk/artist/stale-completed-artist/123",
+    ))
+    subscriptionId = int(subscription["id"])
+    subscriptionStore.updateSubscriptionPolicy(subscriptionId, "auto")
+    subscriptionStore.upsertSeenAlbum(
+      subscriptionId,
+      AppleMusicAlbum(
+        albumId="hk-stale-completed",
+        name="Stale Same Album - EP",
+        url="https://music.apple.com/hk/album/stale-same-album-ep/hk-stale-completed",
+        releaseDate="2024-01-02",
+        artworkUrl="https://is1-ssl.mzstatic.com/image/thumb/Music/stale/512x512bb.jpg",
+      ),
+      status="completed",
+      taskId="old-stale-task",
+      userState="subscribed",
+      detectedStatus="completed",
+    )
+
+    fakeAppleMusic = FakeAppleMusicClient()
+    fakeAppleMusic.albums = [
+      AppleMusicAlbum(
+        albumId="cn-stale-completed",
+        name="Stale Same Album - EP",
+        url="https://music.apple.com/cn/album/stale-same-album-ep/cn-stale-completed",
+        releaseDate="2024-01-02",
+        artworkUrl="https://is1-ssl.mzstatic.com/image/thumb/Music/stale/1024x1024bb.jpg",
+      )
+    ]
+    app = self.createAppWithConfig(
+      "\n".join([
+        'storefront: "hk"',
+        'subscription-storefront: "cn"',
+      ]),
+      lambda: self.runner,
+      dbName,
+      lambda storefront=None: fakeAppleMusic,
+    )
+    client = app.test_client()
+
+    response = client.post(f"/api/subscriptions/{subscriptionId}/scan")
+    payload = response.get_json()
+    cnSeenAlbum = app.config["SUBSCRIPTION_STORE"].getSeenAlbum(subscriptionId, "cn-stale-completed")
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(payload["queuedCount"], 1)
+    self.assertEqual(payload["skippedCompletedCount"], 0)
+    self.assertEqual(self.runner.calls[0][1], "https://music.apple.com/cn/album/stale-same-album-ep/cn-stale-completed")
+    self.assertNotEqual(cnSeenAlbum["taskId"], "old-stale-task")
+
+  def testMigratedSubscriptionKeepsCompletedAlbumWhenCnUsesSameAlbumId(self):
+    dbName = "subscription-keep-completed-same-id-cn.db"
+    dbPath = f"{self.tempDir.name}/{dbName}"
+    historyStore = DownloadHistoryStore(dbPath)
+    subscriptionStore = ArtistSubscriptionStore(dbPath)
+    subscription, _created = subscriptionStore.createOrEnable(AppleMusicArtist(
+      artistId="same-id-artist",
+      storefront="hk",
+      name="Same ID Artist",
+      url="https://music.apple.com/hk/artist/same-id-artist/789",
+    ))
+    subscriptionId = int(subscription["id"])
+    subscriptionStore.updateSubscriptionPolicy(subscriptionId, "auto")
+    subscriptionStore.upsertSeenAlbum(
+      subscriptionId,
+      AppleMusicAlbum(
+        albumId="1234567890",
+        name="Same ID Album - EP",
+        url="https://music.apple.com/hk/album/same-id-album-ep/1234567890",
+        releaseDate="2024-03-04",
+      ),
+      status="completed",
+      taskId="same-id-completed-task",
+      userState="subscribed",
+      detectedStatus="completed",
+    )
+    historyStore.saveRunning(
+      "https://music.apple.com/hk/album/same-id-album-ep/1234567890",
+      "same-id-completed-task",
+      "alac",
+      "subscription",
+      "1234567890",
+    )
+    historyStore.saveCompleted(
+      "https://music.apple.com/hk/album/same-id-album-ep/1234567890",
+      "same-id-completed-task",
+      "alac",
+      [{"path": str(self.resultPath)}],
+      "1234567890",
+    )
+
+    fakeAppleMusic = FakeAppleMusicClient()
+    fakeAppleMusic.albums = [
+      AppleMusicAlbum(
+        albumId="1234567890",
+        name="Same ID Album - EP",
+        url="https://music.apple.com/cn/album/same-id-album-ep/1234567890",
+        releaseDate="2024-03-04",
+      )
+    ]
+    app = self.createAppWithConfig(
+      "\n".join([
+        'storefront: "hk"',
+        'subscription-storefront: "cn"',
+      ]),
+      lambda: self.runner,
+      dbName,
+      lambda storefront=None: fakeAppleMusic,
+    )
+    client = app.test_client()
+
+    response = client.post(f"/api/subscriptions/{subscriptionId}/scan")
+    payload = response.get_json()
+    seenAlbum = app.config["SUBSCRIPTION_STORE"].getSeenAlbum(subscriptionId, "1234567890")
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(payload["queuedCount"], 0)
+    self.assertEqual(payload["skippedCompletedCount"], 1)
+    self.assertEqual(self.runner.calls, [])
+    self.assertEqual(seenAlbum["albumUrl"], "https://music.apple.com/cn/album/same-id-album-ep/1234567890")
+    self.assertEqual(seenAlbum["detectedStatus"], "completed")
+    self.assertEqual(seenAlbum["taskId"], "same-id-completed-task")
+
+  def testMigratedSubscriptionDoesNotKeepCompletedSameIdWithoutUsableHistory(self):
+    dbName = "subscription-no-stale-completed-same-id-cn.db"
+    dbPath = f"{self.tempDir.name}/{dbName}"
+    subscriptionStore = ArtistSubscriptionStore(dbPath)
+    subscription, _created = subscriptionStore.createOrEnable(AppleMusicArtist(
+      artistId="stale-same-id-artist",
+      storefront="hk",
+      name="Stale Same ID Artist",
+      url="https://music.apple.com/hk/artist/stale-same-id-artist/789",
+    ))
+    subscriptionId = int(subscription["id"])
+    subscriptionStore.updateSubscriptionPolicy(subscriptionId, "auto")
+    subscriptionStore.upsertSeenAlbum(
+      subscriptionId,
+      AppleMusicAlbum(
+        albumId="2234567890",
+        name="Same Stale ID Album - EP",
+        url="https://music.apple.com/hk/album/same-stale-id-album-ep/2234567890",
+        releaseDate="2024-03-04",
+      ),
+      status="completed",
+      taskId="same-id-stale-task",
+      userState="subscribed",
+      detectedStatus="completed",
+    )
+
+    fakeAppleMusic = FakeAppleMusicClient()
+    fakeAppleMusic.albums = [
+      AppleMusicAlbum(
+        albumId="2234567890",
+        name="Same Stale ID Album - EP",
+        url="https://music.apple.com/cn/album/same-stale-id-album-ep/2234567890",
+        releaseDate="2024-03-04",
+      )
+    ]
+    app = self.createAppWithConfig(
+      "\n".join([
+        'storefront: "hk"',
+        'subscription-storefront: "cn"',
+      ]),
+      lambda: self.runner,
+      dbName,
+      lambda storefront=None: fakeAppleMusic,
+    )
+    client = app.test_client()
+
+    response = client.post(f"/api/subscriptions/{subscriptionId}/scan")
+    payload = response.get_json()
+    seenAlbum = app.config["SUBSCRIPTION_STORE"].getSeenAlbum(subscriptionId, "2234567890")
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(payload["queuedCount"], 1)
+    self.assertEqual(payload["skippedCompletedCount"], 0)
+    self.assertEqual(self.runner.calls[0][1], "https://music.apple.com/cn/album/same-stale-id-album-ep/2234567890")
+    self.assertNotEqual(seenAlbum["taskId"], "same-id-stale-task")
+
+  def testMigratedSubscriptionInheritsImportedHkAlbumForCnEquivalent(self):
+    dbName = "subscription-inherit-imported-cn.db"
+    dbPath = f"{self.tempDir.name}/{dbName}"
+    subscriptionStore = ArtistSubscriptionStore(dbPath)
+    subscription, _created = subscriptionStore.createOrEnable(AppleMusicArtist(
+      artistId="migrate-imported-artist",
+      storefront="hk",
+      name="Migrate Imported Artist",
+      url="https://music.apple.com/hk/artist/migrate-imported-artist/456",
+    ))
+    subscriptionId = int(subscription["id"])
+    subscriptionStore.updateSubscriptionPolicy(subscriptionId, "auto")
+    subscriptionStore.upsertSeenAlbum(
+      subscriptionId,
+      AppleMusicAlbum(
+        albumId="hk-imported",
+        name="LATATA (English Version) - Single",
+        url="https://music.apple.com/hk/album/latata-english-version-single/hk-imported",
+        releaseDate="2020-05-15",
+        artworkUrl="https://is1-ssl.mzstatic.com/image/thumb/Music/latata/512x512bb.jpg",
+      ),
+      status="seen",
+      taskId="",
+      userState="imported",
+      detectedStatus="missing",
+    )
+
+    fakeAppleMusic = FakeAppleMusicClient()
+    fakeAppleMusic.albums = [
+      AppleMusicAlbum(
+        albumId="cn-imported",
+        name="LATATA (English Version) [feat. <null>] - Single",
+        url="https://music.apple.com/cn/album/latata-english-version-feat-null-single/cn-imported",
+        releaseDate="2020-05-15",
+        artworkUrl="https://is1-ssl.mzstatic.com/image/thumb/Music/latata/1024x1024bb.jpg",
+      )
+    ]
+    app = self.createAppWithConfig(
+      "\n".join([
+        'storefront: "hk"',
+        'subscription-storefront: "cn"',
+      ]),
+      lambda: self.runner,
+      dbName,
+      lambda storefront=None: fakeAppleMusic,
+    )
+    client = app.test_client()
+
+    response = client.post(f"/api/subscriptions/{subscriptionId}/scan")
+    payload = response.get_json()
+    cnSeenAlbum = app.config["SUBSCRIPTION_STORE"].getSeenAlbum(subscriptionId, "cn-imported")
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(payload["queuedCount"], 0)
+    self.assertEqual(payload["skippedImportedCount"], 1)
+    self.assertEqual(self.runner.calls, [])
+    self.assertEqual(cnSeenAlbum["userState"], "imported")
+    self.assertEqual(cnSeenAlbum["detectedStatus"], "missing")
+
+  def testDeleteFailedHkSubscriptionRowsKeepsCompletedAndImportedRows(self):
+    dbPath = f"{self.tempDir.name}/subscription-cleanup.db"
+    historyStore = DownloadHistoryStore(dbPath)
+    subscriptionStore = ArtistSubscriptionStore(dbPath)
+    subscription, _created = subscriptionStore.createOrEnable(AppleMusicArtist(
+      artistId="cleanup-artist",
+      storefront="hk",
+      name="Cleanup Artist",
+      url="https://music.apple.com/hk/artist/cleanup-artist/123",
+    ))
+    subscriptionId = int(subscription["id"])
+    failedUrl = "https://music.apple.com/hk/album/failed/111"
+    completedUrl = "https://music.apple.com/hk/album/completed/222"
+    importedUrl = "https://music.apple.com/hk/album/imported/333"
+
+    subscriptionStore.upsertSeenAlbum(
+      subscriptionId,
+      AppleMusicAlbum(albumId="111", name="Failed", url=failedUrl),
+      status="failed",
+      taskId="failed-task",
+      userState="pending",
+      detectedStatus="failed_history",
+    )
+    subscriptionStore.upsertSeenAlbum(
+      subscriptionId,
+      AppleMusicAlbum(albumId="222", name="Completed", url=completedUrl),
+      status="completed",
+      taskId="completed-task",
+      userState="subscribed",
+      detectedStatus="completed",
+    )
+    subscriptionStore.upsertSeenAlbum(
+      subscriptionId,
+      AppleMusicAlbum(albumId="333", name="Imported", url=importedUrl),
+      status="seen",
+      taskId="",
+      userState="imported",
+      detectedStatus="missing",
+    )
+    historyStore.saveFailed(failedUrl, "failed-task", "alac", "bad hk record", "subscription", "111")
+    historyStore.saveRunning(completedUrl, "completed-task", "alac", "subscription", "222")
+    historyStore.saveCompleted(completedUrl, "completed-task", "alac", [{"path": str(self.resultPath)}], "222")
+
+    deletedRows = subscriptionStore.deleteFailedSeenAlbumsForStorefront("hk")
+    deletedHistoryCount = historyStore.deleteFailedSubscriptionRecordsForStorefront(
+      "hk",
+      [row["album_id"] for row in deletedRows],
+      [row["album_url"] for row in deletedRows],
+    )
+    remainingAlbums = {album["albumId"]: album for album in subscriptionStore.listSeenAlbums(subscriptionId)}
+
+    self.assertEqual([row["album_id"] for row in deletedRows], ["111"])
+    self.assertEqual(deletedHistoryCount, 1)
+    self.assertNotIn("111", remainingAlbums)
+    self.assertEqual(remainingAlbums["222"]["detectedStatus"], "completed")
+    self.assertEqual(remainingAlbums["333"]["userState"], "imported")
+    self.assertIsNone(historyStore.getByUrl(failedUrl))
+    self.assertEqual(historyStore.getByUrl(completedUrl)["status"], "completed")
 
   def testCreateSubscriptionScansAndPendsMissingAlbums(self):
     fakeAppleMusic = FakeAppleMusicClient()

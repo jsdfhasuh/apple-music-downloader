@@ -5,6 +5,7 @@ completed-root-folder: "/downloads/completed"
 
 # Apple Music lookup settings used by artist subscriptions.
 storefront: "us"
+subscription-storefront: "cn"
 language: "en-US"
 authorization-token: "your-authorization-token"
 

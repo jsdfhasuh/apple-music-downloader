@@ -1,4 +1,6 @@
+import difflib
 import hashlib
+import inspect
 import json
 import mimetypes
 import re
@@ -6,6 +8,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+import unicodedata
 import uuid
 from collections import deque
 from contextlib import closing
@@ -19,7 +22,7 @@ from urllib import request as urllib_request
 
 from flask import Flask, Response, jsonify, render_template, request, send_file
 
-from webapp.apple_music import AppleMusicAlbum, AppleMusicArtist, AppleMusicClient, parseAlbumIdFromUrl, parseArtistUrl
+from webapp.apple_music import AppleMusicAlbum, AppleMusicArtist, AppleMusicClient, normalizeStorefront, parseAlbumIdFromUrl, parseArtistUrl
 from webapp.config_loader import getConfigValue, resolveConfigPath
 
 
@@ -27,9 +30,12 @@ APPLE_MUSIC_URL_RE = re.compile(r"^https://music\.apple\.com/[a-z]{2}/")
 DECRYPT_PROGRESS_RE = re.compile(r"Decrypting\.\.\.\s+(\d+)%")
 DOWNLOAD_SUMMARY_RE = re.compile(r"Completed:\s+(\d+)/(\d+).*Errors:\s+(\d+)")
 TRAILING_URL_PUNCTUATION = ".,;:!)]}>，。；：！）】》、"
+APPLE_MUSIC_ARTWORK_SIZE_SEGMENT_RE = re.compile(r"/\d+x\d+bb(?:-[^/.]+)?\.[a-z0-9]+$", re.IGNORECASE)
+NULL_FEATURE_RE = re.compile(r"[\[(]\s*(?:feat|ft)\.?\s*<null>\s*[\])]", re.IGNORECASE)
 DEFAULT_COMPLETED_ROOT = Path("/downloads/completed")
 DOWNLOAD_FORMAT_DIRS = {"ALAC", "AAC", "ATMOS", "Atmos"}
 SUBSCRIPTION_SCAN_INTERVAL_SECONDS = 24 * 60 * 60
+DEFAULT_SUBSCRIPTION_STOREFRONT = "cn"
 INTERACTIVE_RETRY_PROMPT = "Error detected, press Enter to try again..."
 RETRY_PROMPT_LINES = {
   INTERACTIVE_RETRY_PROMPT,
@@ -206,6 +212,19 @@ def normalizeDetectedStatus(value: object, default: str = "seen") -> str:
   return normalized if normalized in ALBUM_DETECTED_STATUSES else default
 
 
+def normalizeStrictStorefront(value: object, label: str = "storefront") -> str:
+  storefront = str(value or "").strip().lower()
+  if re.fullmatch(r"[a-z]{2}", storefront) is None:
+    raise ValueError(f"{label} must be a two-letter Apple Music storefront code")
+  return storefront
+
+
+def getConfiguredSubscriptionStorefront(configPath: Path | None = None) -> str:
+  resolvedConfigPath = configPath or resolveConfigPath()
+  configured = getConfigValue(resolvedConfigPath, "subscription-storefront") or DEFAULT_SUBSCRIPTION_STOREFRONT
+  return normalizeStrictStorefront(configured, "subscription-storefront")
+
+
 def detectedStatusFromHistoryRecord(record: dict[str, str] | None) -> str:
   if record is None:
     return "missing"
@@ -243,6 +262,23 @@ def canDownloadSubscriptionAlbum(userState: str, detectedStatus: str) -> bool:
   return normalizeAlbumUserState(userState) not in {ALBUM_USER_STATE_IGNORED, ALBUM_USER_STATE_IMPORTED} and (
     normalizeDetectedStatus(detectedStatus, "missing") in ALBUM_DETECTED_NEEDS_CONFIRM
   )
+
+
+def getSeenAlbumMergePriority(row: sqlite3.Row) -> int:
+  detectedStatus = normalizeDetectedStatus(row["detected_status"], detectedStatusFromRowStatus(row["status"]))
+  userState = normalizeAlbumUserState(row["user_state"], ALBUM_USER_STATE_PENDING)
+  status = str(row["status"] or "").strip().lower()
+  if detectedStatus == "completed" or status == "completed":
+    return 60
+  if userState == ALBUM_USER_STATE_IMPORTED:
+    return 50
+  if userState == ALBUM_USER_STATE_IGNORED:
+    return 40
+  if detectedStatus in ALBUM_DETECTED_ACTIVE or status in ALBUM_DETECTED_ACTIVE:
+    return 30
+  if detectedStatus in {"failed_history", "stale_history"} or status == "failed":
+    return 20
+  return 10
 
 
 class DownloadHistoryStore:
@@ -415,6 +451,37 @@ class DownloadHistoryStore:
         (url, normalizedAlbumId, taskId, codec, source, error)
       )
       connection.commit()
+
+  def deleteFailedSubscriptionRecordsForStorefront(
+    self,
+    storefront: str,
+    albumIds: list[str],
+    urls: list[str],
+  ) -> int:
+    normalizedStorefront = normalizeStrictStorefront(storefront, "storefront")
+    urlPrefix = f"https://music.apple.com/{normalizedStorefront}/%"
+    deletedCount = 0
+    with closing(self._connect()) as connection:
+      for url in sorted({normalizeUrl(item) for item in urls if item}):
+        cursor = connection.execute(
+          "DELETE FROM downloads WHERE url = ? AND status = 'failed' AND source = 'subscription'",
+          (url,),
+        )
+        deletedCount += cursor.rowcount
+      for albumId in sorted({str(item or "").strip() for item in albumIds if str(item or "").strip()}):
+        cursor = connection.execute(
+          """
+          DELETE FROM downloads
+          WHERE album_id = ?
+            AND status = 'failed'
+            AND source = 'subscription'
+            AND url LIKE ?
+          """,
+          (albumId, urlPrefix),
+        )
+        deletedCount += cursor.rowcount
+      connection.commit()
+    return deletedCount
 
   def saveCancelled(self, url: str, taskId: str, codec: str, source: str = "web", albumId: str | None = None) -> None:
     normalizedAlbumId = albumId if albumId is not None else extractAlbumIdFromUrl(url)
@@ -686,6 +753,45 @@ class ArtistSubscriptionStore:
       return None
     return self._rowToSeenAlbum(row)
 
+  def findEquivalentSeenAlbumForStorefront(
+    self,
+    subscriptionId: int,
+    album: AppleMusicAlbum,
+    storefront: str,
+  ) -> dict[str, str] | None:
+    normalizedStorefront = normalizeStorefront(storefront)
+    targetUrlPrefix = f"https://music.apple.com/{normalizedStorefront}/%"
+    with closing(self._connect()) as connection:
+      rows = connection.execute(
+        """
+        SELECT album_id, album_url, album_name, artwork_url, release_date, status, task_id, user_state, detected_status, updated_at
+        FROM subscription_seen_albums
+        WHERE subscription_id = ?
+          AND album_id != ?
+          AND album_url NOT LIKE ?
+          AND (
+            user_state IN ('imported', 'ignored')
+            OR detected_status = 'completed'
+            OR status = 'completed'
+          )
+        ORDER BY
+          CASE
+            WHEN detected_status = 'completed' OR status = 'completed' THEN 0
+            WHEN user_state = 'imported' THEN 1
+            WHEN user_state = 'ignored' THEN 2
+            ELSE 3
+          END,
+          updated_at DESC,
+          album_id ASC
+        """,
+        (subscriptionId, album.albumId, targetUrlPrefix),
+      ).fetchall()
+    for row in rows:
+      seenAlbum = self._rowToSeenAlbum(row)
+      if seenAlbumMatchesStorefrontAlbum(seenAlbum, album):
+        return seenAlbum
+    return None
+
   def listEnabled(self) -> list[dict[str, object]]:
     with closing(self._connect()) as connection:
       rows = connection.execute(
@@ -711,6 +817,163 @@ class ArtistSubscriptionStore:
       )
       connection.commit()
     return True
+
+  def _mergeDuplicateSeenAlbumRows(
+    self,
+    connection: sqlite3.Connection,
+    sourceRow: sqlite3.Row,
+    targetRow: sqlite3.Row,
+  ) -> None:
+    if getSeenAlbumMergePriority(sourceRow) > getSeenAlbumMergePriority(targetRow):
+      status = sourceRow["status"]
+      taskId = sourceRow["task_id"]
+      userState = sourceRow["user_state"]
+      detectedStatus = sourceRow["detected_status"]
+    else:
+      status = targetRow["status"]
+      taskId = targetRow["task_id"]
+      userState = targetRow["user_state"]
+      detectedStatus = targetRow["detected_status"]
+
+    connection.execute(
+      """
+      UPDATE subscription_seen_albums
+      SET
+        album_url = COALESCE(NULLIF(album_url, ''), ?),
+        album_name = COALESCE(NULLIF(album_name, ''), ?),
+        artwork_url = COALESCE(NULLIF(artwork_url, ''), ?),
+        release_date = COALESCE(NULLIF(release_date, ''), ?),
+        status = ?,
+        task_id = ?,
+        user_state = ?,
+        detected_status = ?,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+      """,
+      (
+        sourceRow["album_url"],
+        sourceRow["album_name"],
+        sourceRow["artwork_url"],
+        sourceRow["release_date"],
+        status,
+        taskId,
+        userState,
+        detectedStatus,
+        targetRow["id"],
+      ),
+    )
+
+  def migrateSubscriptionsToStorefront(self, storefront: str) -> dict[str, int]:
+    normalizedStorefront = normalizeStrictStorefront(storefront, "storefront")
+    migratedCount = 0
+    mergedCount = 0
+    movedAlbumCount = 0
+    deletedDuplicateAlbumCount = 0
+    with closing(self._connect()) as connection:
+      rows = connection.execute(
+        """
+        SELECT id, artist_id, storefront, artist_name, artist_url
+        FROM artist_subscriptions
+        ORDER BY id ASC
+        """
+      ).fetchall()
+      for row in rows:
+        subscriptionId = int(row["id"])
+        if str(row["storefront"]) == normalizedStorefront:
+          continue
+        targetRow = connection.execute(
+          """
+          SELECT id
+          FROM artist_subscriptions
+          WHERE artist_id = ? AND storefront = ?
+          LIMIT 1
+          """,
+          (row["artist_id"], normalizedStorefront),
+        ).fetchone()
+        if targetRow is not None:
+          targetSubscriptionId = int(targetRow["id"])
+          seenRows = connection.execute(
+            """
+            SELECT id, album_id, album_url, album_name, artwork_url, release_date, status, task_id, user_state, detected_status
+            FROM subscription_seen_albums
+            WHERE subscription_id = ?
+            """,
+            (subscriptionId,),
+          ).fetchall()
+          for seenRow in seenRows:
+            duplicateRow = connection.execute(
+              """
+              SELECT id, album_id, album_url, album_name, artwork_url, release_date, status, task_id, user_state, detected_status
+              FROM subscription_seen_albums
+              WHERE subscription_id = ? AND album_id = ?
+              LIMIT 1
+              """,
+              (targetSubscriptionId, seenRow["album_id"]),
+            ).fetchone()
+            if duplicateRow is None:
+              connection.execute(
+                "UPDATE subscription_seen_albums SET subscription_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (targetSubscriptionId, seenRow["id"]),
+              )
+              movedAlbumCount += 1
+            else:
+              self._mergeDuplicateSeenAlbumRows(connection, seenRow, duplicateRow)
+              connection.execute("DELETE FROM subscription_seen_albums WHERE id = ?", (seenRow["id"],))
+              deletedDuplicateAlbumCount += 1
+          connection.execute("DELETE FROM artist_subscriptions WHERE id = ?", (subscriptionId,))
+          mergedCount += 1
+          continue
+
+        artistUrl = str(row["artist_url"] or "")
+        rewrittenArtistUrl = rewriteAppleMusicUrlStorefront(artistUrl, normalizedStorefront) if artistUrl else ""
+        if not rewrittenArtistUrl:
+          rewrittenArtistUrl = buildArtistUrl(normalizedStorefront, str(row["artist_name"]), str(row["artist_id"]))
+        connection.execute(
+          """
+          UPDATE artist_subscriptions
+          SET storefront = ?, artist_url = ?, updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?
+          """,
+          (normalizedStorefront, rewrittenArtistUrl, subscriptionId),
+        )
+        migratedCount += 1
+      connection.commit()
+    return {
+      "migratedSubscriptions": migratedCount,
+      "mergedSubscriptions": mergedCount,
+      "movedAlbums": movedAlbumCount,
+      "deletedDuplicateAlbums": deletedDuplicateAlbumCount,
+    }
+
+  def listFailedSeenAlbumsForStorefront(self, storefront: str) -> list[dict[str, str]]:
+    normalizedStorefront = normalizeStrictStorefront(storefront, "storefront")
+    urlPrefix = f"https://music.apple.com/{normalizedStorefront}/%"
+    with closing(self._connect()) as connection:
+      rows = connection.execute(
+        """
+        SELECT id, subscription_id, album_id, album_url, album_name, status, task_id, user_state, detected_status
+        FROM subscription_seen_albums
+        WHERE album_url LIKE ?
+          AND (
+            status = 'failed'
+            OR detected_status IN ('failed_history', 'stale_history')
+          )
+        ORDER BY subscription_id ASC, id ASC
+        """,
+        (urlPrefix,),
+      ).fetchall()
+    return [{key: str(row[key]) for key in row.keys()} for row in rows]
+
+  def deleteFailedSeenAlbumsForStorefront(self, storefront: str) -> list[dict[str, str]]:
+    rows = self.listFailedSeenAlbumsForStorefront(storefront)
+    if not rows:
+      return []
+    rowIds = [int(row["id"]) for row in rows]
+    with closing(self._connect()) as connection:
+      for rowId in rowIds:
+        connection.execute("DELETE FROM subscription_seen_albums WHERE id = ?", (rowId,))
+      connection.commit()
+    return rows
 
   def upsertSeenAlbum(
     self,
@@ -1485,6 +1748,72 @@ def extractAlbumIdFromUrl(url: str) -> str:
   return parseAlbumIdFromUrl(normalizeUrl(url))
 
 
+def normalizeAlbumTitleForStorefrontMatch(title: str) -> str:
+  normalized = unicodedata.normalize("NFKC", str(title or "")).casefold()
+  normalized = NULL_FEATURE_RE.sub(" ", normalized)
+  normalized = normalized.replace("<null>", " ")
+  normalized = re.sub(r"[^\w]+", " ", normalized, flags=re.UNICODE)
+  return " ".join(normalized.split())
+
+
+def getArtworkIdentity(url: str) -> str:
+  rawUrl = str(url or "").strip()
+  if not rawUrl:
+    return ""
+  try:
+    parsed = urllib_parse.urlparse(rawUrl)
+  except ValueError:
+    return ""
+  hostname = (parsed.hostname or "").lower()
+  path = urllib_parse.unquote(parsed.path or "")
+  if not hostname or not path:
+    return ""
+  return f"{hostname}{APPLE_MUSIC_ARTWORK_SIZE_SEGMENT_RE.sub('', path).lower()}"
+
+
+def releaseDatesMatch(left: str, right: str) -> bool:
+  leftDate = str(left or "").strip()
+  rightDate = str(right or "").strip()
+  return bool(leftDate and rightDate and leftDate == rightDate)
+
+
+def seenAlbumMatchesStorefrontAlbum(seenAlbum: dict[str, str], album: AppleMusicAlbum) -> bool:
+  hasSameReleaseDate = releaseDatesMatch(seenAlbum.get("releaseDate", ""), album.releaseDate)
+  seenArtworkIdentity = getArtworkIdentity(seenAlbum.get("artworkUrl", ""))
+  albumArtworkIdentity = getArtworkIdentity(album.artworkUrl)
+  if hasSameReleaseDate and seenArtworkIdentity and seenArtworkIdentity == albumArtworkIdentity:
+    return True
+
+  seenTitle = normalizeAlbumTitleForStorefrontMatch(seenAlbum.get("albumName", ""))
+  albumTitle = normalizeAlbumTitleForStorefrontMatch(album.name)
+  if not seenTitle or not albumTitle:
+    return False
+  if hasSameReleaseDate and seenTitle == albumTitle:
+    return True
+  if hasSameReleaseDate and min(len(seenTitle), len(albumTitle)) >= 8:
+    return difflib.SequenceMatcher(None, seenTitle, albumTitle).ratio() >= 0.92
+  return False
+
+
+def rewriteAppleMusicUrlStorefront(url: str, storefront: str) -> str:
+  normalizedUrl = normalizeUrl(url)
+  normalizedStorefront = normalizeStorefront(storefront)
+  return re.sub(r"^(https://music\.apple\.com/)[a-z]{2}(/)", rf"\g<1>{normalizedStorefront}\2", normalizedUrl, count=1)
+
+
+def buildArtistUrl(storefront: str, artistName: str, artistId: str) -> str:
+  normalizedStorefront = normalizeStorefront(storefront)
+  slug = urllib_parse.quote(str(artistName or artistId).strip().lower().replace(" ", "-"))
+  return f"https://music.apple.com/{normalizedStorefront}/artist/{slug}/{artistId}"
+
+
+def getSubscriptionStorefront(app: Flask) -> str:
+  configured = str(app.config.get("SUBSCRIPTION_STOREFRONT", "") or "").strip()
+  if configured:
+    return normalizeStrictStorefront(configured, "subscription-storefront")
+  return getConfiguredSubscriptionStorefront()
+
+
 def parseStoredResult(rawResult: str) -> list[dict[str, str]]:
   try:
     parsed = json.loads(rawResult)
@@ -1950,8 +2279,29 @@ def serializeArtist(artist: AppleMusicArtist) -> dict[str, str]:
   }
 
 
-def createAppleMusicClient(app: Flask) -> AppleMusicClient:
-  return app.config["APPLE_MUSIC_CLIENT_FACTORY"]()
+def callableAcceptsKeyword(callableObject: Callable[..., object], keyword: str) -> bool:
+  try:
+    signature = inspect.signature(callableObject)
+  except (TypeError, ValueError):
+    return True
+  for parameter in signature.parameters.values():
+    if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+      return True
+    if parameter.name == keyword and parameter.kind in {
+      inspect.Parameter.POSITIONAL_OR_KEYWORD,
+      inspect.Parameter.KEYWORD_ONLY,
+    }:
+      return True
+  return False
+
+
+def createAppleMusicClient(app: Flask, storefront: str | None = None) -> AppleMusicClient:
+  factory = app.config["APPLE_MUSIC_CLIENT_FACTORY"]
+  if storefront is None:
+    return factory()
+  if callableAcceptsKeyword(factory, "storefront"):
+    return factory(storefront=storefront)
+  return factory()
 
 
 def getStaticVersion(app: Flask) -> str:
@@ -2083,6 +2433,70 @@ def detectSubscriptionAlbumStatus(
   return detectedStatus, taskId
 
 
+def inheritEquivalentSeenAlbumState(
+  subscriptionStore: ArtistSubscriptionStore,
+  historyStore: DownloadHistoryStore,
+  subscriptionId: int,
+  album: AppleMusicAlbum,
+  storefront: str,
+  detectedStatus: str,
+  taskId: str,
+  summary: SubscriptionScanSummary,
+) -> bool:
+  equivalentSeenAlbum = subscriptionStore.findEquivalentSeenAlbumForStorefront(subscriptionId, album, storefront)
+  if equivalentSeenAlbum is None:
+    return False
+
+  equivalentDetectedStatus = normalizeDetectedStatus(
+    equivalentSeenAlbum.get("detectedStatus", ""),
+    detectedStatusFromRowStatus(equivalentSeenAlbum.get("status", "")),
+  )
+  equivalentUserState = normalizeAlbumUserState(equivalentSeenAlbum.get("userState", ""), ALBUM_USER_STATE_SUBSCRIBED)
+  equivalentTaskId = equivalentSeenAlbum.get("taskId", "")
+
+  if equivalentDetectedStatus == "completed" or equivalentSeenAlbum.get("status") == "completed":
+    equivalentRecord = findDownloadRecord(
+      historyStore,
+      equivalentSeenAlbum.get("albumUrl", ""),
+      equivalentSeenAlbum.get("albumId", ""),
+    )
+    if not hasUsableCompletedRecord(equivalentRecord):
+      return False
+    subscriptionStore.updateSeenAlbumDetection(
+      subscriptionId,
+      album.albumId,
+      "completed",
+      equivalentTaskId or taskId,
+      ALBUM_USER_STATE_SUBSCRIBED,
+    )
+    summary.skippedCompletedCount += 1
+    return True
+
+  if equivalentUserState == ALBUM_USER_STATE_IMPORTED:
+    subscriptionStore.updateSeenAlbumDetection(
+      subscriptionId,
+      album.albumId,
+      detectedStatus,
+      taskId,
+      ALBUM_USER_STATE_IMPORTED,
+    )
+    summary.skippedImportedCount += 1
+    return True
+
+  if equivalentUserState == ALBUM_USER_STATE_IGNORED:
+    subscriptionStore.updateSeenAlbumDetection(
+      subscriptionId,
+      album.albumId,
+      detectedStatus,
+      taskId,
+      ALBUM_USER_STATE_IGNORED,
+    )
+    summary.skippedIgnoredCount += 1
+    return True
+
+  return False
+
+
 def queueSubscriptionAlbumDownload(
   app: Flask,
   subscriptionStore: ArtistSubscriptionStore,
@@ -2141,7 +2555,7 @@ def scanSubscriptionUnlocked(
   subscriptionId = int(subscription["id"])
   artistId = str(subscription["artistId"])
   artistName = str(subscription["artistName"])
-  storefront = str(subscription["storefront"])
+  storefront = getSubscriptionStorefront(app)
   newAlbumPolicy = normalizeSubscriptionPolicy(subscription.get("newAlbumPolicy"), SUBSCRIPTION_POLICY_CONFIRM)
   summary = SubscriptionScanSummary(
     subscriptionId=subscriptionId,
@@ -2150,7 +2564,7 @@ def scanSubscriptionUnlocked(
   )
 
   try:
-    albums = createAppleMusicClient(app).listArtistAlbums(storefront, artistId)
+    albums = createAppleMusicClient(app, storefront).listArtistAlbums(storefront, artistId)
     summary.foundCount = len(albums)
     for album in albums:
       albumId = album.albumId or extractAlbumIdFromUrl(album.url)
@@ -2167,6 +2581,10 @@ def scanSubscriptionUnlocked(
       )
       seenAlbum, _created = subscriptionStore.upsertSeenAlbumMetadata(subscriptionId, normalizedAlbum)
       currentUserState = normalizeAlbumUserState(seenAlbum.get("userState"), ALBUM_USER_STATE_PENDING)
+      storedDetectedStatus = normalizeDetectedStatus(
+        seenAlbum.get("detectedStatus", ""),
+        detectedStatusFromRowStatus(seenAlbum.get("status", "")),
+      )
       detectedStatus, taskId = detectSubscriptionAlbumStatus(historyStore, taskStore, normalizedAlbum)
 
       if detectedStatus in ALBUM_DETECTED_ACTIVE:
@@ -2179,6 +2597,34 @@ def scanSubscriptionUnlocked(
         summary.skippedCompletedCount += 1
         userState = currentUserState if currentUserState in {ALBUM_USER_STATE_IGNORED, ALBUM_USER_STATE_IMPORTED} else ALBUM_USER_STATE_SUBSCRIBED
         subscriptionStore.updateSeenAlbumDetection(subscriptionId, albumId, detectedStatus, taskId, userState)
+        continue
+
+      if storedDetectedStatus == "completed" and detectedStatus in {"missing", "stale_history"}:
+        completedRecord = findDownloadRecord(historyStore, normalizedAlbum.url, albumId)
+        if not hasUsableCompletedRecord(completedRecord):
+          if currentUserState == ALBUM_USER_STATE_SUBSCRIBED:
+            currentUserState = ALBUM_USER_STATE_PENDING
+        else:
+          summary.skippedCompletedCount += 1
+          subscriptionStore.updateSeenAlbumDetection(
+            subscriptionId,
+            albumId,
+            "completed",
+            seenAlbum.get("taskId", "") or taskId,
+            ALBUM_USER_STATE_SUBSCRIBED,
+          )
+          continue
+
+      if inheritEquivalentSeenAlbumState(
+        subscriptionStore,
+        historyStore,
+        subscriptionId,
+        normalizedAlbum,
+        storefront,
+        detectedStatus,
+        taskId,
+        summary,
+      ):
         continue
 
       if currentUserState == ALBUM_USER_STATE_IGNORED:
@@ -2456,6 +2902,7 @@ def createApp(
   taskStore = TaskStore()
   taskQueue = SerialTaskQueue()
   historyDbPath = dbPath or str(Path("data/downloads.db"))
+  configPath = resolveConfigPath()
   historyStore = DownloadHistoryStore(historyDbPath)
   subscriptionStore = ArtistSubscriptionStore(historyDbPath)
   app.config["TASK_STORE"] = taskStore
@@ -2464,7 +2911,9 @@ def createApp(
   app.config["SUBSCRIPTION_STORE"] = subscriptionStore
   app.config["SUBSCRIPTION_SCAN_LOCK"] = threading.Lock()
   app.config["RUNNER_FACTORY"] = runnerFactory or (lambda: PipelineRunner(DownloaderRunner()))
-  app.config["APPLE_MUSIC_CLIENT_FACTORY"] = appleMusicClientFactory or (lambda: AppleMusicClient())
+  app.config["APPLE_MUSIC_CLIENT_FACTORY"] = appleMusicClientFactory or (lambda storefront=None: AppleMusicClient(storefront=storefront))
+  app.config["SUBSCRIPTION_STOREFRONT"] = getConfiguredSubscriptionStorefront(configPath)
+  subscriptionStore.migrateSubscriptionsToStorefront(app.config["SUBSCRIPTION_STOREFRONT"])
   app.config["ARTWORK_CACHE_DIR"] = Path(historyDbPath).parent / "artwork_cache"
 
   @app.get("/")
@@ -2550,7 +2999,8 @@ def createApp(
     if not term:
       return jsonify({"error": "search term is required"}), 400
     try:
-      artists = createAppleMusicClient(app).searchArtists(term)
+      subscriptionStorefront = getSubscriptionStorefront(app)
+      artists = createAppleMusicClient(app, subscriptionStorefront).searchArtists(term)
     except Exception as exc:  # noqa: BLE001
       return jsonify({"error": str(exc)}), 502
     return jsonify({"results": [serializeArtist(artist) for artist in artists]})
@@ -2560,7 +3010,7 @@ def createApp(
     payload = request.get_json(silent=True) or {}
     artistUrl = normalizeUrl(str(payload.get("artistUrl", payload.get("artist_url", payload.get("url", "")))))
     artistId = str(payload.get("artistId", payload.get("artist_id", ""))).strip()
-    storefront = str(payload.get("storefront", "")).strip().lower()
+    subscriptionStorefront = getSubscriptionStorefront(app)
     artistName = str(payload.get("artistName", payload.get("artist_name", ""))).strip()
     artistArtworkUrl = str(payload.get("artistArtworkUrl", payload.get("artist_artwork_url", ""))).strip()
 
@@ -2571,23 +3021,27 @@ def createApp(
           return jsonify({"error": "invalid Apple Music artist URL"}), 400
         parsedStorefront, parsedArtistId = parsed
         if artistId and artistName:
+          resolvedArtistId = artistId or parsedArtistId
+          resolvedArtistUrl = artistUrl if parsedStorefront == subscriptionStorefront else buildArtistUrl(subscriptionStorefront, artistName, resolvedArtistId)
           artist = AppleMusicArtist(
-            artistId=artistId,
-            storefront=storefront or parsedStorefront,
+            artistId=resolvedArtistId,
+            storefront=subscriptionStorefront,
             name=artistName,
-            url=artistUrl,
+            url=resolvedArtistUrl,
             artworkUrl=artistArtworkUrl,
           )
         else:
-          artist = createAppleMusicClient(app).getArtist(parsedStorefront, parsedArtistId)
+          artist = createAppleMusicClient(app, subscriptionStorefront).getArtist(subscriptionStorefront, parsedArtistId)
       else:
-        if not artistId or not storefront or not artistName:
-          return jsonify({"error": "artistUrl or artistId/storefront/artistName is required"}), 400
+        if not artistId or not artistName:
+          return jsonify({"error": "artistUrl or artistId/artistName is required"}), 400
+        rawArtistUrl = str(payload.get("artistUrl", payload.get("artist_url", ""))).strip()
+        artistUrl = rewriteAppleMusicUrlStorefront(rawArtistUrl, subscriptionStorefront) if rawArtistUrl else ""
         artist = AppleMusicArtist(
           artistId=artistId,
-          storefront=storefront,
+          storefront=subscriptionStorefront,
           name=artistName,
-          url=str(payload.get("artistUrl", payload.get("artist_url", ""))).strip(),
+          url=artistUrl or buildArtistUrl(subscriptionStorefront, artistName, artistId),
           artworkUrl=artistArtworkUrl,
         )
     except Exception as exc:  # noqa: BLE001
