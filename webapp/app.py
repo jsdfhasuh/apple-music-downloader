@@ -33,7 +33,6 @@ TRAILING_URL_PUNCTUATION = ".,;:!)]}>，。；：！）】》、"
 APPLE_MUSIC_ARTWORK_SIZE_SEGMENT_RE = re.compile(r"/\d+x\d+bb(?:-[^/.]+)?\.[a-z0-9]+$", re.IGNORECASE)
 NULL_FEATURE_RE = re.compile(r"[\[(]\s*(?:feat|ft)\.?\s*<null>\s*[\])]", re.IGNORECASE)
 DEFAULT_COMPLETED_ROOT = Path("/downloads/completed")
-DOWNLOAD_FORMAT_DIRS = {"ALAC", "AAC", "ATMOS", "Atmos"}
 SUBSCRIPTION_SCAN_INTERVAL_SECONDS = 24 * 60 * 60
 DEFAULT_SUBSCRIPTION_STOREFRONT = "cn"
 INTERACTIVE_RETRY_PROMPT = "Error detected, press Enter to try again..."
@@ -92,6 +91,11 @@ DEFAULT_WRAPPER_RECOVERY_CONTAINER_NAME = "wrapper"
 DEFAULT_WRAPPER_RECOVERY_TIMEOUT_SECONDS = 60.0
 DEFAULT_WRAPPER_RECOVERY_COOLDOWN_SECONDS = 120.0
 DEFAULT_WRAPPER_RECOVERY_MAX_RETRIES_PER_TASK = 1
+BUILD_NFO_COMPLETED_DIR_PREFIX = "AMD_COMPLETED_ALBUM_DIR="
+KNOWN_DISC_DIR_NAMES = tuple(f"CD{index}" for index in range(1, 100))
+MAX_TASK_LOG_LINES = 1000
+MAX_TASK_EVENTS = 2000
+SSE_HEARTBEAT_SECONDS = 15.0
 
 
 @dataclass
@@ -116,6 +120,7 @@ class DownloadTask:
   error: str = ""
   failureReasonCandidate: str = ""
   events: list[TaskEvent] = field(default_factory=list)
+  eventOffset: int = 0
   condition: threading.Condition = field(default_factory=threading.Condition)
 
   def toDict(self) -> dict[str, object]:
@@ -136,7 +141,7 @@ class DownloadTask:
 
   def publishEvent(self, eventType: str, **payload: object) -> None:
     with self.condition:
-      self.events.append(TaskEvent(eventType=eventType, payload=payload))
+      self._appendEventLocked(TaskEvent(eventType=eventType, payload=payload))
       self.condition.notify_all()
 
   def appendLog(self, line: str) -> None:
@@ -145,8 +150,17 @@ class DownloadTask:
       return
     with self.condition:
       self.logs.append(cleaned)
-      self.events.append(TaskEvent(eventType="log", payload={"message": cleaned}))
+      if len(self.logs) > MAX_TASK_LOG_LINES:
+        del self.logs[:len(self.logs) - MAX_TASK_LOG_LINES]
+      self._appendEventLocked(TaskEvent(eventType="log", payload={"message": cleaned}))
       self.condition.notify_all()
+
+  def _appendEventLocked(self, event: TaskEvent) -> None:
+    self.events.append(event)
+    if len(self.events) > MAX_TASK_EVENTS:
+      overflow = len(self.events) - MAX_TASK_EVENTS
+      del self.events[:overflow]
+      self.eventOffset += overflow
 
   def setStatus(self, status: str) -> None:
     self.status = status
@@ -1449,22 +1463,17 @@ done
     pass
 
 
-def findFileInAlbumDir(albumDir: Path, filename: str) -> Path | None:
+def findFileInKnownAlbumLayout(albumDir: Path, filename: str) -> Path | None:
   directCandidate = albumDir / filename
   if safePathIsFile(directCandidate):
     return directCandidate
   if not safePathIsDir(albumDir):
     return None
-  matches: list[Path] = []
-  try:
-    for candidate in albumDir.rglob("*"):
-      if candidate.name == filename and safePathIsFile(candidate):
-        matches.append(candidate)
-        if len(matches) > 1:
-          return None
-  except OSError:
-    return None
-  return matches[0] if len(matches) == 1 else None
+  for discDirName in KNOWN_DISC_DIR_NAMES:
+    discCandidate = albumDir / discDirName / filename
+    if safePathIsFile(discCandidate):
+      return discCandidate
+  return None
 
 
 def appendCandidateAlbumDir(candidates: list[Path], seen: set[Path], candidate: Path) -> None:
@@ -1472,24 +1481,6 @@ def appendCandidateAlbumDir(candidates: list[Path], seen: set[Path], candidate: 
     return
   seen.add(candidate)
   candidates.append(candidate)
-
-
-def appendCompletedAlbumNameCandidates(
-  candidates: list[Path],
-  seen: set[Path],
-  completedRoot: Path,
-  albumName: str,
-) -> None:
-  if not albumName.strip() or not safePathIsDir(completedRoot):
-    return
-  sanitizedAlbumName = sanitizePathComponent(albumName.strip())
-  try:
-    artistDirs = list(completedRoot.iterdir())
-  except OSError:
-    return
-  for artistDir in artistDirs:
-    if safePathIsDir(artistDir):
-      appendCandidateAlbumDir(candidates, seen, artistDir / sanitizedAlbumName)
 
 
 def resultPathWithinAlbumDir(path: Path, albumDir: Path) -> bool:
@@ -1503,8 +1494,7 @@ def resultPathWithinAlbumDir(path: Path, albumDir: Path) -> bool:
 def findResultPathAfterNfo(
   item: dict[str, str],
   originalPath: Path,
-  sourceAlbumDirs: list[Path],
-  completedRoot: Path,
+  completedAlbumBySourceDir: dict[Path, Path],
 ) -> Path | None:
   if safePathIsFile(originalPath):
     return originalPath
@@ -1513,45 +1503,38 @@ def findResultPathAfterNfo(
 
   candidates: list[Path] = []
   seen: set[Path] = set()
-  for albumDir in getCompletedAlbumCandidateDirs(item, originalPath, completedRoot):
-    appendCandidateAlbumDir(candidates, seen, albumDir)
-
-  for sourceAlbumDir in sourceAlbumDirs:
-    if resultPathWithinAlbumDir(originalPath, sourceAlbumDir):
-      appendCandidateAlbumDir(candidates, seen, sourceAlbumDir)
-    appendCompletedAlbumNameCandidates(candidates, seen, completedRoot, sourceAlbumDir.name)
-
-  itemAlbum = item.get("album", "").strip()
-  if itemAlbum:
-    appendCompletedAlbumNameCandidates(candidates, seen, completedRoot, itemAlbum)
-
-  parts = originalPath.parts
-  for index, part in enumerate(parts):
-    if part in DOWNLOAD_FORMAT_DIRS and index + 2 < len(parts):
-      appendCompletedAlbumNameCandidates(candidates, seen, completedRoot, parts[index + 2])
-      break
+  for sourceAlbumDir, completedAlbumDir in completedAlbumBySourceDir.items():
+    if not resultPathWithinAlbumDir(originalPath, sourceAlbumDir):
+      continue
+    try:
+      relativePath = originalPath.relative_to(sourceAlbumDir)
+    except ValueError:
+      relativePath = Path(originalPath.name)
+    appendCandidateAlbumDir(candidates, seen, completedAlbumDir / relativePath.parent)
+    appendCandidateAlbumDir(candidates, seen, completedAlbumDir)
 
   for albumDir in candidates:
-    foundPath = findFileInAlbumDir(albumDir, originalPath.name)
+    foundPath = findFileInKnownAlbumLayout(albumDir, originalPath.name)
     if foundPath is not None:
       return foundPath
+  return None
 
-  if not safePathIsDir(completedRoot):
+
+def parseBuildNfoCompletedAlbumDir(output: str | None) -> Path | None:
+  cleaned = str(output or "").strip()
+  if not cleaned.startswith(BUILD_NFO_COMPLETED_DIR_PREFIX):
     return None
-  matches: list[Path] = []
-  try:
-    for candidate in completedRoot.rglob("*"):
-      if candidate.name == originalPath.name and safePathIsFile(candidate):
-        matches.append(candidate)
-        if len(matches) > 1:
-          return None
-  except OSError:
-    return None
-  return matches[0] if len(matches) == 1 else None
+  pathText = cleaned[len(BUILD_NFO_COMPLETED_DIR_PREFIX):].strip()
+  return Path(pathText) if pathText else None
 
 
-def refreshResultPathsAfterNfo(task: DownloadTask, sourceAlbumDirs: list[Path]) -> None:
-  completedRoot = getCompletedRoot()
+def refreshResultPathsAfterNfo(
+  task: DownloadTask,
+  completedAlbumBySourceDir: dict[Path, Path],
+) -> None:
+  if not completedAlbumBySourceDir:
+    task.appendLog("Post-processing: completed album directory was not reported; keeping result paths unchanged.")
+    return
   updatedResult: list[dict[str, str]] = []
   changed = False
   for item in task.result:
@@ -1559,7 +1542,7 @@ def refreshResultPathsAfterNfo(task: DownloadTask, sourceAlbumDirs: list[Path]) 
     if not rawPath:
       updatedResult.append(item)
       continue
-    movedPath = findResultPathAfterNfo(item, Path(rawPath), sourceAlbumDirs, completedRoot)
+    movedPath = findResultPathAfterNfo(item, Path(rawPath), completedAlbumBySourceDir)
     if movedPath is None or str(movedPath) == rawPath:
       updatedResult.append(item)
       continue
@@ -1646,11 +1629,15 @@ class PipelineRunner:
       task.appendLog("No album directories found, skipping NFO build")
       return
     sourceAlbumDirs = [Path(directory) for directory in sorted(directories)]
+    completedAlbumBySourceDir: dict[Path, Path] = {}
     for directory in sourceAlbumDirs:
-      self._runScript(task, ["python", "-m", "tools.build_nfo", str(directory)])
+      output = self._runScript(task, ["python", "-m", "tools.build_nfo", str(directory)])
       if task.status == "failed":
         return
-    refreshResultPathsAfterNfo(task, sourceAlbumDirs)
+      completedAlbumDir = parseBuildNfoCompletedAlbumDir(output)
+      if completedAlbumDir is not None:
+        completedAlbumBySourceDir[directory] = completedAlbumDir
+    refreshResultPathsAfterNfo(task, completedAlbumBySourceDir)
 
   def _runScript(self, task: DownloadTask, command: list[str]) -> str | None:
     task.appendLog(f"Running: {' '.join(command)}")
@@ -1663,16 +1650,22 @@ class PipelineRunner:
     )
     assert process.stdout is not None
     lastLine = ""
+    structuredOutput = ""
     for line in iterOutput(process.stdout):
-      if line.strip():
-        task.appendLog(line)
-        lastLine = line.strip()
+      strippedLine = line.strip()
+      if not strippedLine:
+        continue
+      if strippedLine.startswith(BUILD_NFO_COMPLETED_DIR_PREFIX):
+        structuredOutput = strippedLine
+        continue
+      task.appendLog(line)
+      lastLine = strippedLine
     returnCode = process.wait()
     if returnCode != 0:
       scriptName = command[2] if len(command) > 2 and command[1] == "-m" else Path(command[1]).name if len(command) > 1 else "script"
       markTaskFailed(task, f"{scriptName} exited with code {returnCode}")
       return None
-    return lastLine
+    return structuredOutput or lastLine
 
 
 def buildCommand(url: str, codec: str) -> list[str]:
@@ -1921,12 +1914,6 @@ def parseStoredResult(rawResult: str) -> list[dict[str, str]]:
   return result
 
 
-def sanitizePathComponent(value: str) -> str:
-  cleaned = re.sub(r'[<>:"/\\|?*]', '_', value).strip()
-  cleaned = cleaned.rstrip('. ')
-  return cleaned or "Unknown"
-
-
 def safePathExists(path: Path) -> bool:
   try:
     return path.exists()
@@ -1955,59 +1942,18 @@ def getCompletedRoot() -> Path:
   return Path(configuredPath).expanduser()
 
 
-def getCompletedAlbumCandidateDirs(item: dict[str, str], originalPath: Path, completedRoot: Path) -> list[Path]:
-  candidates: list[Path] = []
-  parts = originalPath.parts
-  for index, part in enumerate(parts):
-    if part in DOWNLOAD_FORMAT_DIRS and index + 2 < len(parts):
-      candidates.append(completedRoot / parts[index + 1] / parts[index + 2])
-      break
-
-  artist = item.get("artist", "").strip()
-  album = item.get("album", "").strip()
-  if artist and album:
-    candidates.append(completedRoot / sanitizePathComponent(artist) / sanitizePathComponent(album))
-
-  uniqueCandidates: list[Path] = []
-  seen: set[Path] = set()
-  for candidate in candidates:
-    if candidate in seen:
-      continue
-    seen.add(candidate)
-    uniqueCandidates.append(candidate)
-  return uniqueCandidates
-
-
-def resultItemFileExists(item: dict[str, str], completedRoot: Path) -> bool:
+def resultItemFileExists(item: dict[str, str]) -> bool:
   rawPath = item.get("path", "").strip()
   if not rawPath:
     return False
-  originalPath = Path(rawPath)
-  if safePathIsFile(originalPath):
-    return True
-  if originalPath.is_absolute() and len(originalPath.parts) > 1 and originalPath.parts[1] == "downloads" and not safePathExists(Path("/downloads")):
-    return True
-  if not originalPath.name:
-    return False
-  for albumDir in getCompletedAlbumCandidateDirs(item, originalPath, completedRoot):
-    directCandidate = albumDir / originalPath.name
-    if safePathIsFile(directCandidate):
-      return True
-    if safePathIsDir(albumDir):
-      try:
-        if any(safePathIsFile(candidate) for candidate in albumDir.rglob(originalPath.name)):
-          return True
-      except OSError:
-        continue
-  return False
+  return safePathIsFile(Path(rawPath))
 
 
 def storedResultFilesExist(result: list[dict[str, str]]) -> bool:
   itemsWithPath = [item for item in result if item.get("path", "").strip()]
   if not itemsWithPath:
     return False
-  completedRoot = getCompletedRoot()
-  return all(resultItemFileExists(item, completedRoot) for item in itemsWithPath)
+  return all(resultItemFileExists(item) for item in itemsWithPath)
 
 
 def hasUsableCompletedRecord(record: dict[str, str] | None) -> bool:
@@ -3372,19 +3318,39 @@ def createApp(
       return jsonify({"error": "task not found"}), 404
 
     def eventStream() -> Generator[str, None, None]:
-      yield formatSse("snapshot", task.toDict())
-      eventIndex = 0
+      with task.condition:
+        snapshot = task.toDict()
+        nextEventSequence = task.eventOffset
+      yield formatSse("snapshot", snapshot)
       while True:
+        heartbeat = False
+        terminalSnapshot: dict[str, object] | None = None
         with task.condition:
-          while eventIndex >= len(task.events) and task.status not in {"completed", "failed", "cancelled"}:
-            task.condition.wait(timeout=1.0)
-            yield formatSse("snapshot", task.toDict())
-          events = task.events[eventIndex:]
-          eventIndex = len(task.events)
+          while (
+            nextEventSequence >= task.eventOffset + len(task.events)
+            and task.status not in {"completed", "failed", "cancelled"}
+          ):
+            task.condition.wait(timeout=SSE_HEARTBEAT_SECONDS)
+            if nextEventSequence >= task.eventOffset + len(task.events):
+              heartbeat = True
+              break
+          if heartbeat:
+            events: list[TaskEvent] = []
+          else:
+            if nextEventSequence < task.eventOffset:
+              nextEventSequence = task.eventOffset
+            eventIndex = max(0, nextEventSequence - task.eventOffset)
+            events = task.events[eventIndex:]
+            nextEventSequence = task.eventOffset + len(task.events)
+            if task.status in {"completed", "failed", "cancelled"} and nextEventSequence >= task.eventOffset + len(task.events):
+              terminalSnapshot = task.toDict()
+        if heartbeat:
+          yield formatSse("heartbeat", {})
+          continue
         for event in events:
           yield formatSse(event.eventType, event.payload)
-        if task.status in {"completed", "failed", "cancelled"} and eventIndex >= len(task.events):
-          yield formatSse("snapshot", task.toDict())
+        if terminalSnapshot is not None:
+          yield formatSse("snapshot", terminalSnapshot)
           break
 
     return Response(eventStream(), mimetype="text/event-stream")

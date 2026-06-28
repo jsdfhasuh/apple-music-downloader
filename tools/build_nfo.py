@@ -56,6 +56,7 @@ def get_logs_dir() -> Path:
 LOGS_DIR = get_logs_dir()
 DEFAULT_DOWNLOADS_DIR_NAME = "downloads"
 DEFAULT_COMPLETED_ROOT = Path("/downloads/completed")
+COMPLETED_ALBUM_DIR_PREFIX = "AMD_COMPLETED_ALBUM_DIR="
 
 
 def getCompletedRoot(configPath: Path | None) -> Path:
@@ -844,7 +845,7 @@ def main() -> int:
             nfo_written = True
 
         if nfo_written:
-            finalize_album_output(
+            finalized = finalize_album_output(
                 source_folder=Path(final_folder),
                 completed_root=completedRoot,
                 album_artist=album_artist,
@@ -853,6 +854,13 @@ def main() -> int:
                 logger=logger,
                 organize_only=args.organize_only,
             )
+            if finalized and not args.organize_only:
+                completedAlbumDir = build_completed_album_target(
+                    completed_root=completedRoot,
+                    album_artist=album_artist,
+                    album_name=album,
+                )
+                print(f"{COMPLETED_ALBUM_DIR_PREFIX}{completedAlbumDir}", flush=True)
 
     logger.info("=" * 60)
     logger.info("Build NFO - 完成")

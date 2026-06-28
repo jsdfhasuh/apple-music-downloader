@@ -13,7 +13,24 @@ from unittest.mock import patch
 
 
 from webapp.apple_music import AppleMusicAlbum, AppleMusicArtist, formatArtworkUrl
-from webapp.app import ArtistSubscriptionStore, DownloadHistoryStore, DownloadTask, DownloaderRunner, PipelineRunner, createApp, getArtworkCacheDir, isRecoverableWrapperError, runAutomaticSubscriptionScan, startSubscriptionScheduler, updateTaskFromLine
+from webapp.app import (
+  BUILD_NFO_COMPLETED_DIR_PREFIX,
+  MAX_TASK_EVENTS,
+  MAX_TASK_LOG_LINES,
+  ArtistSubscriptionStore,
+  DownloadHistoryStore,
+  DownloadTask,
+  DownloaderRunner,
+  PipelineRunner,
+  createApp,
+  getArtworkCacheDir,
+  hasUsableCompletedRecord,
+  isRecoverableWrapperError,
+  resultItemFileExists,
+  runAutomaticSubscriptionScan,
+  startSubscriptionScheduler,
+  updateTaskFromLine,
+)
 
 
 class FakeRunner:
@@ -434,48 +451,35 @@ class FlaskDashboardTest(unittest.TestCase):
     self.assertNotEqual(payload["taskId"], "old-task")
     self.assertEqual(len(self.runner.calls), 1)
 
-  def testDownloadShortcutReusesCompletedUrlMovedToCompletedRoot(self):
-    configPath = Path(self.tempDir.name) / "config.yaml"
+  def testDownloadShortcutReusesCompletedUrlWhenStoredPathExists(self):
     completedFile = Path(self.tempDir.name) / "completed" / "Artist" / "Album" / "track.flac"
     completedFile.parent.mkdir(parents=True)
     completedFile.write_text("fake flac", encoding="utf-8")
-    configPath.write_text(
-      f'completed-root-folder: "{Path(self.tempDir.name) / "completed"}"\n',
-      encoding="utf-8",
-    )
     historyStore = self.client.application.config["HISTORY_STORE"]
     historyStore.saveRunning(
-      "https://music.apple.com/cn/album/moved-completed/222",
+      "https://music.apple.com/cn/album/stored-completed/222",
       "old-task",
       "alac",
     )
     historyStore.saveCompleted(
-      "https://music.apple.com/cn/album/moved-completed/222",
+      "https://music.apple.com/cn/album/stored-completed/222",
       "old-task",
       "alac",
       [{
-        "path": f"{self.tempDir.name}/ALAC/Artist/Album/track.flac",
+        "path": str(completedFile),
         "artist": "Artist",
         "album": "Album",
         "song": "Track",
       }],
     )
 
-    originalConfigPath = os.environ.get("WEBAPP_CONFIG_PATH")
-    try:
-      os.environ["WEBAPP_CONFIG_PATH"] = str(configPath)
-      response = self.client.post(
-        "/api/downloads",
-        data=json.dumps({
-          "url": "https://music.apple.com/cn/album/moved-completed/222"
-        }),
-        content_type="application/json"
-      )
-    finally:
-      if originalConfigPath is None:
-        os.environ.pop("WEBAPP_CONFIG_PATH", None)
-      else:
-        os.environ["WEBAPP_CONFIG_PATH"] = originalConfigPath
+    response = self.client.post(
+      "/api/downloads",
+      data=json.dumps({
+        "url": "https://music.apple.com/cn/album/stored-completed/222"
+      }),
+      content_type="application/json"
+    )
     payload = response.get_json()
 
     self.assertEqual(response.status_code, 200)
@@ -1691,7 +1695,7 @@ class FlaskDashboardTest(unittest.TestCase):
         if command[:3] == ["python", "-m", "tools.build_nfo"]:
           targetDir.parent.mkdir(parents=True, exist_ok=True)
           shutil.move(command[3], targetDir)
-          return f"专辑已移动到完成目录: {targetDir}"
+          return f"{BUILD_NFO_COMPLETED_DIR_PREFIX}{targetDir}"
         return ""
 
     originalConfigPath = os.environ.get("WEBAPP_CONFIG_PATH")
@@ -1736,6 +1740,85 @@ class FlaskDashboardTest(unittest.TestCase):
     self.assertEqual(secondPayload["status"], "completed")
     self.assertEqual(secondPayload["message"], "already downloaded")
     self.assertEqual(len(calls), 1)
+
+  def testCompletedRecordValidationOnlyUsesStoredPath(self):
+    completedRoot = Path(self.tempDir.name) / "completed"
+    oldRoot = Path(self.tempDir.name) / "downloads" / "ALAC"
+    oldPath = oldRoot / "Track Artist" / "Example Album" / "01. Example.flac"
+    completedPath = completedRoot / "Track Artist" / "Example Album" / oldPath.name
+    completedPath.parent.mkdir(parents=True)
+    completedPath.write_text("fake flac", encoding="utf-8")
+
+    with patch("pathlib.Path.rglob", side_effect=AssertionError("completed fallback scan should not run")):
+      self.assertFalse(resultItemFileExists({"path": str(oldPath)}))
+      self.assertFalse(hasUsableCompletedRecord({
+        "status": "completed",
+        "ever_completed": "1",
+        "result_json": json.dumps([{"path": str(oldPath)}]),
+      }))
+      self.assertTrue(resultItemFileExists({"path": str(completedPath)}))
+
+  def testPipelineDoesNotCrossMapCompletedDirsWhenMarkerMissing(self):
+    firstSourceDir = Path(self.tempDir.name) / "downloads" / "ALAC" / "First Artist" / "First Album"
+    secondSourceDir = Path(self.tempDir.name) / "downloads" / "ALAC" / "Second Artist" / "Second Album"
+    firstSourcePath = firstSourceDir / "01. Same.flac"
+    secondSourcePath = secondSourceDir / "01. Same.flac"
+    completedRoot = Path(self.tempDir.name) / "completed"
+    secondTargetDir = completedRoot / "Second Artist" / "Second Album"
+    secondTargetPath = secondTargetDir / secondSourcePath.name
+    firstSourceDir.mkdir(parents=True)
+    secondSourceDir.mkdir(parents=True)
+    firstSourcePath.write_text("first flac", encoding="utf-8")
+    secondSourcePath.write_text("second flac", encoding="utf-8")
+
+    def fakeDownloadRunner(task, url, codec):
+      task.setResult([
+        {
+          "path": str(firstSourcePath),
+          "artist": "First Artist",
+          "album": "First Album",
+          "song": "Same",
+        },
+        {
+          "path": str(secondSourcePath),
+          "artist": "Second Artist",
+          "album": "Second Album",
+          "song": "Same",
+        },
+      ])
+      task.setStatus("completed")
+
+    class PartiallyReportingPipelineRunner(PipelineRunner):
+      def __init__(self, downloadRunner):
+        super().__init__(downloadRunner)
+
+      def _runScript(self, task, command):
+        if command[:3] == ["python", "-m", "tools.build_nfo"] and Path(command[3]) == secondSourceDir:
+          secondTargetDir.parent.mkdir(parents=True, exist_ok=True)
+          shutil.move(command[3], secondTargetDir)
+          return f"{BUILD_NFO_COMPLETED_DIR_PREFIX}{secondTargetDir}"
+        return ""
+
+    app = createApp(
+      runnerFactory=lambda: PartiallyReportingPipelineRunner(fakeDownloadRunner),
+      dbPath=f"{self.tempDir.name}/downloads.db"
+    )
+    app.config["TESTING"] = True
+    client = app.test_client()
+
+    response = client.post(
+      "/api/downloads",
+      data=json.dumps({"url": "https://music.apple.com/cn/album/partial-marker/1895089349"}),
+      content_type="application/json",
+    )
+    taskPayload = client.get(f"/api/tasks/{response.get_json()['taskId']}").get_json()
+    storedResult = json.loads(app.config["HISTORY_STORE"].getByUrl("https://music.apple.com/cn/album/partial-marker/1895089349")["result_json"])
+
+    self.assertEqual(response.status_code, 202)
+    self.assertEqual(Path(taskPayload["result"][0]["path"]), firstSourcePath)
+    self.assertEqual(Path(taskPayload["result"][1]["path"]), secondTargetPath)
+    self.assertEqual(Path(storedResult[0]["path"]), firstSourcePath)
+    self.assertEqual(Path(storedResult[1]["path"]), secondTargetPath)
 
   def testPipelineFailsWhenSourceFileMissing(self):
     def fakeDownloadRunner(task, url, codec):
@@ -3186,6 +3269,21 @@ class FlaskDashboardTest(unittest.TestCase):
 
 
 class DownloaderRunnerTest(unittest.TestCase):
+  def testDownloadTaskTrimsLogsAndEvents(self):
+    task = DownloadTask(
+      id="task-id",
+      url="https://music.apple.com/cn/album/example/123",
+      codec="alac"
+    )
+
+    for index in range(MAX_TASK_EVENTS + 25):
+      task.appendLog(f"log line {index}")
+
+    self.assertEqual(len(task.logs), MAX_TASK_LOG_LINES)
+    self.assertEqual(task.logs[0], f"log line {MAX_TASK_EVENTS + 25 - MAX_TASK_LOG_LINES}")
+    self.assertEqual(len(task.events), MAX_TASK_EVENTS)
+    self.assertEqual(task.eventOffset, 25)
+
   def testSummaryWithErrorsMarksTaskFailed(self):
     task = DownloadTask(
       id="task-id",

@@ -909,6 +909,23 @@ function appendLog(message) {
 }
 
 
+function applySnapshotLogs(logs) {
+  if (!Array.isArray(logs) || logs.length === 0) {
+    return;
+  }
+  if (state.logLines.length > 0 || state.pendingLogLines.length > 0) {
+    return;
+  }
+  state.logLines = logs.slice(-MAX_LOG_LINES);
+  const logsOutput = document.getElementById("logs-output");
+  logsOutput.textContent = state.logLines.join("\n");
+  if (logsOutput.textContent) {
+    logsOutput.textContent += "\n";
+    logsOutput.scrollTop = logsOutput.scrollHeight;
+  }
+}
+
+
 function clearTaskDetails() {
   document.getElementById("current-url").textContent = "-";
   document.getElementById("logs-output").textContent = "";
@@ -1086,6 +1103,7 @@ function applySnapshot(data) {
   if (data.url) {
     document.getElementById("current-url").textContent = data.url;
   }
+  applySnapshotLogs(data.logs);
   setStage(data.stage);
   setProgress(Number(data.progress || 0));
   setStatus(data.status, data.error || data.stage || "");
